@@ -80,10 +80,9 @@ from rtmlib import PoseTracker, BodyWithFeet, Wholebody, Body, Hand, Custom
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
 from Sports2D.Utilities import filter
-from Sports2D.Utilities.common import *
 from Pose2Sim.common import *
 from Pose2Sim.skeletons import *
-from Pose2Sim.triangulation import indices_of_first_last_non_nan_chunks
+from Sports2D.Utilities.common import *  # 우리의 angle_dict와 함수들이 마지막에 로드되어 덮어쓰도록
 
 DEFAULT_MASS = 70
 DEFAULT_HEIGHT = 1.7
@@ -415,7 +414,7 @@ def compute_angle(ang_name, person_X_flipped, person_Y, angle_dict, keypoints_id
                 angle_coords = [[np.abs(person_X_flipped[keypoints_ids[keypoints_names.index(kpt)]]), person_Y[keypoints_ids[keypoints_names.index(kpt)]]] for kpt in ang_params[0]]
             else:
                 angle_coords = [[person_X_flipped[keypoints_ids[keypoints_names.index(kpt)]], person_Y[keypoints_ids[keypoints_names.index(kpt)]]] for kpt in ang_params[0]]
-            ang = fixed_angles(angle_coords, ang_name)
+            ang = fixed_angles2(angle_coords, ang_name)
         except:
             ang = np.nan    
     else:
@@ -424,7 +423,7 @@ def compute_angle(ang_name, person_X_flipped, person_Y, angle_dict, keypoints_id
     return ang
 
 
-def draw_dotted_line(img, start, direction, length, color=(0, 255, 0), gap=7, dot_length=3, thickness=thickness):
+def draw_dotted_line(img, start, direction, length, color=(0, 255, 0), gap=7, dot_length=3, thickness=2):
     '''
     Draw a dotted line with on a cv2 image
 
@@ -448,7 +447,67 @@ def draw_dotted_line(img, start, direction, length, color=(0, 255, 0), gap=7, do
         cv2.line(img, tuple(line_start.astype(int)), tuple(line_end.astype(int)), color, thickness)
 
 
-def draw_angles(img, valid_X, valid_Y, valid_angles, valid_X_flipped, keypoints_ids, keypoints_names, angle_names, display_angle_values_on= ['body', 'list'], colors=[(255, 0, 0), (0, 255, 0), (0, 0, 255)], fontSize=0.3, thickness=1):
+def draw_heel_trajectory(img, valid_X, valid_Y, keypoints_ids, keypoints_names, heel_trajectory_buffer, max_trajectory_length=50):
+    """
+    러닝 분석을 위한 발뒤꿈치 궤적 시각화
+
+    INPUTS:
+    - max_trajectory_length: int 또는 None
+                            int: 최대 궤적 길이 (프레임 수)
+                            None: 전체 영상 궤적 표시 ('all' 옵션)
+    """
+
+    # 발뒤꿈치 키포인트와 색상 설정 (고정)
+    heel_keypoints = ['LHeel', 'RHeel']
+    heel_colors = [(0, 0, 255), (255, 0, 0)]  # 왼쪽=빨간색, 오른쪽=파란색
+
+    for heel_name, color in zip(heel_keypoints, heel_colors):
+        if heel_name in keypoints_names:
+            # 올바른 인덱싱 방식 사용 (다른 함수들과 동일)
+            heel_idx = keypoints_ids[keypoints_names.index(heel_name)]
+
+            # 현재 프레임의 발뒤꿈치 좌표 확인
+            if heel_idx < len(valid_X) and heel_idx < len(valid_Y):
+                heel_x = valid_X[heel_idx]
+                heel_y = valid_Y[heel_idx]
+
+                # 유효한 좌표인지 확인
+                if not np.isnan(heel_x) and not np.isnan(heel_y):
+                    heel_point = (int(heel_x), int(heel_y))
+
+                    # 궤적 버퍼 초기화
+                    if heel_name not in heel_trajectory_buffer:
+                        heel_trajectory_buffer[heel_name] = []
+
+                    # 현재 점을 궤적에 추가
+                    heel_trajectory_buffer[heel_name].append(heel_point)
+
+                    # 링 버퍼 방식으로 최대 길이 제한 (None이면 제한 없음)
+                    if max_trajectory_length is not None and len(heel_trajectory_buffer[heel_name]) > max_trajectory_length:
+                        heel_trajectory_buffer[heel_name].pop(0)
+
+                    # 궤적 그리기 (고정 색상 + 50% 투명도)
+                    trajectory = heel_trajectory_buffer[heel_name]
+                    if len(trajectory) > 1:
+                        # 투명도를 위한 오버레이 생성
+                        overlay = img.copy()
+
+                        # 연결선으로 궤적 표시 (오버레이에 그리기)
+                        for i in range(1, len(trajectory)):
+                            cv2.line(overlay, trajectory[i-1], trajectory[i], color, 2)
+
+                        # 50% 투명도로 합성
+                        cv2.addWeighted(overlay, 0.5, img, 0.5, 0, img)
+
+                        # 현재 위치를 원으로 강조 표시 (불투명하게)
+                        cv2.circle(img, heel_point, 5, color, -1)
+                        cv2.circle(img, heel_point, 6, (255, 255, 255), 2)  # 흰색 테두리
+
+
+    return heel_trajectory_buffer
+
+
+def draw_angles(img, valid_X, valid_Y, valid_angles, valid_X_flipped, keypoints_ids, keypoints_names, angle_names, display_angle_values_on= ['body', 'list'], colors=[(255, 0, 0), (0, 255, 0), (0, 0, 255)], fontSize=0.3, thickness=2):
     '''
     Draw angles on the image.
     Angles are displayed as a list on the image and/or on the body.
@@ -496,25 +555,26 @@ def draw_angles(img, valid_X, valid_Y, valid_angles, valid_X_flipped, keypoints_
                             right_angle = True if ang_params[2]==90 else False
                             
                             # Draw angle
-                            if not np.any(np.isnan(ang_coords)):
-                                if len(ang_coords) == 2: # segment angle
-                                    app_point, vec = draw_segment_angle(img, ang_coords, flip)
-                                else: # joint angle
-                                    app_point, vec1, vec2 = draw_joint_angle(img, ang_coords, flip, right_angle)
+                            if len(ang_coords) == 2: # segment angle
+                                app_point, vec = draw_segment_angle(img, ang_coords, flip)
+                            elif 'inversion/eversion' in ang_name: # 내번/외번 각도
+                                app_point, vec1, vec2 = draw_inversion_eversion_angle(img, ang_coords, flip)
+                            else: # joint angle
+                                app_point, vec1, vec2 = draw_joint_angle(img, ang_coords, flip, right_angle)
         
-                                # Write angle on body
-                                if 'body' in display_angle_values_on:
-                                    if len(ang_coords) == 2: # segment angle
-                                        write_angle_on_body(img, ang, app_point, vec, np.array([1,0]), dist=20, color=(255,255,255), fontSize=fontSize, thickness=thickness)
-                                    else: # joint angle
-                                        write_angle_on_body(img, ang, app_point, vec1, vec2, dist=40, color=(0,255,0), fontSize=fontSize, thickness=thickness)
+                            # Write angle on body
+                            if 'body' in display_angle_values_on:
+                                if len(ang_coords) == 2: # segment angle
+                                    write_angle_on_body(img, ang, app_point, vec, np.array([1,0]), dist=20, color=(255,255,255), fontSize=fontSize, thickness=thickness)
+                                else: # joint angle
+                                    write_angle_on_body(img, ang, app_point, vec1, vec2, dist=40, color=(0,255,0), fontSize=fontSize, thickness=thickness)
 
-                                # Write angle as a list on image with progress bar
-                                if 'list' in display_angle_values_on:
-                                    if len(ang_coords) == 2: # segment angle
-                                        ang_label_line = write_angle_as_list(img, ang, ang_name, person_label_position, ang_label_line, color = (255,255,255), fontSize=fontSize, thickness=thickness)
-                                    else:
-                                        ang_label_line = write_angle_as_list(img, ang, ang_name, person_label_position, ang_label_line, color = (0,255,0), fontSize=fontSize, thickness=thickness)
+                            # Write angle as a list on image with progress bar
+                            if 'list' in display_angle_values_on:
+                                if len(ang_coords) == 2: # segment angle
+                                    ang_label_line = write_angle_as_list(img, ang, ang_name, person_label_position, ang_label_line, color = (255,255,255), fontSize=fontSize, thickness=thickness)
+                                else:
+                                    ang_label_line = write_angle_as_list(img, ang, ang_name, person_label_position, ang_label_line, color = (0,255,0), fontSize=fontSize, thickness=thickness)
 
     return img
 
@@ -596,6 +656,41 @@ def draw_joint_angle(img, ang_coords, flip, right_angle):
         cv2.ellipse(img, app_point, (20, 20), 0, start_angle, end_angle, (0, 255, 0), thickness)
 
         return app_point, unit_segment_direction, unit_parentsegment_direction
+
+
+def draw_inversion_eversion_angle(img, ang_coords, flip):
+    """내번/외번 각도 시각화"""
+
+    if len(ang_coords) != 3 or np.any(np.isnan(ang_coords)):
+        return np.array([0, 0]), np.array([0, 0]), np.array([0, 1])
+
+    ankle_point = np.int32(ang_coords[1])
+    heel_point = np.int32(ang_coords[2])
+    heel_vector = heel_point - ankle_point
+
+    if np.linalg.norm(heel_vector) > 0:
+        # 발뒤꿈치 벡터 (2배 연장)
+        extended_heel_point = ankle_point + (heel_vector * 2).astype(int)
+        cv2.line(img, tuple(ankle_point), tuple(extended_heel_point), (255, 255, 255), 2)
+
+        # 각도 호
+        unit_heel = heel_vector / np.linalg.norm(heel_vector)
+        start_angle = np.degrees(np.arctan2(unit_heel[1], unit_heel[0]))
+        end_angle = 90  # 수직선 각도
+
+        if abs(end_angle - start_angle) > 180:
+            if end_angle > start_angle:
+                start_angle += 360
+            else:
+                end_angle += 360
+
+        cv2.ellipse(img, tuple(ankle_point), (20, 20), 0, start_angle, end_angle, (0, 0, 0), 2)
+
+    # 수직 기준선
+    draw_dotted_line(img, ankle_point, np.array([0, 1]), 50,
+                    color=(255, 255, 255), gap=5, dot_length=2, thickness=2)
+
+    return ankle_point, np.array([0, 0]), np.array([0, 1])
 
 
 def write_angle_on_body(img, ang, app_point, vec1, vec2, dist=40, color=(255,255,255), fontSize=0.3, thickness=1):
@@ -791,15 +886,14 @@ def pose_plots(trc_data_unfiltered, trc_data, person_id):
     OUTPUT:
     - matplotlib window with tabbed figures for each keypoint
     '''
-
     os_name = platform.system()
+
     if os_name == 'Windows':
         mpl.use('qt5agg') # windows
-
     mpl.rc('figure', max_open_warning=0)
 
     keypoints_names = trc_data.columns[1::3]
-    
+
     pw = plotWindow()
     pw.MainWindow.setWindowTitle('Person'+ str(person_id) + ' coordinates') # Main title
 
@@ -841,22 +935,16 @@ def angle_plots(angle_data_unfiltered, angle_data, person_id):
     - matplotlib window with tabbed figures for each angle
     '''
 
-    os_name = platform.system()
-    if os_name == 'Windows':
-        mpl.use('qt5agg') # windows
+    mpl.use('qt5agg')
     mpl.rc('figure', max_open_warning=0)
 
     angles_names = angle_data.columns[1:]
-    
+
     pw = plotWindow()
     pw.MainWindow.setWindowTitle('Person'+ str(person_id) + ' angles') # Main title
 
     for id, angle in enumerate(angles_names):
         f = plt.figure()
-        if os_name == 'Windows':
-            f.canvas.manager.window.setWindowTitle(angle + ' Plot') # windows
-        elif os_name == 'Darwin':  # macOS
-            f.canvas.manager.set_window_title(angle + ' Plot') # mac
         
         ax = plt.subplot(111)
         plt.plot(angle_data_unfiltered.iloc[:,0], angle_data_unfiltered.iloc[:,id+1], label='unfiltered')
@@ -1074,7 +1162,6 @@ def select_persons_on_vid(frames, all_pose_coords):
                 bbox=dict(facecolor=UNSELECTED_COLOR, edgecolor=LINE_UNSELECTED_COLOR, boxstyle='square,pad=0.3', path_effects=[patheffects.withSimplePatchShadow()]), zorder=3
             )
             rects.append(rect)
-            annotations.append(annotation)
     img_plot = ax_video.imshow(frame_rgb)
 
     # Slider
@@ -1381,6 +1468,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     calculate_angles = config_dict.get('base').get('calculate_angles')
     save_angles = config_dict.get('base').get('save_angles')
 
+    # 발뒤꿈치 궤적 시각화 설정
+    show_heel_trajectory = config_dict.get('base').get('show_heel_trajectory', False)
+    heel_trajectory_length = config_dict.get('base').get('heel_trajectory_length', 50)
+
+    # 'all'인 경우 전체 프레임 대상으로 설정
+    if heel_trajectory_length == 'all':
+        heel_trajectory_length = None  # None으로 설정하여 제한 없음을 표시
+
     # Pose_advanced settings
     slowmo_factor = config_dict.get('pose').get('slowmo_factor')
     pose_model = config_dict.get('pose').get('pose_model')
@@ -1562,9 +1657,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 logging.error('Error: Pose estimation failed. Check in Config.toml that pose_model and mode are valid.')
                 raise ValueError('Error: Pose estimation failed. Check in Config.toml that pose_model and mode are valid.')
         
-        # if tracking_mode not in ['deepsort', 'sports2d']:
-        #     logging.warning(f"Tracking mode {tracking_mode} not recognized. Using sports2d method.")
-        #     tracking_mode = 'sports2d'
+        if tracking_mode not in ['deepsort', 'sports2d']:
+            logging.warning(f"Tracking mode {tracking_mode} not recognized. Using sports2d method.")
+            tracking_mode = 'sports2d'
         logging.info(f'Pose tracking set up for "{pose_model_name}" model.')
         logging.info(f'Mode: {mode}.\n')
         logging.info(f'Persons are detected every {det_frequency} frames and tracked inbetween. Tracking is done with {tracking_mode}.')
@@ -1586,6 +1681,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     if calculate_angles:
         for ang_name in angle_names:
             ang_params = angle_dict.get(ang_name)
+            if ang_params is None:
+                logging.warning(f"Skipping {ang_name} angle computation because it is not defined in angle_dict.")
+                continue
             kpts = ang_params[0]
             if any(item not in keypoints_names+['Neck', 'Hip'] for item in kpts):
                 logging.warning(f"Skipping {ang_name} angle computation because at least one of the following keypoints is not provided by the model: {ang_params[0]}.")
@@ -1600,6 +1698,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     frame_processing_times = []
     frame_count = 0
     frames = []
+
+    # 발뒤꿈치 궤적 버퍼 초기화
+    heel_trajectory_buffer = {}
     while cap.isOpened():
         # Skip to the starting frame
         if frame_count <= int(t0 * fps) or frame_count < frame_range[0]:
@@ -1642,8 +1743,6 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 if tracking_mode == 'sports2d': 
                     if 'prev_keypoints' not in locals(): prev_keypoints = keypoints
                     prev_keypoints, keypoints, scores = sort_people_sports2d(prev_keypoints, keypoints, scores=scores)
-                else:
-                    pass
 
             
             # Process coordinates and compute angles
@@ -1688,11 +1787,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     person_angles = []
                     for ang_name in angle_names:
                         ang_params = angle_dict.get(ang_name)
-                        kpts = ang_params[0]
-                        if not any(item not in new_keypoints_names for item in kpts):
-                            ang = compute_angle(ang_name, person_X_flipped, person_Y, angle_dict, new_keypoints_ids, new_keypoints_names)
-                        else:
+                        if ang_params is None:
                             ang = np.nan
+                        else:
+                            kpts = ang_params[0]
+                            if not any(item not in new_keypoints_names for item in kpts):
+                                ang = compute_angle(ang_name, person_X_flipped, person_Y, angle_dict, new_keypoints_ids, new_keypoints_names)
+                            else:
+                                ang = np.nan
                         person_angles.append(ang)
                     valid_angles.append(person_angles)
                     valid_X_flipped.append(person_X_flipped)
@@ -1703,11 +1805,24 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             # Draw keypoints and skeleton
             if show_realtime_results:
                 img = frame.copy()
+
+                # 발뒤꿈치 궤적 시각화 (배경에 먼저 그리기 - 모든 사람에 대해)
+                if show_heel_trajectory and len(valid_X) > 0 and len(valid_Y) > 0:
+                    for person_idx in range(len(valid_X)):
+                        person_key = f"person_{person_idx}"
+                        if person_key not in heel_trajectory_buffer:
+                            heel_trajectory_buffer[person_key] = {}
+                        heel_trajectory_buffer[person_key] = draw_heel_trajectory(img, valid_X[person_idx], valid_Y[person_idx],
+                                                                    new_keypoints_ids, new_keypoints_names,
+                                                                    heel_trajectory_buffer[person_key], max_trajectory_length=heel_trajectory_length)
+
+                # 다른 시각화 요소들 (궤적 위에 그리기)
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (255,255,255), thickness+1, cv2.LINE_AA)
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (0,0,255), thickness, cv2.LINE_AA)
                 img = draw_bounding_box(img, valid_X, valid_Y, colors=colors, fontSize=fontSize, thickness=thickness)
                 img = draw_keypts(img, valid_X, valid_Y, valid_scores, cmap_str='RdYlGn')
                 img = draw_skel(img, valid_X, valid_Y, pose_model)
+
                 if calculate_angles:
                     img = draw_angles(img, valid_X, valid_Y, valid_angles, valid_X_flipped, new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
                 cv2.imshow(f'{video_file} Sports2D', img)
@@ -1829,15 +1944,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     logging.info(f'- Person {i}: Interpolating missing sequences if they are smaller than {interp_gap_smaller_than} frames. Large gaps filled with {fill_large_gaps_with}.')
                     all_frames_X_person_interp = all_frames_X_person.apply(interpolate_zeros_nans, axis=0, args = [interp_gap_smaller_than, 'linear'])
                     all_frames_Y_person_interp = all_frames_Y_person.apply(interpolate_zeros_nans, axis=0, args = [interp_gap_smaller_than, 'linear'])
-
                     if fill_large_gaps_with.lower() == 'last_value':
-                        for col in all_frames_X_person_interp.columns:
-                            first_run_start, last_run_end = indices_of_first_last_non_nan_chunks(all_frames_Y_person_interp[col])
-                            for coord_df in [all_frames_X_person_interp, all_frames_Y_person_interp, all_frames_Z_homog]:
-                                coord_df.loc[:first_run_start, col] = np.nan
-                                coord_df.loc[last_run_end:, col] = np.nan
-                                coord_df.loc[first_run_start:last_run_end, col] = coord_df.loc[first_run_start:last_run_end, col].ffill().bfill()
-
+                        all_frames_X_person_interp = all_frames_X_person_interp.ffill(axis=0).bfill(axis=0)
+                        all_frames_Y_person_interp = all_frames_Y_person_interp.ffill(axis=0).bfill(axis=0)
                     elif fill_large_gaps_with.lower() == 'zeros':
                         all_frames_X_person_interp.replace(np.nan, 0, inplace=True)
                         all_frames_Y_person_interp.replace(np.nan, 0, inplace=True)
@@ -1959,13 +2068,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     # Convert to meters
                     px_to_m_i = [convert_px_to_meters(trc_data[i][kpt_name], first_person_height, height_px, cx, cy, -floor_angle_estim, visible_side=visible_side_i) for kpt_name in new_keypoints_names]
                     trc_data_m_i = pd.concat([all_frames_time.rename('time')]+px_to_m_i, axis=1)
-                    for c in 3*np.arange(len(trc_data_m_i.columns[3::3]))+1: # only X coordinates
-                        first_run_start, last_run_end = indices_of_first_last_non_nan_chunks(trc_data_m_i.iloc[:,c])
-                        trc_data_m_i.iloc[:first_run_start,c+2] = np.nan
-                        trc_data_m_i.iloc[last_run_end:,c+2] = np.nan
-                        trc_data_m_i.iloc[first_run_start:last_run_end,c+2] = trc_data_m_i.iloc[first_run_start:last_run_end,c+2].ffill().bfill()
-                    first_trim, last_trim = trc_data_m_i.isnull().any(axis=1).idxmin(), trc_data_m_i[::-1].isnull().any(axis=1).idxmin()
-                    trc_data_m_i = trc_data_m_i.iloc[first_trim:last_trim+1,:]
+                    trc_data_m_i = trc_data_m_i.ffill(axis=0).bfill(axis=0)
                     px_to_m_unfiltered_i = [convert_px_to_meters(trc_data_unfiltered[i][kpt_name], first_person_height, height_px, cx, cy, -floor_angle_estim) for kpt_name in new_keypoints_names]
                     trc_data_unfiltered_m_i = pd.concat([all_frames_time.rename('time')]+px_to_m_unfiltered_i, axis=1)
 
@@ -2032,10 +2135,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
         # unwrap angles
         # all_frames_angles_homog = np.unwrap(all_frames_angles_homog, axis=0, period=180) # This give all nan values -> need to mask nans
-        for i in range(all_frames_angles_homog.shape[1]):  # for each person
-            for j in range(all_frames_angles_homog.shape[2]):  # for each angle
-                valid_mask = ~np.isnan(all_frames_angles_homog[:, i, j])
-                all_frames_angles_homog[valid_mask, i, j] = np.unwrap(all_frames_angles_homog[valid_mask, i, j], period=180)
+        # for i in range(all_frames_angles_homog.shape[1]):  # for each person
+        #     for j in range(all_frames_angles_homog.shape[2]):  # for each angle
+        #         valid_mask = ~np.isnan(all_frames_angles_homog[:, i, j])
+        #         all_frames_angles_homog[valid_mask, i, j] = np.unwrap(all_frames_angles_homog[valid_mask, i, j], period=180)
 
         # Process angles for each person
         for i, idx_person in enumerate(selected_persons):
@@ -2057,11 +2160,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     logging.info(f'- Person {i}: Interpolating missing sequences if they are smaller than {interp_gap_smaller_than} frames. Large gaps filled with {fill_large_gaps_with}.')
                     all_frames_angles_person_interp = all_frames_angles_person.apply(interpolate_zeros_nans, axis=0, args = [interp_gap_smaller_than, 'linear'])
                     if fill_large_gaps_with == 'last_value':
-                        for col in all_frames_angles_person_interp.columns:
-                            first_run_start, last_run_end = indices_of_first_last_non_nan_chunks(all_frames_angles_person_interp[col])
-                            all_frames_angles_person_interp.loc[:first_run_start, col] = np.nan
-                            all_frames_angles_person_interp.loc[last_run_end:, col] = np.nan
-                            all_frames_angles_person_interp.loc[first_run_start:last_run_end, col] = all_frames_angles_person_interp.loc[first_run_start:last_run_end, col].ffill().bfill()
+                        all_frames_angles_person_interp = all_frames_angles_person_interp.ffill(axis=0).bfill(axis=0)
                     elif fill_large_gaps_with == 'zeros':
                         all_frames_angles_person_interp.replace(np.nan, 0, inplace=True)
                 
@@ -2142,12 +2241,30 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 max_id+=1
         new_keypoints_ids = list(range(len(new_keypoints_ids)))
 
+        # 저장용 발뒤꿈치 궤적 버퍼 초기화 (사람별로 관리)
+        save_heel_trajectory_buffer = {}
+
         # Draw pose and angles
         for frame_count, (frame, valid_X, valid_X_flipped, valid_Y, valid_scores, valid_angles) in enumerate(zip(frames, all_frames_X_processed, all_frames_X_flipped_processed, all_frames_Y_processed, all_frames_scores_processed, all_frames_angles_processed)):
             img = frame.copy()
+
+            # Heel 궤적 시각화 (배경에 먼저 그리기 - 저장용 - 모든 사람에 대해)
+            if show_heel_trajectory and len(valid_X) > 0 and len(valid_Y) > 0:
+                for person_idx in range(len(valid_X)):
+                    person_key = f"person_{person_idx}"
+                    if person_key not in save_heel_trajectory_buffer:
+                        save_heel_trajectory_buffer[person_key] = {}
+                    save_heel_trajectory_buffer[person_key] = draw_heel_trajectory(img, valid_X[person_idx], valid_Y[person_idx],
+                                                                     new_keypoints_ids, new_keypoints_names,
+                                                                     save_heel_trajectory_buffer[person_key], max_trajectory_length=heel_trajectory_length)
+                    # save heel trajectories in .csv file
+                    
+
+            # 다른 시각화 요소들 (궤적 위에 그리기)
             img = draw_bounding_box(img, valid_X, valid_Y, colors=colors, fontSize=fontSize, thickness=thickness)
             img = draw_keypts(img, valid_X, valid_Y, valid_scores, cmap_str='RdYlGn')
             img = draw_skel(img, valid_X, valid_Y, pose_model_with_new_ids)
+
             if calculate_angles:
                 img = draw_angles(img, valid_X, valid_Y, valid_angles, valid_X_flipped, new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
 
@@ -2155,7 +2272,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             if save_vid:
                 out_vid.write(img)
             if save_img:
-                cv2.imwrite(str((img_output_dir / f'{output_dir_name}_{(frame_count):06d}.png')), img)
+                cv2.imwrite(str((img_output_dir / f'{output_dir_name}_{(frame_count-1):06d}.png')), img)
 
         if save_vid:
             out_vid.release()

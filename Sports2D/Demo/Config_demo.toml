@@ -12,14 +12,14 @@
 
 
 [base]
-video_input = 'demo.mp4'   # 'webcam' or '<video_path.ext>', or ['video1_path.mp4', 'video2_path.avi>', ...]
+video_input = '후면_phase1_2.mp4'   # 'webcam' or '<video_path.ext>', or ['video1_path.mp4', 'video2_path.avi>', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
 nb_persons_to_detect = 'all'   # int or 'all' # Limiting or not the number of persons to be analyzed
 person_ordering_method = 'on_click' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size',  'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
 first_person_height = 1.65  # Height of the reference person in meters (for pixels -> meters conversion: not used if a calibration file is provided)
-visible_side = ['auto', 'front', 'none']  # Choose visible side among ['right', 'left', 'front', 'back', 'auto', 'none']. String or list of strings.
+visible_side = ['back']  # Choose visible side among ['right', 'left', 'front', 'back', 'auto', 'none']. String or list of strings.
                   # if 'auto', will be either 'left', 'right', or 'front' depending on the direction of the motion
                   # if 'none', coordinates will be left in 2D rather than 3D
 
@@ -37,12 +37,15 @@ input_size = [1280, 720] # [W, H]. Lower resolution will be faster but less prec
 
 show_realtime_results = true
 save_vid = true
-save_img = true
+save_img = false
 save_pose = true
 calculate_angles = true
 save_angles = true
 result_dir = '' # If empty, project dir is current dir
 
+# 발뒤꿈치 궤적 시각화 설정
+show_heel_trajectory = false  # 발뒤꿈치 궤적 표시 여부
+heel_trajectory_length = 'all'  # 궤적 길이: 숫자(프레임 수) 또는 'all'(전체 영상)
 
 ##########################
 # ADVANCED CONFIGURATION #
@@ -62,7 +65,7 @@ pose_model = 'Body_with_feet'  #With RTMLib:
                          # - Animal (ANIMAL2D_17)
                          # /!\ Only RTMPose is natively embeded in Pose2Sim. For all other pose estimation methods, you will have to run them yourself, and then refer to the documentation to convert the output files if needed
                          # /!\ For Face and Animal, use mode="""{dictionary}""", and find the corresponding .onnx model there https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose
-mode = 'balanced' # 'lightweight', 'balanced', 'performance', or """{dictionary}""" (see below)
+mode = 'performance' # 'lightweight', 'balanced', 'performance', or """{dictionary}""" (see below)
 
 # A dictionary (WITHIN THREE DOUBLE QUOTES) allows you to manually select the person detection (if top_down approach) and/or pose estimation models (see https://github.com/Tau-J/rtmlib). 
 # Models can be local paths or URLs.
@@ -84,7 +87,7 @@ mode = 'balanced' # 'lightweight', 'balanced', 'performance', or """{dictionary}
 #          'pose_model':'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-ap10k_pt-aic-coco_210e-256x256-7a041aa1_20230206.zip',
 #          'pose_input_size':[256,256]}"""
 
-det_frequency = 4       # Run person detection only every N frames, and inbetween track previously detected bounding boxes (keypoint detection is still run on all frames). 
+det_frequency = 1       # Run person detection only every N frames, and inbetween track previously detected bounding boxes (keypoint detection is still run on all frames). 
                         # Equal to or greater than 1, can be as high as you want in simple uncrowded cases. Much faster, but might be less accurate. 
 device = 'auto' # 'auto', 'CPU', 'CUDA', 'MPS', 'ROCM'
 backend = 'auto' # 'auto', 'openvino', 'onnxruntime', 'opencv'
@@ -115,17 +118,22 @@ calib_file = ''         # Calibration in the Pose2Sim format. 'calib_demo.toml',
 
 [angles]
 display_angle_values_on = ['body', 'list'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
-fontSize = 0.3
+fontSize = 0.4
 
 # Select joint angles among
-# ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']
-joint_angles = ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']
+# ['Right inversion/eversion', 'Left inversion/eversion', 'Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']
+joint_angles = ['Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']
+# joint_angles = []
+
 # Select segment angles among
 # ['Right foot', 'Left foot', 'Right shank', 'Left shank', 'Right thigh', 'Left thigh', 'Pelvis', 'Trunk', 'Shoulders', 'Head', 'Right arm', 'Left arm', 'Right forearm', 'Left forearm']
-segment_angles = ['Right foot', 'Left foot', 'Right shank', 'Left shank', 'Right thigh', 'Left thigh', 'Pelvis', 'Trunk', 'Shoulders', 'Head', 'Right arm', 'Left arm', 'Right forearm', 'Left forearm']
+# segment_angles = ['Right shank', 'Left shank', 'Right thigh', 'Left thigh', 'Pelvis', 'Trunk', 'Shoulders', 'Head', 'Right arm', 'Left arm', 'Right forearm', 'Left forearm']
+# segment_angles = []
+segment_angles = ['Right inversion/eversion', 'Left inversion/eversion']
+
 
 # Processing parameters
-flip_left_right = true  # Same angles whether the participant faces left/right. Set it to false if you want timeseries to be continuous even when the participent switches their stance.
+flip_left_right = false  # Same angles whether the participant faces left/right. Set it to false if you want timeseries to be continuous even when the participent switches their stance.
 correct_segment_angles_with_floor_angle = true # If the camera is tilted, corrects segment angles as regards to the floor angle. Set to false is the floor is tilted instead
 
 
@@ -150,7 +158,7 @@ filter_type = 'butterworth'   # butterworth, gaussian, LOESS, median
 
 [kinematics]
 do_ik = false # Do scaling and inverse kinematics?
-use_augmentation = false  # true or false (lowercase) # Set to true if you want to use the model with augmented markers
+use_augmentation = true  # true or false (lowercase) # Set to true if you want to use the model with augmented markers
 feet_on_floor = false # true or false (lowercase) # Set to false if you want to use the model with feet not on the floor (e.g. running, jumping, etc.)
 use_simple_model = false # true or false # >10 times faster IK if true. No muscles, no constraints (eg stiff spine and shoulders, no patella)
 participant_mass = [55.0, 67.0] # kg # defaults to 70 if not provided. No influence on kinematics (motion), only on kinetics (forces)
