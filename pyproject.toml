@@ -37,6 +37,15 @@ dependencies = [
     "Pose2Sim>=0.10.40"
 ]
 
+[project.optional-dependencies]
+# SynthPose support (VitPose pose estimation)
+# Note: RT-DETRv4 requires manual installation - see Sports2D/models/rtdetrv4/README.md
+synthpose = [
+    "torch",
+    "torchvision", 
+    "transformers",
+]
+
 [tool.setuptools_scm]
 
 [tool.setuptools]

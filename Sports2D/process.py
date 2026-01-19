@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+# Fix OpenMP runtime conflict: multiple copies of libiomp5md.dll
+# This occurs when PyTorch, NumPy(MKL), onnxruntime, etc. load their own OpenMP runtime
+# Must be set BEFORE importing numpy, torch, or any library that uses OpenMP
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 
 '''
     ##############################################################
@@ -79,6 +85,19 @@ from matplotlib import patheffects
 from rtmlib import PoseTracker, BodyWithFeet, Wholebody, Body, Hand, Custom
 from rtmlib.tools.object_detection.post_processings import nms
 
+# SynthPose integration - lazy import to avoid dependency issues
+SYNTHPOSE_AVAILABLE = False
+try:
+    from Sports2D.Utilities.synthpose_tracker import SynthPosePoseTracker
+    from Sports2D.Utilities.synthpose_skeleton import (
+        create_synthpose_skeleton,
+        SYNTHPOSE_KEYPOINT_NAMES,
+        SYNTHPOSE_SKELETON_LINKS,
+    )
+    SYNTHPOSE_AVAILABLE = True
+except ImportError:
+    pass
+
 from Sports2D.Utilities.common import *
 from Pose2Sim.common import *
 from Pose2Sim.skeletons import *
@@ -97,6 +116,144 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid valu
 # Not safe, but to be used until OpenMMLab/RTMlib's SSL certificates are updated
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
+
+# SynthPose-specific drawing functions
+def draw_synthpose_keypoints(img, all_X, all_Y, all_scores, keypoint_names=None, thickness=1):
+    '''
+    Draw SynthPose 52 keypoints with special styling:
+    - HALPE26 (bodywithfeet): Colored circles at normal size
+    - Other anatomical markers: 1/2 size diamonds (white color)
+    
+    HALPE26 bodywithfeet keypoints:
+    - COCO17 body (0-16): Nose, Eyes, Ears, Shoulders, Elbows, Wrists, Hips, Knees, Ankles
+    - Foot keypoints (40-47): R5Meta, L5Meta, RToe, LToe, RBigToe, LBigToe, LHeel, RHeel
+    
+    Uses keypoint NAMES (not IDs) to distinguish HALPE26 from other anatomical markers,
+    so it works correctly even after keypoint IDs are reordered.
+    
+    INPUTS:
+    - img: OpenCV image
+    - all_X: list of x coordinates for each person
+    - all_Y: list of y coordinates for each person
+    - all_scores: list of scores for each person
+    - keypoint_names: list of keypoint names (required for correct HALPE26/Anatomical distinction)
+    - thickness: int. Line thickness
+    
+    OUTPUT:
+    - img: Image with drawn keypoints
+    '''
+    from Sports2D.Utilities.synthpose_skeleton import (
+        SYNTHPOSE_KEYPOINT_COLORS, 
+        SYNTHPOSE_HALPE26_BODYWITHFEET_NAMES,
+        SYNTHPOSE_KEYPOINT_NAMES
+    )
+    
+    radius = thickness + 4  # Same as default in Pose2Sim
+    
+    for person_id, (X, Y, scores) in enumerate(zip(all_X, all_Y, all_scores)):
+        if np.isnan(X).all():
+            continue
+            
+        for kp_id in range(len(X)):
+            if np.isnan(X[kp_id]) or np.isnan(Y[kp_id]) or np.isnan(scores[kp_id]):
+                continue
+                
+            x_coord, y_coord = int(X[kp_id]), int(Y[kp_id])
+            score = scores[kp_id]
+            
+            # Skip if score is below threshold
+            if score < 0.3:
+                continue
+            
+            # Determine if this is HALPE26 bodywithfeet or other anatomical marker based on keypoint NAME
+            is_halpe26 = False
+            kp_name = None
+            if keypoint_names is not None and kp_id < len(keypoint_names):
+                kp_name = keypoint_names[kp_id]
+                is_halpe26 = kp_name in SYNTHPOSE_HALPE26_BODYWITHFEET_NAMES
+            else:
+                # Fallback: use ID-based check (only works for original IDs)
+                # HALPE26 = COCO17 (0-16) + Foot keypoints (40-47)
+                is_halpe26 = kp_id < 17 or (40 <= kp_id <= 47)
+            
+            if not is_halpe26:
+                # Other anatomical marker: 1/2 size diamond (white color)
+                diamond_radius = radius // 2
+                points = np.array([
+                    [x_coord, y_coord - diamond_radius],  # top
+                    [x_coord + diamond_radius, y_coord],  # right
+                    [x_coord, y_coord + diamond_radius],  # bottom
+                    [x_coord - diamond_radius, y_coord]   # left
+                ], np.int32)
+                cv2.fillPoly(img, [points], (255, 255, 255))  # White
+            else:
+                # HALPE26 bodywithfeet marker: Colored circle at normal size
+                # Get color based on keypoint name (lookup original ID in SYNTHPOSE_KEYPOINT_NAMES)
+                if kp_name is not None:
+                    try:
+                        original_id = SYNTHPOSE_KEYPOINT_NAMES.index(kp_name)
+                        color = SYNTHPOSE_KEYPOINT_COLORS[original_id]
+                    except (ValueError, IndexError):
+                        color = (0, 255, 0)  # Default green
+                else:
+                    color = SYNTHPOSE_KEYPOINT_COLORS[kp_id] if kp_id < len(SYNTHPOSE_KEYPOINT_COLORS) else (0, 255, 0)
+                cv2.circle(img, (x_coord, y_coord), radius, tuple(color), -1)
+    
+    return img
+
+def draw_synthpose_skeleton(img, all_X, all_Y, pose_model, thickness=1):
+    '''
+    Draw SynthPose skeleton using pose_model tree structure.
+    Uses parent-child relationships from anytree, not hardcoded ID links,
+    so it works correctly even after keypoint IDs are reordered.
+    
+    INPUTS:
+    - img: OpenCV image
+    - all_X: list of x coordinates for each person
+    - all_Y: list of y coordinates for each person
+    - pose_model: Skeleton tree structure (anytree Node)
+    - thickness: int. Line thickness
+    
+    OUTPUT:
+    - img: Image with drawn skeleton
+    '''
+    from Sports2D.Utilities.synthpose_skeleton import SYNTHPOSE_KEYPOINT_COLORS
+    from anytree import PreOrderIter
+    
+    for person_id, (X, Y) in enumerate(zip(all_X, all_Y)):
+        if np.isnan(X).all():
+            continue
+        
+        # Use anytree parent-child relationships (works with reordered IDs)
+        for node in PreOrderIter(pose_model):
+            if node.parent is None:
+                continue  # Skip root node
+            
+            child_id = node.id
+            parent_id = node.parent.id
+            
+            # Skip if either node has no valid ID
+            if child_id is None or parent_id is None:
+                continue
+            
+            # Skip if out of bounds
+            if child_id >= len(X) or parent_id >= len(X):
+                continue
+            
+            x1, y1 = X[parent_id], Y[parent_id]
+            x2, y2 = X[child_id], Y[child_id]
+            
+            if np.isnan(x1) or np.isnan(y1) or np.isnan(x2) or np.isnan(y2):
+                continue
+            
+            # Determine color: gray for anatomical markers, colored for COCO17
+            # Note: After reordering, we can't rely on original IDs for color
+            # Use a consistent gray/white for skeleton lines
+            color = (200, 200, 200)  # Gray for all skeleton lines
+            
+            cv2.line(img, (int(x1), int(y1)), (int(x2), int(y2)), tuple(color), thickness)
+    
+    return img
 
 
 DEFAULT_MASS = 70
@@ -1477,6 +1634,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     backend = config_dict.get('pose').get('backend')
     device = config_dict.get('pose').get('device')
     tracking_mode = config_dict.get('pose').get('tracking_mode')
+    synthpose_detector = config_dict.get('pose').get('synthpose_detector', 'yolox')  # 'yolox' or 'rtdetr'
     if tracking_mode == 'deepsort':
         from deep_sort_realtime.deepsort_tracker import DeepSort
         deepsort_params = config_dict.get('pose').get('deepsort_params')
@@ -1648,10 +1806,35 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     # Select the appropriate model based on the model_type
     logging.info('\nEstimating pose...')
     pose_model_name = pose_model
-    pose_model, ModelClass, mode = setup_model_class_mode(pose_model, mode, config_dict)
+    
+    # Check if SynthPose is requested
+    use_synthpose = pose_model_name.lower() in ['synthpose', 'synthpose_base']
+    
+    if use_synthpose:
+        # SynthPose mode
+        if not SYNTHPOSE_AVAILABLE:
+            raise ImportError(
+                "SynthPose is not available. Install with: pip install torch transformers\n"
+                "Or use a different pose_model (body_with_feet, whole_body, body, etc.)"
+            )
+        synthpose_mode = 'huge' if pose_model_name.lower() == 'synthpose' else 'base'
+        # Use full 52-keypoint SynthPose skeleton for angle calculation and visualization
+        pose_model = create_synthpose_skeleton()
+        ModelClass = None  # Not used for SynthPose
+        mode = synthpose_mode
+        logging.info(f'Using SynthPose ({synthpose_mode}) - VitPose from HuggingFace Transformers with 52 keypoints')
+    else:
+        # RTMLib mode (default)
+        pose_model, ModelClass, mode = setup_model_class_mode(pose_model, mode, config_dict)
     
     # Select device and backend
-    backend, device = setup_backend_device(backend=backend, device=device)
+    if use_synthpose:
+        # SynthPose uses PyTorch directly, not ONNX - skip Pose2Sim backend setup
+        # Device will be auto-detected by SynthPosePoseTracker using torch.cuda.is_available()
+        pass  # Keep original device value from config ('auto', 'cuda', 'cpu', etc.)
+    else:
+        # RTMLib uses ONNX backends
+        backend, device = setup_backend_device(backend=backend, device=device)
 
     # Skip pose estimation or set it up:
     if load_trc_px:
@@ -1683,16 +1866,32 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         kpt_id_max = max(keypoints_ids)+1
 
         # Set up pose tracker
-        try:
-            pose_tracker = setup_pose_tracker(ModelClass, det_frequency, mode, False, backend, device)
-        except: # for multi-threading
+        if use_synthpose:
+            # Use SynthPose tracker
             try:
-                import time
-                time.sleep(3)
+                pose_tracker = SynthPosePoseTracker(
+                    mode=synthpose_mode,
+                    device=device,
+                    det_frequency=det_frequency,
+                    person_threshold=keypoint_likelihood_threshold,
+                    detector=synthpose_detector
+                )
+                logging.info(f'SynthPose tracker initialized with mode={synthpose_mode}, device={device}, detector={synthpose_detector}, outputting 52 keypoints')
+            except Exception as e:
+                logging.error(f'Error: SynthPose initialization failed: {e}')
+                raise ValueError(f'Error: SynthPose initialization failed: {e}')
+        else:
+            # Use RTMLib tracker (default)
+            try:
                 pose_tracker = setup_pose_tracker(ModelClass, det_frequency, mode, False, backend, device)
-            except:
-                logging.error('Error: Pose estimation failed. Check in Config.toml that pose_model and mode are valid.')
-                raise ValueError('Error: Pose estimation failed. Check in Config.toml that pose_model and mode are valid.')
+            except: # for multi-threading
+                try:
+                    import time
+                    time.sleep(3)
+                    pose_tracker = setup_pose_tracker(ModelClass, det_frequency, mode, False, backend, device)
+                except:
+                    logging.error('Error: Pose estimation failed. Check in Config.toml that pose_model and mode are valid.')
+                    raise ValueError('Error: Pose estimation failed. Check in Config.toml that pose_model and mode are valid.')
         logging.info(f'Persons detection is run every {det_frequency} frames (pose estimation is run at every frame). Tracking is done with {tracking_mode}.')
         
         if tracking_mode == 'deepsort': 
@@ -1910,8 +2109,21 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (255,255,255), thickness+1, cv2.LINE_AA)
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (0,0,255), thickness, cv2.LINE_AA)
                 img = draw_bounding_box(img, valid_X, valid_Y, colors=colors, fontSize=fontSize, thickness=thickness)
-                img = draw_keypts(img, valid_X, valid_Y, valid_scores, cmap_str='RdYlGn')
-                img = draw_skel(img, valid_X, valid_Y, pose_model)
+                # Use SynthPose-specific drawing for anatomical markers (white, 1/2 size)
+                if use_synthpose:
+                    # For realtime visualization, data is in original SynthPose order (indices 0-51)
+                    # Use SYNTHPOSE_KEYPOINT_NAMES for correct name-to-index mapping
+                    from Sports2D.Utilities.synthpose_skeleton import SYNTHPOSE_KEYPOINT_NAMES
+                    realtime_kpt_names = list(SYNTHPOSE_KEYPOINT_NAMES)
+                    # Add Hip/Neck if they were added to the data
+                    for kpt in ['Hip', 'Neck']:
+                        if kpt in new_keypoints_names and kpt not in realtime_kpt_names:
+                            realtime_kpt_names.append(kpt)
+                    img = draw_synthpose_keypoints(img, valid_X, valid_Y, valid_scores, keypoint_names=realtime_kpt_names, thickness=thickness)
+                    img = draw_synthpose_skeleton(img, valid_X, valid_Y, pose_model, thickness=thickness)
+                else:
+                    img = draw_keypts(img, valid_X, valid_Y, valid_scores, cmap_str='RdYlGn')
+                    img = draw_skel(img, valid_X, valid_Y, pose_model)
                 if calculate_angles:
                     img = draw_angles(img, valid_X, valid_Y, valid_angles_flipped, valid_X_flipped, new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
                 cv2.imshow(f'{video_file} Sports2D', img)
@@ -2491,8 +2703,13 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 raise ValueError(f"Could not read frame {i}")
             img = frame.copy()
             img = draw_bounding_box(img, all_frames_X_processed[i], all_frames_Y_processed[i], colors=colors, fontSize=fontSize, thickness=thickness)
-            img = draw_keypts(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_scores_processed[i], cmap_str='RdYlGn')
-            img = draw_skel(img, all_frames_X_processed[i], all_frames_Y_processed[i], pose_model_with_new_ids)
+            # Use SynthPose-specific drawing for anatomical markers (white, 1/2 size) - matching realtime visualization
+            if use_synthpose:
+                img = draw_synthpose_keypoints(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_scores_processed[i], keypoint_names=new_keypoints_names, thickness=thickness)
+                img = draw_synthpose_skeleton(img, all_frames_X_processed[i], all_frames_Y_processed[i], pose_model_with_new_ids, thickness=thickness)
+            else:
+                img = draw_keypts(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_scores_processed[i], cmap_str='RdYlGn')
+                img = draw_skel(img, all_frames_X_processed[i], all_frames_Y_processed[i], pose_model_with_new_ids)
             if calculate_angles:
                 img = draw_angles(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_angles_processed[i], all_frames_X_flipped_processed[i], new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
 

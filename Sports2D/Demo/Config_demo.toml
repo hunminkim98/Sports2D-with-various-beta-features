@@ -12,7 +12,7 @@
 
 
 [base]
-video_input = 'demo.mp4'   # 'webcam' or '<video_path.ext>', or ['video1_path.mp4', 'video2_path.avi>', ...]
+video_input = ['KHM1.mp4', 'KHM2.mp4', 'KHM3.mp4', 'KHM4.mp4', 'KHM5.mp4', 'KHM6.mp4', 'KHM7.mp4']   # 'webcam' or '<video_path.ext>', or ['video1_path.mp4', 'video2_path.avi>', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
@@ -52,7 +52,10 @@ result_dir = '' # If empty, project dir is current dir
 slowmo_factor = 1       # 1 for normal speed. For a video recorded at 240 fps and exported to 30 fps, it would be 240/30 = 8
 
 # Pose detection parameters
-pose_model = 'Body_with_feet'  #With RTMLib: 
+pose_model = 'Body_with_feet'  # Available models:
+synthpose_detector = 'rtdetrv4'  # 'yolox' (rtmlib, faster), 'rtdetr' (HuggingFace), or 'rtdetrv4' (local checkpoint, RT-DETRv4 state-of-the-art)
+                         #
+                         # RTMLib models (default, uses ONNX):
                          # - Body_with_feet (default HALPE_26 model), 
                          # - Whole_body_wrist (COCO_133_WRIST: body + feet + 2 hand_points), 
                          # - Whole_body (COCO_133: body + feet + hands), 
@@ -60,9 +63,16 @@ pose_model = 'Body_with_feet'  #With RTMLib:
                          # - Hand (HAND_21, only lightweight mode. Potentially better results with Whole_body), 
                          # - Face (FACE_106), 
                          # - Animal (ANIMAL2D_17)
+                         #
+                         # SynthPose models (requires: pip install torch transformers):
+                         # - synthpose (VitPose-huge from Stanford MIMI, 52 keypoints mapped to HALPE_26, more accurate)
+                         # - synthpose_base (VitPose-base, faster but less accurate)
+                         # SynthPose uses RT-DETR for person detection and VitPose for pose estimation.
+                         # Models are automatically downloaded from HuggingFace on first use.
+                         #
                          # ⚠ Only RTMPose is natively embeded in Pose2Sim. For all other pose estimation methods, you will have to run them yourself, and then refer to the documentation to convert the output files if needed
                          # ⚠ For Face and Animal, use mode="""{dictionary}""", and find the corresponding .onnx model there https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose
-mode = 'balanced' # 'lightweight', 'balanced', 'performance', or """{dictionary}""" (see below)
+mode = 'performance' # 'lightweight', 'balanced', 'performance', or """{dictionary}""" (see below)
 
 # A dictionary (WITHIN THREE DOUBLE QUOTES) allows you to manually select the person detection (if top_down approach) and/or pose estimation models (see https://github.com/Tau-J/rtmlib). 
 # Models can be local paths or URLs.
@@ -84,7 +94,7 @@ mode = 'balanced' # 'lightweight', 'balanced', 'performance', or """{dictionary}
 #          'pose_model':'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-ap10k_pt-aic-coco_210e-256x256-7a041aa1_20230206.zip',
 #          'pose_input_size':[256,256]}"""
 
-det_frequency = 4       # Run person detection only every N frames, and inbetween track previously detected bounding boxes (keypoint detection is still run on all frames). 
+det_frequency = 1       # Run person detection only every N frames, and inbetween track previously detected bounding boxes (keypoint detection is still run on all frames). 
                         # Equal to or greater than 1, can be as high as you want in simple uncrowded cases. Much faster, but might be less accurate. 
 device = 'auto' # 'auto', 'CPU', 'CUDA', 'MPS', 'ROCM'
 backend = 'auto' # 'auto', 'openvino', 'onnxruntime', 'opencv'
@@ -123,7 +133,7 @@ calib_file = ''      # Calibration file in the Pose2Sim toml format, or '' if no
 
 [angles]
 display_angle_values_on = ['body', 'list'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
-fontSize = 0.3
+fontSize = 0.5
 
 # Select joint angles among
 # ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']
@@ -147,7 +157,7 @@ min_chunk_size = 10     # Minimum number of valid frames in a row to keep a chun
 reject_outliers = true  # Hampel filter for outlier rejection before other filtering methods. Rejects outliers that are outside of a 95% confidence interal from the median in a sliding window of size 7.
 
 filter = true
-show_graphs = true         # Show plots of raw and processed results
+show_graphs = false         # Show plots of raw and processed results
 save_graphs = true         # Save position and angle plots of raw and processed results
 filter_type = 'butterworth'     # butterworth, kalman, gcv_spline, gaussian, loess, median, butterworth_on_speed
    
@@ -179,8 +189,8 @@ filter_type = 'butterworth'     # butterworth, kalman, gcv_spline, gaussian, loe
 
 
 [kinematics]
-do_ik = false # Do scaling and inverse kinematics?
-use_augmentation = false  # true or false (lowercase) # Set to true if you want to use the model with augmented markers
+do_ik = true # Do scaling and inverse kinematics?
+use_augmentation = true  # true or false (lowercase) # Set to true if you want to use the model with augmented markers
 feet_on_floor = false # true or false (lowercase) # Set to false if you want to use the model with feet not on the floor (e.g. running, jumping, etc.)
 use_simple_model = false # true or false # IK 10+ times faster, but no muscles or flexible spine, no patella
 participant_mass = [55.0, 67.0] # kg # defaults to 70 if not provided. No influence on kinematics (motion), only on kinetics (forces)
