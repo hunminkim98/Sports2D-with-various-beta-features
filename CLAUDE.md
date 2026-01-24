@@ -173,7 +173,7 @@ keypoints, scores = backend(frame)
 |-----------|--------|-----------|
 | `device` | Affects ONNX provider | Affects PyTorch device (cuda/mps/cpu) |
 | `backend` | ONNX provider (onnxruntime/openvino/opencv) | **Ignored** (always PyTorch) |
-| `mode` | Model quality (lightweight/balanced/performance) | **Ignored** (uses pose_model name) |
+| `mode` | Model quality (lightweight/balanced/performance) | VitPose selection: performance→huge, balanced→base, lightweight→base+warning |
 | `synthpose_detector` | **Ignored** | Person detector (yolox/rtdetr/rtdetrv4) |
 
 ## Key Implementation Details

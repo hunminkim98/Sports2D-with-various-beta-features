@@ -86,15 +86,20 @@ pose_model = 'synthpose'
 synthpose_detector = 'yolox'
 
 ## ============================================================
-## Mode Selection (RTMLib only, ignored for SynthPose)
+## Mode Selection (Works for both RTMLib and SynthPose)
 ## ============================================================
-## For RTMLib models:
+## RTMLib models:
 ##   - 'lightweight': Fastest inference, lower accuracy
 ##   - 'balanced': Good balance of speed and accuracy
 ##   - 'performance': Highest accuracy, slower inference
 ##   - """{dictionary}""": Custom model configuration (see examples below)
 ##
-## Note: This parameter is IGNORED for SynthPose models.
+## SynthPose models (when pose_model='synthpose'):
+##   - 'performance': VitPose-huge (most accurate, ~2GB model)
+##   - 'balanced': VitPose-base (faster, good accuracy)
+##   - 'lightweight': NOT SUPPORTED → Falls back to VitPose-base with warning
+##
+## Note: If pose_model='synthpose_base' is set explicitly, mode is ignored.
 ##
 mode = 'performance'
 

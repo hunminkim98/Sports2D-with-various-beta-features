@@ -230,6 +230,16 @@ class SynthPoseBackend(PoseBackend):
     - 52 keypoints (17 COCO + 35 anatomical markers)
     - Multiple detector options (yolox, rtdetr, rtdetrv4)
 
+    Model Selection:
+        SynthPose supports RTMLib-compatible 'mode' parameter for model selection:
+        - 'performance': VitPose-huge (most accurate, slower)
+        - 'balanced': VitPose-base (good balance of speed/accuracy)
+        - 'lightweight': NOT SUPPORTED - falls back to VitPose-base with warning
+
+        Alternatively, use pose_model directly:
+        - 'synthpose': VitPose-huge
+        - 'synthpose_base': VitPose-base
+
     Device Selection:
         - 'auto': Auto-detect (CUDA > MPS > CPU)
         - 'cuda': Force NVIDIA GPU
@@ -237,10 +247,22 @@ class SynthPoseBackend(PoseBackend):
         - 'cpu': Force CPU
 
     Usage:
-        config = {'pose': {'pose_model': 'synthpose', 'device': 'auto', ...}}
+        # Using mode parameter (RTMLib-compatible)
+        config = {'pose': {'pose_model': 'synthpose', 'mode': 'performance', ...}}
+
+        # Using explicit pose_model
+        config = {'pose': {'pose_model': 'synthpose_base', 'device': 'auto', ...}}
+
         backend = SynthPoseBackend(config)
         keypoints, scores = backend(frame)
     """
+
+    # Mode to VitPose model mapping (RTMLib compatibility)
+    MODE_TO_VITPOSE = {
+        'performance': 'huge',   # VitPose-huge (most accurate)
+        'balanced': 'base',      # VitPose-base (balanced)
+        'lightweight': 'base',   # Fallback to base (lightweight not supported)
+    }
 
     def __init__(self, config_dict: dict):
         """
@@ -249,6 +271,10 @@ class SynthPoseBackend(PoseBackend):
         Args:
             config_dict: Full configuration dictionary with 'pose' section containing:
                 - pose_model: 'synthpose' (huge) or 'synthpose_base' (base)
+                - mode: RTMLib-compatible mode ('performance', 'balanced', 'lightweight')
+                       - 'performance' → VitPose-huge
+                       - 'balanced' → VitPose-base
+                       - 'lightweight' → VitPose-base (with warning)
                 - device: Device selection ('auto', 'cuda', 'cpu', 'mps')
                 - det_frequency: Detection frequency (every N frames)
                 - keypoint_likelihood_threshold: Confidence threshold
@@ -264,10 +290,30 @@ class SynthPoseBackend(PoseBackend):
         )
 
         pose_config = config_dict.get('pose', {})
-        pose_model = pose_config.get('pose_model', 'synthpose')
+        pose_model = pose_config.get('pose_model', 'synthpose').lower()
+        mode = pose_config.get('mode', 'balanced').lower()
 
-        # Determine VitPose size from pose_model name
-        self._mode = 'huge' if pose_model.lower() == 'synthpose' else 'base'
+        # Determine VitPose size: explicit pose_model takes precedence, then mode
+        if pose_model == 'synthpose_base':
+            # Explicit base model requested
+            self._mode = 'base'
+        elif pose_model == 'synthpose':
+            # Generic synthpose - use mode parameter for model selection
+            if mode == 'lightweight':
+                logging.warning(
+                    "SynthPose does not support 'lightweight' mode. "
+                    "VitPose-base (balanced) will be used instead. "
+                    "For maximum accuracy, use mode='performance' (VitPose-huge)."
+                )
+                self._mode = 'base'
+            elif mode == 'performance':
+                self._mode = 'huge'
+            else:
+                # balanced or any other value defaults to base
+                self._mode = self.MODE_TO_VITPOSE.get(mode, 'base')
+        else:
+            # Unknown pose_model, default to huge
+            self._mode = 'huge'
 
         # Device selection (config takes priority, 'auto' triggers detection in tracker)
         device = pose_config.get('device', 'auto')
@@ -285,7 +331,9 @@ class SynthPoseBackend(PoseBackend):
         self._skeleton_tree = create_synthpose_skeleton()
         self._keypoint_names = list(SYNTHPOSE_KEYPOINT_NAMES)
 
-        logging.info(f'SynthPoseBackend initialized: mode={self._mode}, '
+        # Log initialization with mode mapping info
+        mode_info = f"config_mode='{mode}' → vitpose='{self._mode}'"
+        logging.info(f'SynthPoseBackend initialized: {mode_info}, '
                      f'detector={pose_config.get("synthpose_detector", "yolox")}, '
                      f'device={self._tracker.device}, keypoints=52')
 
@@ -332,14 +380,31 @@ def create_pose_backend(config_dict: dict) -> PoseBackend:
         ValueError: If pose_model is invalid
         ImportError: If SynthPose dependencies not installed
 
+    Mode Parameter (RTMLib Compatibility):
+        The 'mode' parameter works consistently across both backends:
+
+        RTMLib:
+            - 'performance': Highest quality ONNX models
+            - 'balanced': Good balance of speed/accuracy
+            - 'lightweight': Fastest, lower accuracy
+
+        SynthPose:
+            - 'performance': VitPose-huge (most accurate)
+            - 'balanced': VitPose-base (good balance)
+            - 'lightweight': NOT SUPPORTED → falls back to VitPose-base with warning
+
     Examples:
         # RTMLib backend (default)
         config = {'pose': {'pose_model': 'body_with_feet', 'mode': 'balanced'}}
         backend = create_pose_backend(config)
 
-        # SynthPose backend
-        config = {'pose': {'pose_model': 'synthpose', 'device': 'cuda'}}
-        backend = create_pose_backend(config)
+        # SynthPose backend with mode parameter
+        config = {'pose': {'pose_model': 'synthpose', 'mode': 'performance'}}
+        backend = create_pose_backend(config)  # Uses VitPose-huge
+
+        # SynthPose backend with explicit model
+        config = {'pose': {'pose_model': 'synthpose_base', 'device': 'cuda'}}
+        backend = create_pose_backend(config)  # Uses VitPose-base
     """
     pose_config = config_dict.get('pose', {})
     pose_model = pose_config.get('pose_model', 'body_with_feet').lower()

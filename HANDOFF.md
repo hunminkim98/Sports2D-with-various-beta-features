@@ -176,8 +176,28 @@ pose_model = 'synthpose'  # or 'body_with_feet', 'whole_body', etc.
 - `hand`, `face`, `animal` - Specialized models
 
 **SynthPose options:**
-- `synthpose` - VitPose-huge (52 keypoints, most accurate)
-- `synthpose_base` - VitPose-base (52 keypoints, faster)
+- `synthpose` - Uses `mode` parameter for model selection (RTMLib-compatible)
+- `synthpose_base` - VitPose-base (52 keypoints, faster) - explicit selection
+
+### Mode Parameter for SynthPose (RTMLib Compatibility)
+
+SynthPose now supports the `mode` parameter for consistency with RTMLib:
+
+```toml
+[pose]
+pose_model = 'synthpose'
+mode = 'performance'  # VitPose-huge (most accurate)
+# mode = 'balanced'   # VitPose-base (good balance)
+# mode = 'lightweight' # NOT SUPPORTED → falls back to VitPose-base with warning
+```
+
+| Mode | RTMLib | SynthPose |
+|------|--------|-----------|
+| `performance` | Highest quality ONNX models | VitPose-huge (most accurate) |
+| `balanced` | Good balance of speed/accuracy | VitPose-base |
+| `lightweight` | Fastest, lower accuracy | **NOT SUPPORTED** → VitPose-base with warning |
+
+**Note:** If `pose_model = 'synthpose_base'` is set explicitly, the `mode` parameter is ignored.
 
 ### Detector Configuration (SynthPose only)
 
@@ -195,7 +215,7 @@ synthpose_detector = 'yolox'  # 'yolox' | 'rtdetr' | 'rtdetrv4'
 |-----------|--------|-----------|
 | `device` | ONNX provider control | PyTorch device (cuda/cpu/mps) |
 | `backend` | ONNX provider (onnxruntime/openvino/opencv) | **Ignored** |
-| `mode` | Model quality (lightweight/balanced/performance) | **Ignored** |
+| `mode` | Model quality (lightweight/balanced/performance) | VitPose model selection (performance→huge, balanced→base, lightweight→base with warning) |
 | `synthpose_detector` | **Ignored** | Person detector selection |
 
 ---
