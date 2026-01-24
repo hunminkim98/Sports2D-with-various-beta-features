@@ -2,7 +2,19 @@
   "permissions": {
     "allow": [
       "Bash(find:*)",
-      "Bash(python3 -m py_compile:*)"
+      "Bash(python3 -m py_compile:*)",
+      "Bash(cat:*)",
+      "WebSearch",
+      "Bash(dir \"C:\\\\Users\\\\gnsal\\\\OneDrive\\\\Desktop\\\\Projects\\\\JAN\\\\1\\\\Sports2D\\\\Sports2D\\\\models\\\\RT-DETRv4\"\")",
+      "Bash(dir /b \"C:\\\\Users\\\\gnsal\\\\OneDrive\\\\Desktop\\\\Projects\\\\JAN\\\\1\\\\Sports2D\\\\Sports2D\\\\models\\\\RT-DETRv4\\\\engine\")",
+      "Bash(dir /s /b \"C:\\\\Users\\\\gnsal\\\\OneDrive\\\\Desktop\\\\Projects\\\\JAN\\\\1\\\\Sports2D\\\\Sports2D\\\\models\\\\RT-DETRv4\")",
+      "Bash(flake8:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(powershell -command:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ]
   }
 }
