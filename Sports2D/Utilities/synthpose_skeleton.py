@@ -223,73 +223,13 @@ SYNTHPOSE_SKELETON_LINKS = [
 
 
 # ============================================================
-# Halpe26 (bodywithfeet) indices in SynthPose 52 format
-# ============================================================
-# Indices 0-16: COCO17 body keypoints
-# Indices 40-47: Foot keypoints (5meta, toe, big_toe, heel)
-SYNTHPOSE_HALPE26_BODYWITHFEET_INDICES = {
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,  # COCO17 body
-    40, 41, 42, 43, 44, 45, 46, 47  # Foot keypoints
-}
-
-# Keypoint names corresponding to Halpe26 bodywithfeet (for name-based lookup)
-SYNTHPOSE_HALPE26_BODYWITHFEET_NAMES = {
-    # COCO17 body (0-16)
-    'Nose', 'LEye', 'REye', 'LEar', 'REar',
-    'LShoulder', 'RShoulder', 'LElbow', 'RElbow', 'LWrist', 'RWrist',
-    'LHip', 'RHip', 'LKnee', 'RKnee', 'LAnkle', 'RAnkle',
-    # Foot keypoints
-    'R5Meta', 'L5Meta', 'RToe', 'LToe', 'RBigToe', 'LBigToe', 'LHeel', 'RHeel'
-}
-
-
-# Halpe26 (bodywithfeet) indices in SynthPose 52 format
-# Body (COCO17): 0-16
-# Feet: 40-47 (r_5meta, l_5meta, r_toe, l_toe, r_big_toe, l_big_toe, l_calc, r_calc)
-SYNTHPOSE_HALPE26_BODYWITHFEET_INDICES = {
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,  # COCO17 body
-    40, 41, 42, 43, 44, 45, 46, 47  # Feet keypoints
-}
-
-# Names of Halpe26 bodywithfeet keypoints (for lookup)
-SYNTHPOSE_HALPE26_BODYWITHFEET_NAMES = {
-    'Nose', 'LEye', 'REye', 'LEar', 'REar',
-    'LShoulder', 'RShoulder', 'LElbow', 'RElbow', 'LWrist', 'RWrist',
-    'LHip', 'RHip', 'LKnee', 'RKnee', 'LAnkle', 'RAnkle',
-    'R5Meta', 'L5Meta', 'RToe', 'LToe', 'RBigToe', 'LBigToe', 'LHeel', 'RHeel'
-}
-
-# ============================================================
-# Halpe26 (bodywithfeet) indices in SynthPose 52 format
-# Used for visualization: these keypoints get colored circles,
-# the rest get 1/2 size white diamonds
-# ============================================================
-
-# Halpe26 bodywithfeet consists of:
-# - COCO17 body keypoints (0-16)
-# - Foot keypoints: r_5meta(40), l_5meta(41), r_toe(42), l_toe(43), 
-#                   r_big_toe(44), l_big_toe(45), l_calc(46), r_calc(47)
-SYNTHPOSE_HALPE26_BODYWITHFEET_INDICES = {
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,  # COCO17 body
-    40, 41, 42, 43, 44, 45, 46, 47  # Feet
-}
-
-# Names of Halpe26 bodywithfeet keypoints (for name-based lookup)
-SYNTHPOSE_HALPE26_BODYWITHFEET_NAMES = {
-    'Nose', 'LEye', 'REye', 'LEar', 'REar',
-    'LShoulder', 'RShoulder', 'LElbow', 'RElbow', 'LWrist', 'RWrist',
-    'LHip', 'RHip', 'LKnee', 'RKnee', 'LAnkle', 'RAnkle',
-    'R5Meta', 'L5Meta', 'RToe', 'LToe', 'RBigToe', 'LBigToe', 'LHeel', 'RHeel'
-}
-
-
-# ============================================================
-# Halpe26 BodyWithFeet indices in SynthPose 52 format
+# HALPE26 MAPPING - SINGLE SOURCE OF TRUTH
 # ============================================================
 # Halpe26 bodywithfeet = COCO17 body (0-16) + foot keypoints (40-47)
 # These keypoints will be visualized as COLORED CIRCLES
 # All other anatomical markers (17-39, 48-51) will be 1/2 size DIAMONDS
 
+# Indices of SynthPose keypoints that correspond to HALPE26 bodywithfeet
 SYNTHPOSE_HALPE26_BODYWITHFEET_INDICES = {
     # COCO17 body keypoints (0-16)
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
@@ -304,8 +244,7 @@ SYNTHPOSE_HALPE26_BODYWITHFEET_INDICES = {
     47,  # RHeel (right calcaneus/heel)
 }
 
-# Names of Halpe26 bodywithfeet keypoints for name-based lookup
-# Used for visualization: these keypoints get COLORED CIRCLES
+# Names of HALPE26 bodywithfeet keypoints for name-based lookup
 SYNTHPOSE_HALPE26_BODYWITHFEET_NAMES = {
     'Nose', 'LEye', 'REye', 'LEar', 'REar',
     'LShoulder', 'RShoulder', 'LElbow', 'RElbow', 'LWrist', 'RWrist',

@@ -80,8 +80,8 @@ class SynthPosePoseTracker:
         - scores: np.array shape (N_persons, 52)
     '''
     
-    def __init__(self, 
-                 mode='huge', 
+    def __init__(self,
+                 mode='huge',
                  device='auto',
                  det_frequency=1,
                  person_threshold=0.3,
@@ -90,18 +90,26 @@ class SynthPosePoseTracker:
                  detector='yolox'):
         '''
         Initialize SynthPose tracker.
-        
+
         INPUTS:
         - mode: 'huge' or 'base' - VitPose model size selection
                 'huge' = stanfordmimi/synthpose-vitpose-huge-hf (more accurate, slower)
                 'base' = stanfordmimi/synthpose-vitpose-base-hf (faster, less accurate)
-        - device: 'auto', 'cuda', 'cpu', 'mps' for VitPose
-                  'auto' will select CUDA if available, else CPU
+        - device: Device for PyTorch inference
+                  'auto': Auto-detect (CUDA > MPS > CPU)
+                  'cuda': Force NVIDIA GPU (raises if unavailable)
+                  'mps': Force Apple Metal (macOS only)
+                  'cpu': Force CPU inference
+                  Note: This differs from RTMLib which uses ONNX providers.
         - det_frequency: Run person detection every N frames (default 1)
         - person_threshold: Confidence threshold for person detection (default 0.3)
         - keypoint_threshold: Confidence threshold for keypoints (default 0.3)
-        - backend: Backend for rtmlib ('auto', 'onnxruntime', 'openvino', 'opencv')
-        - detector: 'yolox' (rtmlib, faster) or 'rtdetr' (HuggingFace Transformers, original SynthPose_PM detector)
+        - backend: Backend for rtmlib YOLOX ('auto', 'onnxruntime', 'openvino', 'opencv')
+                   Only used when detector='yolox'. Ignored for 'rtdetr' and 'rtdetrv4'.
+        - detector: Person detector selection
+                    'yolox': rtmlib YOLOX (RECOMMENDED - fast, reliable)
+                    'rtdetr': HuggingFace RT-DETR (good accuracy, no local setup)
+                    'rtdetrv4': Local RT-DETRv4 (requires engine installation)
         '''
         
         # Load dependencies
@@ -311,25 +319,26 @@ class SynthPosePoseTracker:
         logging.info(f'RT-DETRv4 detector loaded from {checkpoint_path}')
     
     def _load_rtdetrv4_simplified(self, checkpoint_path):
-        '''Simplified RT-DETRv4 loading without YAMLConfig (uses raw checkpoint).'''
-        import torch
-        import torch.nn as nn
-        import torchvision.transforms as T
-        from torchvision.models.detection import fasterrcnn_resnet50_fpn
-        
-        logging.warning('Using fallback detector (Faster R-CNN) since RT-DETRv4 engine is not installed.')
-        logging.warning('For full RT-DETRv4 support, install: pip install git+https://github.com/RT-DETRs/RT-DETRv4.git')
-        
-        # Fallback to torchvision Faster R-CNN for person detection
-        self.rtdetrv4_model = fasterrcnn_resnet50_fpn(pretrained=True).to(self.device)
-        self.rtdetrv4_model.eval()
-        
-        self.rtdetrv4_transform = T.Compose([
-            T.ToTensor(),
-        ])
-        
-        self._rtdetrv4_is_fallback = True
-        logging.info('Fallback Faster R-CNN detector loaded')
+        '''
+        RT-DETRv4 loading without YAMLConfig - raises clear error.
+
+        The fallback to Faster R-CNN has been removed for clarity.
+        Users should either:
+        1. Use synthpose_detector='yolox' (recommended, fastest)
+        2. Use synthpose_detector='rtdetr' (good accuracy, no local setup)
+        3. Properly install RT-DETRv4 engine for synthpose_detector='rtdetrv4'
+        '''
+        raise ImportError(
+            "RT-DETRv4 engine not properly installed.\n\n"
+            "The RT-DETRv4 detector requires the engine/ directory from the RT-DETRv4 repository.\n\n"
+            "Options:\n"
+            "  1. Use 'synthpose_detector = \"yolox\"' (RECOMMENDED - fast and reliable)\n"
+            "  2. Use 'synthpose_detector = \"rtdetr\"' (good accuracy, HuggingFace-based)\n"
+            "  3. Install RT-DETRv4 engine properly:\n"
+            "     - Ensure Sports2D/models/RT-DETRv4/engine/ directory exists\n"
+            "     - Download model weights to Sports2D/models/rtdetrv4/\n\n"
+            "For most users, we recommend: synthpose_detector = 'yolox'"
+        )
     
     def __call__(self, frame):
         '''
@@ -469,11 +478,7 @@ class SynthPosePoseTracker:
         # Convert BGR to RGB PIL Image
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(frame_rgb)
-        
-        # Check if using fallback detector
-        if getattr(self, '_rtdetrv4_is_fallback', False):
-            return self._detect_persons_rtdetrv4_fallback(frame_rgb, height, width)
-        
+
         # Preprocess
         im_data = self.rtdetrv4_transform(pil_image).unsqueeze(0).to(self.device)
         orig_size = _torch.tensor([[width, height]]).to(self.device)
@@ -497,37 +502,7 @@ class SynthPosePoseTracker:
         person_boxes_coco[:, 3] = person_boxes_voc[:, 3] - person_boxes_voc[:, 1]  # height
         
         return person_boxes_coco
-    
-    def _detect_persons_rtdetrv4_fallback(self, frame_rgb, height, width):
-        '''Fallback detection using Faster R-CNN when RT-DETRv4 engine is not available.'''
-        import torch
-        
-        # Convert to tensor
-        im_tensor = self.rtdetrv4_transform(Image.fromarray(frame_rgb)).to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.rtdetrv4_model([im_tensor])
-        
-        # Filter for person class (label 1 in torchvision COCO) and threshold
-        boxes = outputs[0]['boxes'].cpu().numpy()
-        labels = outputs[0]['labels'].cpu().numpy()
-        scores = outputs[0]['scores'].cpu().numpy()
-        
-        person_mask = (labels == 1) & (scores >= self.person_threshold)
-        person_boxes_voc = boxes[person_mask]
-        
-        if len(person_boxes_voc) == 0:
-            return np.array([])
-        
-        # Convert from VOC (x1, y1, x2, y2) to COCO format (x, y, w, h) for VitPose
-        person_boxes_coco = np.zeros((len(person_boxes_voc), 4))
-        person_boxes_coco[:, 0] = person_boxes_voc[:, 0]  # x
-        person_boxes_coco[:, 1] = person_boxes_voc[:, 1]  # y
-        person_boxes_coco[:, 2] = person_boxes_voc[:, 2] - person_boxes_voc[:, 0]  # width
-        person_boxes_coco[:, 3] = person_boxes_voc[:, 3] - person_boxes_voc[:, 1]  # height
-        
-        return person_boxes_coco
-    
+
     def _estimate_poses(self, pil_image, person_boxes):
         '''
         Estimate poses for detected persons using VitPose.

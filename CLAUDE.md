@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Sports2D is a Python tool that computes 2D joint positions, joint angles, and segment angles from video or webcam input. It uses RTMLib for pose estimation and optionally integrates with OpenSim for inverse kinematics.
+Sports2D is a Python tool that computes 2D joint positions, joint angles, and segment angles from video or webcam input. It uses RTMLib or SynthPose for pose estimation and optionally integrates with OpenSim for inverse kinematics.
 
 ## Build and Development Commands
 
@@ -14,8 +14,6 @@ Sports2D is a Python tool that computes 2D joint positions, joint angles, and se
 pip install sports2d
 
 # Install from source (development)
-git clone https://github.com/davidpagnon/sports2d.git
-cd sports2d
 pip install .
 
 # Full install with OpenSim (required for inverse kinematics)
@@ -30,19 +28,22 @@ pip install sports2d[synthpose]
 
 ### Running Tests
 ```bash
-# Run the test suite with pytest
+# Run the full test suite
 pytest -v Sports2D/Utilities/tests.py
 
-# Or use the test entry point
+# Run tests with output capture (as CI does)
+pytest -v Sports2D/Utilities/tests.py --capture=sys
+
+# Use the test entry point
 tests_sports2d
 ```
 
 ### Linting
 ```bash
-# Check for syntax errors
+# Check for syntax errors (CI blocking)
 flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 
-# Full lint check
+# Full lint check (non-blocking warnings)
 flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 ```
 
@@ -62,6 +63,23 @@ from Sports2D import Sports2D
 Sports2D.process(config_dict)
 ```
 
+### GPU Acceleration (Development)
+```bash
+# Check CUDA compatibility
+nvidia-smi
+
+# Install PyTorch with CUDA (example for CUDA 12.4)
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# Install ONNX Runtime with GPU
+pip uninstall onnxruntime
+pip install onnxruntime-gpu
+
+# Verify GPU setup
+python -c 'import torch; print(torch.cuda.is_available())'
+python -c 'import onnxruntime as ort; print(ort.get_available_providers())'
+```
+
 ## Architecture Overview
 
 ### Core Pipeline Flow
@@ -73,22 +91,34 @@ Sports2D.process(config_dict)
    - Angle computation
    - Result visualization and output
 
+### Key Entry Points
+- `Sports2D.main()` - CLI entry point, parses args and calls `process()`
+- `Sports2D.process(config_dict)` - Main API, accepts config dictionary
+- `process.process_fun()` - Core video processing loop
+- `common.angle_dict` - Joint/segment angle definitions
+
 ### Key Dependencies
-- **Pose2Sim**: Heavy reuse of utilities from the [Pose2Sim](https://github.com/perfanalytics/pose2sim) project for:
-  - Skeleton definitions (`Pose2Sim.skeletons`)
-  - Filtering algorithms (`Pose2Sim.filtering`)
-  - Calibration file handling (`Pose2Sim.calibration`)
-  - Pose estimation setup (`Pose2Sim.poseEstimation`)
+- **Pose2Sim** (>=0.10.40): Heavy reuse for skeleton definitions (`Pose2Sim.skeletons`), filtering (`Pose2Sim.filtering`), calibration (`Pose2Sim.calibration`), and pose estimation setup (`Pose2Sim.poseEstimation`)
 - **RTMLib**: Primary pose estimation backend using ONNX models
 - **OpenSim** (optional): For biomechanically accurate inverse kinematics
 
-### Skeleton/Pose Model Support
-- **RTMLib models**: body_with_feet (HALPE_26), whole_body, body (COCO_17), hand, face, animal
-- **SynthPose**: VitPose-huge from Stanford MIMI (52 keypoints mapped to HALPE_26)
-- Custom skeletons can be defined in the TOML config file
+### Pose Estimation Backends
+
+**RTMLib (default):**
+- body_with_feet (HALPE_26) - most common, 26 keypoints
+- whole_body_wrist (COCO_133) - includes hands/face
+- body (COCO_17) - basic body only
+- Modes: `lightweight`, `balanced`, `performance`
+
+**SynthPose (optional, requires `[synthpose]` extras):**
+- VitPose-huge/base from Stanford MIMI
+- 52 keypoints (17 COCO + 35 anatomical markers)
+- Person detectors: `yolox` (recommended), `rtdetr`, `rtdetrv4`
+- Files: `Utilities/pose_backend.py`, `Utilities/synthpose_tracker.py`, `Utilities/synthpose_skeleton.py`
+- RT-DETRv4 engine (inference-only): `Sports2D/models/RT-DETRv4/engine/`
 
 ### Configuration System
-The configuration uses TOML files with these main sections:
+The configuration uses TOML files (see `Demo/Config_demo.toml` for full reference):
 - `[base]`: Video input, person detection, output settings
 - `[pose]`: Pose model, mode, detection frequency, tracking
 - `[px_to_meters_conversion]`: Calibration, perspective correction
@@ -104,9 +134,47 @@ The configuration uses TOML files with these main sections:
 - **Calibration TOML**: Camera parameters for Pose2Sim
 
 ### Utilities Module (`Sports2D/Utilities/`)
-- `common.py`: Angle computation dictionaries, marker Z positions, helper functions
+- `common.py`: Angle computation dictionaries (`angle_dict`), marker Z positions, helper functions
 - `tests.py`: Test workflow covering CLI and Python API
-- `synthpose_tracker.py` / `synthpose_skeleton.py`: SynthPose VitPose integration
+- `pose_backend.py`: **Backend abstraction layer** - unified interface for pose estimation
+- `synthpose_tracker.py`: SynthPose person tracking with YOLOX/RT-DETR/RT-DETRv4 detectors
+- `synthpose_skeleton.py`: 52-keypoint skeleton definition and HALPE_26 mapping
+
+### Pose Backend System
+
+Sports2D uses a unified backend abstraction (`pose_backend.py`) for pose estimation:
+
+**Interface** (`PoseBackend` ABC):
+```python
+class PoseBackend(ABC):
+    def __call__(self, frame) -> (keypoints, scores)  # (N, K, 2), (N, K)
+    def reset() -> None
+    @property skeleton_tree -> anytree.Node
+    @property num_keypoints -> int
+    @property backend_name -> str  # 'rtmlib' or 'synthpose'
+    @property keypoint_names -> List[str]
+```
+
+**Implementations**:
+- `RTMLibBackend`: ONNX-based pose estimation via Pose2Sim/rtmlib
+- `SynthPoseBackend`: PyTorch-based VitPose estimation
+
+**Factory Function**:
+```python
+from Sports2D.Utilities.pose_backend import create_pose_backend
+
+config = {'pose': {'pose_model': 'synthpose', 'device': 'auto', ...}}
+backend = create_pose_backend(config)
+keypoints, scores = backend(frame)
+```
+
+**Device/Backend Parameter Differences**:
+| Parameter | RTMLib | SynthPose |
+|-----------|--------|-----------|
+| `device` | Affects ONNX provider | Affects PyTorch device (cuda/mps/cpu) |
+| `backend` | ONNX provider (onnxruntime/openvino/opencv) | **Ignored** (always PyTorch) |
+| `mode` | Model quality (lightweight/balanced/performance) | **Ignored** (uses pose_model name) |
+| `synthpose_detector` | **Ignored** | Person detector (yolox/rtdetr/rtdetrv4) |
 
 ## Key Implementation Details
 
@@ -123,9 +191,19 @@ Joint and segment angles are defined in `angle_dict` in `common.py`:
 
 ### Pixel-to-Meters Conversion
 Handles perspective correction using:
-- Person height reference
-- Camera-to-person distance, focal length, or field of view
-- Calibration file with camera intrinsics/extrinsics
+- Person height reference (`--first_person_height`)
+- Camera-to-person distance, focal length, or field of view (`--perspective_unit`, `--perspective_value`)
+- Calibration file with camera intrinsics/extrinsics (`--calib_file`)
+
+## CI/CD Pipeline
+- **Platforms**: Ubuntu, Windows, macOS (latest)
+- **Python versions**: 3.10, 3.11, 3.12
+- **Required checks**: flake8 syntax errors (E9, F63, F7, F82)
+- **Test timeout**: 20 minutes
+- Tests require OpenSim conda environment
+
+## Version Management
+Uses `setuptools-scm` to auto-generate version from git tags. No manual version bumping needed.
 
 ## Python Version Requirements
 - Requires Python >=3.9 (tested on 3.10, 3.11, 3.12)

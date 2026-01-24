@@ -12,14 +12,14 @@
 
 
 [base]
-video_input = ['KHM1.mp4', 'KHM2.mp4', 'KHM3.mp4', 'KHM4.mp4', 'KHM5.mp4', 'KHM6.mp4', 'KHM7.mp4']   # 'webcam' or '<video_path.ext>', or ['video1_path.mp4', 'video2_path.avi>', ...]
+video_input = ['KHM5.mp4']   # 'webcam' or '<video_path.ext>', or ['video1_path.mp4', 'video2_path.avi>', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
 nb_persons_to_detect = 'all'   # int or 'all' # Limiting or not the number of persons to be analyzed
 person_ordering_method = 'on_click' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size',  'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
 first_person_height = 1.65  # Height of the reference person in meters (for pixels -> meters conversion: not used if a calibration file is provided)
-visible_side = ['auto', 'front', 'none']  # Choose visible side among ['right', 'left', 'front', 'back', 'auto', 'none']. String or list of strings.
+visible_side = ['left']  # Choose visible side among ['right', 'left', 'front', 'back', 'auto', 'none']. String or list of strings.
                   # if 'auto', will be either 'left', 'right', or 'front' depending on the direction of the motion
                   # if 'none', coordinates will be left in 2D rather than 3D
 
@@ -51,28 +51,52 @@ result_dir = '' # If empty, project dir is current dir
 # Slow motion factor
 slowmo_factor = 1       # 1 for normal speed. For a video recorded at 240 fps and exported to 30 fps, it would be 240/30 = 8
 
-# Pose detection parameters
-pose_model = 'Body_with_feet'  # Available models:
-synthpose_detector = 'rtdetrv4'  # 'yolox' (rtmlib, faster), 'rtdetr' (HuggingFace), or 'rtdetrv4' (local checkpoint, RT-DETRv4 state-of-the-art)
-                         #
-                         # RTMLib models (default, uses ONNX):
-                         # - Body_with_feet (default HALPE_26 model), 
-                         # - Whole_body_wrist (COCO_133_WRIST: body + feet + 2 hand_points), 
-                         # - Whole_body (COCO_133: body + feet + hands), 
-                         # - Body (COCO_17). Marker augmentation won't work, Kinematic analysis will work,
-                         # - Hand (HAND_21, only lightweight mode. Potentially better results with Whole_body), 
-                         # - Face (FACE_106), 
-                         # - Animal (ANIMAL2D_17)
-                         #
-                         # SynthPose models (requires: pip install torch transformers):
-                         # - synthpose (VitPose-huge from Stanford MIMI, 52 keypoints mapped to HALPE_26, more accurate)
-                         # - synthpose_base (VitPose-base, faster but less accurate)
-                         # SynthPose uses RT-DETR for person detection and VitPose for pose estimation.
-                         # Models are automatically downloaded from HuggingFace on first use.
-                         #
-                         # ⚠ Only RTMPose is natively embeded in Pose2Sim. For all other pose estimation methods, you will have to run them yourself, and then refer to the documentation to convert the output files if needed
-                         # ⚠ For Face and Animal, use mode="""{dictionary}""", and find the corresponding .onnx model there https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose
-mode = 'performance' # 'lightweight', 'balanced', 'performance', or """{dictionary}""" (see below)
+## ============================================================
+## Pose Estimation Model Selection
+## ============================================================
+##
+## RTMLib models (ONNX-based, default):
+##   - 'body_with_feet': HALPE_26 model with 26 keypoints (RECOMMENDED for most use cases)
+##   - 'whole_body_wrist': COCO_133_WRIST model (body + feet + 2 hand points)
+##   - 'whole_body': COCO_133 model (body + feet + hands)
+##   - 'body': COCO_17 model (17 basic body keypoints)
+##   - 'hand': HAND_21 (only lightweight mode)
+##   - 'face': FACE_106
+##   - 'animal': ANIMAL2D_17
+##
+## SynthPose models (PyTorch-based, requires 'pip install sports2d[synthpose]'):
+##   - 'synthpose': VitPose-huge with 52 keypoints (most accurate, slower)
+##   - 'synthpose_base': VitPose-base with 52 keypoints (faster)
+##   Note: SynthPose outputs 52 anatomical keypoints including HALPE_26 + additional markers.
+##   Models are automatically downloaded from HuggingFace on first use (~2GB).
+##
+pose_model = 'synthpose'
+
+## ============================================================
+## SynthPose Person Detector Selection
+## ============================================================
+## Only used when pose_model='synthpose' or 'synthpose_base':
+##   - 'yolox': Fast YOLOX detector from rtmlib (RECOMMENDED - fast and reliable)
+##   - 'rtdetr': RT-DETR from HuggingFace transformers (good accuracy, no local setup)
+##   - 'rtdetrv4': RT-DETRv4 local model (requires model weights download)
+##
+## Note: For 'rtdetrv4', you need to download model weights and place them in:
+##       Sports2D/models/rtdetrv4/
+##
+synthpose_detector = 'yolox'
+
+## ============================================================
+## Mode Selection (RTMLib only, ignored for SynthPose)
+## ============================================================
+## For RTMLib models:
+##   - 'lightweight': Fastest inference, lower accuracy
+##   - 'balanced': Good balance of speed and accuracy
+##   - 'performance': Highest accuracy, slower inference
+##   - """{dictionary}""": Custom model configuration (see examples below)
+##
+## Note: This parameter is IGNORED for SynthPose models.
+##
+mode = 'performance'
 
 # A dictionary (WITHIN THREE DOUBLE QUOTES) allows you to manually select the person detection (if top_down approach) and/or pose estimation models (see https://github.com/Tau-J/rtmlib). 
 # Models can be local paths or URLs.
@@ -94,17 +118,39 @@ mode = 'performance' # 'lightweight', 'balanced', 'performance', or """{dictiona
 #          'pose_model':'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-ap10k_pt-aic-coco_210e-256x256-7a041aa1_20230206.zip',
 #          'pose_input_size':[256,256]}"""
 
-det_frequency = 1       # Run person detection only every N frames, and inbetween track previously detected bounding boxes (keypoint detection is still run on all frames). 
-                        # Equal to or greater than 1, can be as high as you want in simple uncrowded cases. Much faster, but might be less accurate. 
-device = 'auto' # 'auto', 'CPU', 'CUDA', 'MPS', 'ROCM'
-backend = 'auto' # 'auto', 'openvino', 'onnxruntime', 'opencv'
+det_frequency = 1       # Run person detection only every N frames, and inbetween track previously detected bounding boxes (keypoint detection is still run on all frames).
+                        # Equal to or greater than 1, can be as high as you want in simple uncrowded cases. Much faster, but might be less accurate.
+
+## ============================================================
+## Device Selection
+## ============================================================
+## Works for both RTMLib and SynthPose:
+##   - 'auto': Auto-detect best available (CUDA > MPS > CPU)
+##   - 'cuda': Force NVIDIA GPU (requires CUDA)
+##   - 'mps': Force Apple Metal (macOS only)
+##   - 'cpu': Force CPU inference
+##
+device = 'auto'
+
+## ============================================================
+## Backend Selection (RTMLib only, ignored for SynthPose)
+## ============================================================
+## ONNX execution provider:
+##   - 'auto': Auto-select best provider
+##   - 'onnxruntime': ONNX Runtime (default)
+##   - 'openvino': Intel OpenVINO
+##   - 'opencv': OpenCV DNN
+##
+## Note: SynthPose uses PyTorch directly and ignores this setting.
+##
+backend = 'auto'
 tracking_mode = 'sports2d' # 'sports2d' or 'deepsort'. 'deepsort' is slower, harder to parametrize but can be more robust if correctly tuned
 # deepsort_params = """{'max_age':30, 'n_init':3, 'max_cosine_distance':0.3, 'max_iou_distance':0.8, 'embedder_gpu': True, 'embedder':'torchreid'}""" # """{dictionary between 3 double quotes}"""
                   # More robust in crowded scenes but tricky to parametrize. More information there: https://github.com/levan92/deep_sort_realtime/blob/master/deep_sort_realtime/deepsort_tracker.py#L51
                   # Requires `pip install torch torchvision torchreid gdown tensorboard`
 
 # Processing parameters
-keypoint_likelihood_threshold = 0.3 # Keypoints whose likelihood is lower will not be taken into account
+keypoint_likelihood_threshold = 0.5 # Keypoints whose likelihood is lower will not be taken into account
 average_likelihood_threshold = 0.5  # Person will be ignored if average likelihood of good keypoints is lower than this value
 keypoint_number_threshold = 0.3     # Person will be ignored if the number of good keypoints (above keypoint_likelihood_threshold) is less than this fraction
 max_distance = 250  # in px or None # If a person is detected further than max_distance from its position on the previous frame, it will be considered as a new one
@@ -143,7 +189,7 @@ joint_angles = ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right h
 segment_angles = ['Right foot', 'Left foot', 'Right shank', 'Left shank', 'Right thigh', 'Left thigh', 'Pelvis', 'Trunk', 'Shoulders', 'Head', 'Right arm', 'Left arm', 'Right forearm', 'Left forearm']
 
 # Processing parameters
-flip_left_right = false  # Same angles whether the participant faces left/right. Set it to false if you want timeseries to be continuous even when the participant switches their stance.
+flip_left_right = true  # Same angles whether the participant faces left/right. Set it to false if you want timeseries to be continuous even when the participant switches their stance.
 correct_segment_angles_with_floor_angle = true # If the camera is tilted, corrects segment angles as regards to the floor angle. Set to false if it is the floor which is actually tilted
 
 

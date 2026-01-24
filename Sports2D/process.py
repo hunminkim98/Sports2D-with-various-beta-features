@@ -88,7 +88,6 @@ from rtmlib.tools.object_detection.post_processings import nms
 # SynthPose integration - lazy import to avoid dependency issues
 SYNTHPOSE_AVAILABLE = False
 try:
-    from Sports2D.Utilities.synthpose_tracker import SynthPosePoseTracker
     from Sports2D.Utilities.synthpose_skeleton import (
         create_synthpose_skeleton,
         SYNTHPOSE_KEYPOINT_NAMES,
@@ -98,11 +97,14 @@ try:
 except ImportError:
     pass
 
+# Unified pose backend abstraction
+from Sports2D.Utilities.pose_backend import create_pose_backend
+
 from Sports2D.Utilities.common import *
 from Pose2Sim.common import *
 from Pose2Sim.skeletons import *
 from Pose2Sim.calibration import toml_write
-from Pose2Sim.poseEstimation import setup_model_class_mode, setup_backend_device, setup_pose_tracker
+from Pose2Sim.poseEstimation import setup_model_class_mode, setup_backend_device
 from Pose2Sim.triangulation import indices_of_first_last_non_nan_chunks
 from Pose2Sim.personAssociation import *
 from Pose2Sim.filtering import *
@@ -117,8 +119,47 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid valu
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# SynthPose-specific drawing functions
-def draw_synthpose_keypoints(img, all_X, all_Y, all_scores, keypoint_names=None, thickness=1):
+# ============================================================
+# Pose Drawing Functions
+# ============================================================
+
+def draw_pose(img, all_X, all_Y, all_scores, pose_model, keypoint_names=None,
+              backend_name='rtmlib', thickness=1, kpt_threshold=0.3):
+    '''
+    Unified pose drawing function that works with any backend.
+
+    For RTMLib (26/133 keypoints):
+        - Uses Pose2Sim's draw_keypts/draw_skel functions
+
+    For SynthPose (52 keypoints):
+        - Uses custom styling (HALPE26 colored circles, others white diamonds)
+
+    INPUTS:
+    - img: OpenCV image (BGR)
+    - all_X, all_Y: List of x,y coordinates per person
+    - all_scores: List of confidence scores per person
+    - pose_model: Skeleton tree structure (anytree Node)
+    - keypoint_names: List of keypoint names (required for SynthPose)
+    - backend_name: 'rtmlib' or 'synthpose'
+    - thickness: Line thickness
+    - kpt_threshold: Keypoint confidence threshold
+
+    OUTPUT:
+    - img: Image with drawn keypoints and skeleton
+    '''
+    if backend_name == 'synthpose':
+        img = _draw_synthpose_keypoints(img, all_X, all_Y, all_scores,
+                                        keypoint_names=keypoint_names, thickness=thickness)
+        img = _draw_synthpose_skeleton(img, all_X, all_Y, pose_model, thickness=thickness)
+    else:
+        # RTMLib: use Pose2Sim functions
+        img = draw_keypts(img, all_X, all_Y, all_scores, cmap_str='RdYlGn')
+        img = draw_skel(img, all_X, all_Y, pose_model)
+    return img
+
+
+# SynthPose-specific drawing functions (private)
+def _draw_synthpose_keypoints(img, all_X, all_Y, all_scores, keypoint_names=None, thickness=1):
     '''
     Draw SynthPose 52 keypoints with special styling:
     - HALPE26 (bodywithfeet): Colored circles at normal size
@@ -201,7 +242,8 @@ def draw_synthpose_keypoints(img, all_X, all_Y, all_scores, keypoint_names=None,
     
     return img
 
-def draw_synthpose_skeleton(img, all_X, all_Y, pose_model, thickness=1):
+
+def _draw_synthpose_skeleton(img, all_X, all_Y, pose_model, thickness=1):
     '''
     Draw SynthPose skeleton using pose_model tree structure.
     Uses parent-child relationships from anytree, not hardcoded ID links,
@@ -1830,7 +1872,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     # Select device and backend
     if use_synthpose:
         # SynthPose uses PyTorch directly, not ONNX - skip Pose2Sim backend setup
-        # Device will be auto-detected by SynthPosePoseTracker using torch.cuda.is_available()
+        # Device will be auto-detected by the pose backend using torch.cuda.is_available()
         pass  # Keep original device value from config ('auto', 'cuda', 'cpu', etc.)
     else:
         # RTMLib uses ONNX backends
@@ -1865,33 +1907,15 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         tf = (cap.get(cv2.CAP_PROP_FRAME_COUNT)-1) / fps if cap.get(cv2.CAP_PROP_FRAME_COUNT)>0 else float('inf')
         kpt_id_max = max(keypoints_ids)+1
 
-        # Set up pose tracker
-        if use_synthpose:
-            # Use SynthPose tracker
-            try:
-                pose_tracker = SynthPosePoseTracker(
-                    mode=synthpose_mode,
-                    device=device,
-                    det_frequency=det_frequency,
-                    person_threshold=keypoint_likelihood_threshold,
-                    detector=synthpose_detector
-                )
-                logging.info(f'SynthPose tracker initialized with mode={synthpose_mode}, device={device}, detector={synthpose_detector}, outputting 52 keypoints')
-            except Exception as e:
-                logging.error(f'Error: SynthPose initialization failed: {e}')
-                raise ValueError(f'Error: SynthPose initialization failed: {e}')
-        else:
-            # Use RTMLib tracker (default)
-            try:
-                pose_tracker = setup_pose_tracker(ModelClass, det_frequency, mode, False, backend, device)
-            except: # for multi-threading
-                try:
-                    import time
-                    time.sleep(3)
-                    pose_tracker = setup_pose_tracker(ModelClass, det_frequency, mode, False, backend, device)
-                except:
-                    logging.error('Error: Pose estimation failed. Check in Config.toml that pose_model and mode are valid.')
-                    raise ValueError('Error: Pose estimation failed. Check in Config.toml that pose_model and mode are valid.')
+        # Set up pose tracker using unified backend
+        try:
+            pose_tracker = create_pose_backend(config_dict)
+            backend_name = pose_tracker.backend_name
+            use_synthpose = (backend_name == 'synthpose')
+            logging.info(f'{pose_tracker.backend_name} tracker initialized with {pose_tracker.num_keypoints} keypoints')
+        except Exception as e:
+            logging.error(f'Error: Pose estimation backend initialization failed: {e}')
+            raise ValueError(f'Error: Pose estimation backend initialization failed: {e}')
         logging.info(f'Persons detection is run every {det_frequency} frames (pose estimation is run at every frame). Tracking is done with {tracking_mode}.')
         
         if tracking_mode == 'deepsort': 
@@ -2109,7 +2133,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (255,255,255), thickness+1, cv2.LINE_AA)
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (0,0,255), thickness, cv2.LINE_AA)
                 img = draw_bounding_box(img, valid_X, valid_Y, colors=colors, fontSize=fontSize, thickness=thickness)
-                # Use SynthPose-specific drawing for anatomical markers (white, 1/2 size)
+                # Draw keypoints and skeleton using unified draw_pose function
                 if use_synthpose:
                     # For realtime visualization, data is in original SynthPose order (indices 0-51)
                     # Use SYNTHPOSE_KEYPOINT_NAMES for correct name-to-index mapping
@@ -2119,11 +2143,11 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     for kpt in ['Hip', 'Neck']:
                         if kpt in new_keypoints_names and kpt not in realtime_kpt_names:
                             realtime_kpt_names.append(kpt)
-                    img = draw_synthpose_keypoints(img, valid_X, valid_Y, valid_scores, keypoint_names=realtime_kpt_names, thickness=thickness)
-                    img = draw_synthpose_skeleton(img, valid_X, valid_Y, pose_model, thickness=thickness)
+                    kpt_names_for_draw = realtime_kpt_names
                 else:
-                    img = draw_keypts(img, valid_X, valid_Y, valid_scores, cmap_str='RdYlGn')
-                    img = draw_skel(img, valid_X, valid_Y, pose_model)
+                    kpt_names_for_draw = None
+                img = draw_pose(img, valid_X, valid_Y, valid_scores, pose_model,
+                                keypoint_names=kpt_names_for_draw, backend_name=backend_name, thickness=thickness)
                 if calculate_angles:
                     img = draw_angles(img, valid_X, valid_Y, valid_angles_flipped, valid_X_flipped, new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
                 cv2.imshow(f'{video_file} Sports2D', img)
@@ -2703,13 +2727,11 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 raise ValueError(f"Could not read frame {i}")
             img = frame.copy()
             img = draw_bounding_box(img, all_frames_X_processed[i], all_frames_Y_processed[i], colors=colors, fontSize=fontSize, thickness=thickness)
-            # Use SynthPose-specific drawing for anatomical markers (white, 1/2 size) - matching realtime visualization
-            if use_synthpose:
-                img = draw_synthpose_keypoints(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_scores_processed[i], keypoint_names=new_keypoints_names, thickness=thickness)
-                img = draw_synthpose_skeleton(img, all_frames_X_processed[i], all_frames_Y_processed[i], pose_model_with_new_ids, thickness=thickness)
-            else:
-                img = draw_keypts(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_scores_processed[i], cmap_str='RdYlGn')
-                img = draw_skel(img, all_frames_X_processed[i], all_frames_Y_processed[i], pose_model_with_new_ids)
+            # Draw keypoints and skeleton using unified draw_pose function
+            img = draw_pose(img, all_frames_X_processed[i], all_frames_Y_processed[i],
+                            all_frames_scores_processed[i], pose_model_with_new_ids,
+                            keypoint_names=new_keypoints_names if use_synthpose else None,
+                            backend_name=backend_name, thickness=thickness)
             if calculate_angles:
                 img = draw_angles(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_angles_processed[i], all_frames_X_flipped_processed[i], new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
 
