@@ -117,6 +117,23 @@ def to_dict(d):
     return d
 
 
+def wrap_angle_series_to_principal(angles):
+    '''
+    Wrap an angle series to the principal range [-180, 180] while preserving NaNs.
+
+    INPUT:
+    - angles: array-like of angle values in degrees
+
+    OUTPUT:
+    - np.array of wrapped angles
+    '''
+
+    angles = np.asarray(angles, dtype=float).copy()
+    valid_mask = ~np.isnan(angles)
+    angles[valid_mask] = (angles[valid_mask] + 180.0) % 360.0 - 180.0
+    return angles
+
+
 def make_homogeneous(list_of_arrays):
     '''
     Make a list of arrays (or a list of lists) homogeneous by padding with nans

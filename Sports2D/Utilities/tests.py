@@ -18,6 +18,7 @@ import os
 import toml
 import subprocess
 from pathlib import Path
+import numpy as np
 
 
 ## AUTHORSHIP INFORMATION
@@ -32,6 +33,36 @@ __status__ = "Development"
 
 
 ## FUNCTIONS
+def test_wrap_angle_series_to_principal_preserves_nans_and_bounds_values():
+    '''
+    Verify angle wrapping keeps NaNs and maps values to principal range.
+    '''
+
+    from Sports2D.Utilities.common import wrap_angle_series_to_principal
+
+    values = np.array([np.nan, -540.0, -190.0, -181.0, -180.0, -179.0, 0.0, 179.0, 180.0, 181.0, 360.0, 402.59])
+    wrapped = wrap_angle_series_to_principal(values)
+    expected = np.array([np.nan, -180.0, 170.0, 179.0, -180.0, -179.0, 0.0, 179.0, -180.0, -179.0, 0.0, 42.59])
+
+    assert np.isnan(wrapped[0])
+    assert np.allclose(wrapped[1:], expected[1:], atol=1e-9)
+
+
+def test_wrap_angle_series_to_principal_output_range():
+    '''
+    Verify wrapped values remain inside [-180, 180] for finite entries.
+    '''
+
+    from Sports2D.Utilities.common import wrap_angle_series_to_principal
+
+    values = np.array([-721.0, -360.0, -181.0, -180.0, -90.0, 0.0, 90.0, 179.0, 180.0, 181.0, 359.0, 540.0, np.nan])
+    wrapped = wrap_angle_series_to_principal(values)
+    valid = wrapped[~np.isnan(wrapped)]
+
+    assert np.all(valid >= -180.0)
+    assert np.all(valid <= 180.0)
+
+
 def test_workflow():
     '''
     Test the workflow of Sports2D.

@@ -1725,6 +1725,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     angle_names = [angle_name.lower() for angle_name in angle_names]
     flip_left_right = config_dict.get('angles').get('flip_left_right')
     correct_segment_angles_with_floor_angle = config_dict.get('angles').get('correct_segment_angles_with_floor_angle')
+    angle_output_mode = str(config_dict.get('angles').get('angle_output_mode', 'legacy_continuous')).lower()
+    unwrap_angles = config_dict.get('angles').get('unwrap_angles', True)
+    if angle_output_mode not in ['legacy_continuous', 'bounded_principal']:
+        raise ValueError(f"Invalid angle_output_mode: {angle_output_mode}. Must be 'legacy_continuous' or 'bounded_principal'.")
 
     # Post-processing settings
     interpolate = config_dict.get('post-processing').get('interpolate')    
@@ -1952,6 +1956,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     logging.info(f"\nProcessing video stream...")
     # logging.info(f"{'Video, ' if save_vid else ''}{'Images, ' if save_img else ''}{'Pose, ' if save_pose else ''}{'Angles ' if save_angles else ''}{'and ' if save_angles or save_img or save_pose or save_vid else ''}Logs will be saved in {result_dir}.")
     all_frames_X, all_frames_X_flipped, all_frames_Y, all_frames_scores, all_frames_angles = [], [], [], [], []
+    # Keep a valid keypoint schema even when early frames contain no detected persons.
+    new_keypoints_names, new_keypoints_ids = keypoints_names.copy(), keypoints_ids.copy()
     frame_processing_times = []
     frame_count = 0
     first_frame = max(int(t0 * fps), frame_range[0])
@@ -1975,12 +1981,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             # If frame not grabbed
             if not success:
                 logging.warning(f"Failed to grab frame {frame_count-1}.")
-                if save_pose:
-                    all_frames_X.append([])
-                    all_frames_Y.append([])
-                    all_frames_scores.append([])
-                if save_angles:
-                    all_frames_angles.append([])
+                kpt_count = len(new_keypoints_names)
+                nan_pose = np.full((1, kpt_count), np.nan)
+                all_frames_X.append(nan_pose.copy())
+                all_frames_X_flipped.append(nan_pose.copy())
+                all_frames_Y.append(nan_pose.copy())
+                all_frames_scores.append(nan_pose.copy())
+                if save_angles and calculate_angles:
+                    all_frames_angles.append(np.full((1, len(angle_names)), np.nan))
                 continue
 
             # Retrieve pose or Estimate pose and track people
@@ -2128,6 +2136,18 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 valid_X.append(person_X)
                 valid_Y.append(person_Y)
                 valid_scores.append(person_scores)
+
+            # Keep frame arrays homogeneous when no person is detected in a frame.
+            if len(valid_X) == 0:
+                kpt_count = len(new_keypoints_names)
+                valid_X = [np.full(kpt_count, np.nan)]
+                valid_Y = [np.full(kpt_count, np.nan)]
+                valid_scores = [np.full(kpt_count, np.nan)]
+                if calculate_angles:
+                    valid_X_flipped = [np.full(kpt_count, np.nan)]
+                    nan_angles = np.full(len(angle_names), np.nan)
+                    valid_angles = [nan_angles.copy()]
+                    valid_angles_flipped = [nan_angles.copy()]
 
             # Draw keypoints and skeleton
             if show_realtime_results:
@@ -2518,8 +2538,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         trc_data_m_i.iloc[:first_run_start,c+2] = np.nan
                         trc_data_m_i.iloc[last_run_end:,c+2] = np.nan
                         trc_data_m_i.iloc[first_run_start:last_run_end,c+2] = trc_data_m_i.iloc[first_run_start:last_run_end,c+2].ffill().bfill()
-                    first_trim, last_trim = trc_data_m_i.isnull().any(axis=1).idxmin(), trc_data_m_i[::-1].isnull().any(axis=1).idxmin()
-                    trc_data_m_i = trc_data_m_i.iloc[first_trim:last_trim+1,:]
+                    trc_m_first_trim = trc_data_m_i.isnull().any(axis=1).idxmin()
+                    trc_m_last_trim = trc_data_m_i[::-1].isnull().any(axis=1).idxmin()
+                    trc_data_m_i = trc_data_m_i.iloc[trc_m_first_trim:trc_m_last_trim+1,:]
                     px_to_m_unfiltered_i = [convert_px_to_meters(trc_data_unfiltered[i][kpt_name], first_person_height, height_px, distance_m, cam_width, cam_height, cx, cy, -floor_angle_estim, visible_side=visible_side_i) for kpt_name in new_keypoints_names]
                     trc_data_unfiltered_m_i = pd.concat([all_frames_time.rename('time')]+px_to_m_unfiltered_i, axis=1)
 
@@ -2561,16 +2582,19 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     # ====================================================
     if save_angles and calculate_angles:
         logging.info('\nPost-processing angles (without inverse kinematics):')
+        logging.info(f'Angle output mode: {angle_output_mode}.')
+        logging.info(f'Unwrap angles: {unwrap_angles}.')
 
         # unwrap angles
         # all_frames_angles_homog = np.unwrap(all_frames_angles_homog, axis=0, period=180) # This give all nan values -> need to mask nans
-        for i in range(all_frames_angles_homog.shape[1]):  # for each person
-            for j in range(all_frames_angles_homog.shape[2]):  # for each angle
-                valid_mask = ~np.isnan(all_frames_angles_homog[:, i, j])
-                ang = np.unwrap(all_frames_angles_homog[valid_mask, i, j], period=180)
-                ang = ang-360 if ang.mean()> 180 else ang
-                ang = ang+360 if ang.mean()<-180 else ang
-                all_frames_angles_homog[valid_mask, i, j] = ang
+        if unwrap_angles:
+            for i in range(all_frames_angles_homog.shape[1]):  # for each person
+                for j in range(all_frames_angles_homog.shape[2]):  # for each angle
+                    valid_mask = ~np.isnan(all_frames_angles_homog[:, i, j])
+                    ang = np.unwrap(all_frames_angles_homog[valid_mask, i, j], period=180)
+                    ang = ang-360 if ang.mean()> 180 else ang
+                    ang = ang+360 if ang.mean()<-180 else ang
+                    all_frames_angles_homog[valid_mask, i, j] = ang
                 
         # Process angles for each person
         for i, idx_person in enumerate(selected_persons):
@@ -2656,13 +2680,25 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     if 'horizontal' in angle_dict[ang_name][1]:
                         all_frames_angles_person_filt[ang_name] -= np.degrees(floor_angle_estim)
 
+            all_frames_angles_person_export = all_frames_angles_person_filt.copy()
+            if angle_output_mode == 'bounded_principal':
+                for ang_name in all_frames_angles_person_export.columns:
+                    ang_params = angle_dict.get(ang_name)
+                    if ang_params is None:
+                        continue
+                    # Keep segment orientations continuous; bound joint angles to principal range.
+                    if ang_params[1] in ['flexion', 'dorsiflexion']:
+                        all_frames_angles_person_export[ang_name] = wrap_angle_series_to_principal(
+                            all_frames_angles_person_export[ang_name].to_numpy()
+                        )
+
             # Remove columns with all nan values
-            all_frames_angles_processed[:,idx_person,:] = all_frames_angles_person_filt
-            all_frames_angles_person_filt.dropna(axis=1, how='all', inplace=True)
-            all_frames_angles_person = all_frames_angles_person[all_frames_angles_person_filt.columns]
+            all_frames_angles_processed[:,idx_person,:] = all_frames_angles_person_export
+            all_frames_angles_person_export.dropna(axis=1, how='all', inplace=True)
+            all_frames_angles_person = all_frames_angles_person[all_frames_angles_person_export.columns]
 
             # Build mot file
-            angle_data = make_mot_with_angles(all_frames_angles_person_filt, all_frames_time, str(angles_path_person))
+            angle_data = make_mot_with_angles(all_frames_angles_person_export, all_frames_time, str(angles_path_person))
             logging.info(f'Angles saved to {angles_path_person.resolve()}.')
 
             # Plotting angles before and after interpolation and filtering
@@ -2717,10 +2753,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 max_id+=1
         new_keypoints_ids = list(range(len(new_keypoints_ids)))
 
-        # Draw pose and angles
-        first_frame, last_frame = frame_range
-        if 'first_trim' not in locals():
-            first_trim, last_trim = first_frame, last_frame
+        # Draw pose and angles on the full processed frame range.
+        first_frame = frame_range[0]
+        first_trim = 0
+        last_trim = all_frames_X_processed.shape[0]
         cap = cv2.VideoCapture(video_file_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame+first_trim)
         for i in range(first_trim, last_trim):

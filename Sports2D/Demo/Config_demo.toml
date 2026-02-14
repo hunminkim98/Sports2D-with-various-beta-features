@@ -12,14 +12,14 @@
 
 
 [base]
-video_input = ['KHM5.mp4']   # 'webcam' or '<video_path.ext>', or ['video1_path.mp4', 'video2_path.avi>', ...]
+video_input = 'IMG_1911.MOV'   # 'webcam' or '<video_path.ext>', or ['video1_path.mp4', 'video2_path.avi>', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
 nb_persons_to_detect = 'all'   # int or 'all' # Limiting or not the number of persons to be analyzed
 person_ordering_method = 'on_click' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size',  'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
 first_person_height = 1.65  # Height of the reference person in meters (for pixels -> meters conversion: not used if a calibration file is provided)
-visible_side = ['left']  # Choose visible side among ['right', 'left', 'front', 'back', 'auto', 'none']. String or list of strings.
+visible_side = ['right']  # Choose visible side among ['right', 'left', 'front', 'back', 'auto', 'none']. String or list of strings.
                   # if 'auto', will be either 'left', 'right', or 'front' depending on the direction of the motion
                   # if 'none', coordinates will be left in 2D rather than 3D
 
@@ -37,7 +37,7 @@ input_size = [1280, 720] # [W, H]. Lower resolution will be faster but less prec
 
 show_realtime_results = true
 save_vid = true
-save_img = true
+save_img = false
 save_pose = true
 calculate_angles = true
 save_angles = true
@@ -194,8 +194,10 @@ joint_angles = ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right h
 segment_angles = ['Right foot', 'Left foot', 'Right shank', 'Left shank', 'Right thigh', 'Left thigh', 'Pelvis', 'Trunk', 'Shoulders', 'Head', 'Right arm', 'Left arm', 'Right forearm', 'Left forearm']
 
 # Processing parameters
-flip_left_right = true  # Same angles whether the participant faces left/right. Set it to false if you want timeseries to be continuous even when the participant switches their stance.
+flip_left_right = false  # Same angles whether the participant faces left/right. Set it to false if you want timeseries to be continuous even when the participant switches their stance.
 correct_segment_angles_with_floor_angle = true # If the camera is tilted, corrects segment angles as regards to the floor angle. Set to false if it is the floor which is actually tilted
+angle_output_mode = 'legacy_continuous' # 'legacy_continuous' keeps unwrapped continuity, 'bounded_principal' wraps joint-angle outputs to [-180,180] for mot/video overlays.
+unwrap_angles = false # true keeps np.unwrap continuity correction; false disables unwrap in angle post-processing.
 
 
 [post-processing]
@@ -240,8 +242,8 @@ filter_type = 'butterworth'     # butterworth, kalman, gcv_spline, gaussian, loe
 
 
 [kinematics]
-do_ik = true # Do scaling and inverse kinematics?
-use_augmentation = true  # true or false (lowercase) # Set to true if you want to use the model with augmented markers
+do_ik = false # Do scaling and inverse kinematics?
+use_augmentation = false  # true or false (lowercase) # Set to true if you want to use the model with augmented markers
 feet_on_floor = false # true or false (lowercase) # Set to false if you want to use the model with feet not on the floor (e.g. running, jumping, etc.)
 use_simple_model = false # true or false # IK 10+ times faster, but no muscles or flexible spine, no patella
 participant_mass = [55.0, 67.0] # kg # defaults to 70 if not provided. No influence on kinematics (motion), only on kinetics (forces)
