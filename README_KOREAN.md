@@ -382,6 +382,40 @@ sports2d --time_range 1.2 2.7 `
 
 <br>
 
+#### FMPose3D로 2D -> 3D 리프팅 실행:
+Sports2D 설정/CLI에서 바로 FMPose3D 리프팅을 활성화할 수 있습니다.  
+어떤 2D 포즈 백엔드를 사용하더라도 17관절 3D 결과가 TRC 형식(`*_m_personXX_fmpose3d.trc`)으로 저장됩니다.  
+FMPose3D TRC는 Y-up 좌표계로 내보냅니다.
+Sports2D 호환 경로(`*_m_personXX.trc`)로 복사하려면 `--fmpose3d_overwrite_m_trc true`를 추가하세요.
+
+먼저 선택 의존성을 설치하세요:
+```cmd
+pip install "sports2d[pose3d]"
+```
+
+```cmd
+sports2d --pose_3d true
+```
+기본적으로 좌우 비교 mp4(왼쪽: Sports2D overlay, 오른쪽: FMPose3D 3D 패널)도 함께 저장됩니다. 끄려면 `--save_pose3d_comparison_vid false`를 사용하세요.
+
+옵션 예시:
+```cmd
+sports2d --pose_3d true `
+         --fmpose3d_checkpoint Sports2D/FMPose3D/pre_trained_models/FMpose3D_pretrained_weights.pth `
+         --fmpose3d_device auto `
+         --fmpose3d_sample_steps 3 `
+         --fmpose3d_overwrite_m_trc true
+```
+
+최대 스무딩 프리셋(느리지만 3D가 훨씬 부드러움):
+```cmd
+sports2d --pose_3d true `
+         --fmpose3d_smooth_profile max `
+         --fmpose3d_device cuda
+```
+
+<br>
+
 
 #### 여러 비디오 한 번에 실행:
 ``` cmd
@@ -851,4 +885,3 @@ Sports2D 또는 Pose2Sim에 기여하고 싶다면 [이 이슈](https://github.c
 - [ ] 기존 추적 방법(cf. [Kinovea](https://www.kinovea.org/features.html)) 또는 모델 훈련(cf. [DeepLabCut](https://deeplabcut.github.io/DeepLabCut/README.html))으로 **다른 포인트와 각도 추적**.
 - [ ] **포즈 정제**. 잘못 추정된 2D 포인트를 클릭하고 이동. 영감을 위해 [DeepLabCut](https://www.youtube.com/watch?v=bEuBKB7eqmk) 참조.
 - [ ] 이미지 주석, 왜곡 제거, 원근 고려 등을 위한 도구 추가 (cf. [Kinovea](https://www.kinovea.org/features.html)).
-

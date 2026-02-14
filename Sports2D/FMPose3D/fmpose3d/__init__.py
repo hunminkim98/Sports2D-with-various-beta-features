@@ -18,9 +18,16 @@ from .aggregation_methods import (
     aggregation_RPEA_joint_level,
 )
 
-# Import 2D pose detection utilities
-from .lib.gen_kpts import gen_video_kpts
-from .lib.preprocess import h36m_coco_format, revise_kpts
+# Optional 2D pose detection utilities.
+# These are not required for Sports2D's 2D->3D lifting path and can pull
+# additional demo-only dependencies (e.g. skimage, yolox, transformers).
+try:
+    from .lib.gen_kpts import gen_video_kpts
+    from .lib.preprocess import h36m_coco_format, revise_kpts
+except Exception:  # pragma: no cover - optional demo dependencies
+    gen_video_kpts = None
+    h36m_coco_format = None
+    revise_kpts = None
 
 # Make commonly used classes/functions available at package level
 __all__ = [

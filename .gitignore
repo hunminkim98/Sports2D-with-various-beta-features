@@ -10,3 +10,5 @@ demo_Sports2D/**
 **/Demo/*.mp4
 **/*_Sports2D/
 *.pth
+
+.omx/

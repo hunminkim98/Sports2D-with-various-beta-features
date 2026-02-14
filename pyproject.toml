@@ -45,6 +45,12 @@ synthpose = [
     "torchvision", 
     "transformers",
 ]
+pose3d = [
+    "torch",
+    "torchvision",
+    "timm>=1.0.0",
+    "einops>=0.4.0",
+]
 
 [tool.setuptools_scm]
 

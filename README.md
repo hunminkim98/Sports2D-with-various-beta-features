@@ -341,6 +341,40 @@ sports2d --time_range 1.2 2.7 `
 
 <br>
 
+#### Run 2D -> 3D lifting with FMPose3D:
+Enable the integrated FMPose3D lifting path directly from Sports2D config/CLI.
+It works with any 2D pose backend; output is saved as 17-joint 3D TRC (`*_m_personXX_fmpose3d.trc`).
+FMPose3D TRC is exported in a Y-up coordinate system.
+If you want it copied to the Sports2D-compatible path (`*_m_personXX.trc`), add `--fmpose3d_overwrite_m_trc true`.
+
+Install optional dependencies first:
+```cmd
+pip install "sports2d[pose3d]"
+```
+
+```cmd
+sports2d --pose_3d true
+```
+By default, Sports2D also saves a side-by-side comparison mp4 (left: Sports2D overlay, right: FMPose3D 3D panel). Disable with `--save_pose3d_comparison_vid false`.
+
+Optional overrides:
+```cmd
+sports2d --pose_3d true `
+         --fmpose3d_checkpoint Sports2D/FMPose3D/pre_trained_models/FMpose3D_pretrained_weights.pth `
+         --fmpose3d_device auto `
+         --fmpose3d_sample_steps 3 `
+         --fmpose3d_overwrite_m_trc true
+```
+
+Maximum smoothness preset (slower, but much smoother 3D):
+```cmd
+sports2d --pose_3d true `
+         --fmpose3d_smooth_profile max `
+         --fmpose3d_device cuda
+```
+
+<br>
+
 
 #### Run on several videos at once:
 ``` cmd
@@ -749,4 +783,3 @@ You will be proposed a to-do list, but please feel absolutely free to propose yo
 - [ ] **Track other points and angles** with classic tracking methods (cf. [Kinovea](https://www.kinovea.org/features.html)), or by training a model (cf. [DeepLabCut](https://deeplabcut.github.io/DeepLabCut/README.html)).
 - [ ] **Pose refinement**. Click and move badly estimated 2D points. See [DeepLabCut](https://www.youtube.com/watch?v=bEuBKB7eqmk) for inspiration.
 - [ ] Add tools for annotating images, undistort them, take perspective into account, etc. (cf. [Kinovea](https://www.kinovea.org/features.html)).
-

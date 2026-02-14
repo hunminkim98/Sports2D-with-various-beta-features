@@ -79,6 +79,8 @@ import pandas as pd
 import cv2
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.widgets import Slider, Button
 from matplotlib import patheffects
 from rtmlib.tools.object_detection.post_processings import nms
@@ -297,6 +299,263 @@ def _draw_synthpose_skeleton(img, all_X, all_Y, pose_model, thickness=1):
             cv2.line(img, (int(x1), int(y1)), (int(x2), int(y2)), tuple(color), thickness)
     
     return img
+
+
+# FMPose3D 3D visualization helpers (right panel in side-by-side video)
+# Mirrors the reference renderer in Sports2D/FMPose3D/demo/vis_in_the_wild.py.
+H36M_BONES_I = np.array([0, 0, 1, 4, 2, 5, 0, 7, 8, 8, 14, 15, 11, 12, 8, 9], dtype=np.int32)
+H36M_BONES_J = np.array([1, 4, 2, 5, 3, 6, 7, 8, 14, 11, 15, 16, 12, 13, 9, 10], dtype=np.int32)
+H36M_BONES_LR = np.array([0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0], dtype=bool)
+
+
+def _init_pose3d_panel_renderer(panel_width, panel_height, dpi=110):
+    """
+    Initialize a reusable Matplotlib 3D canvas for FMPose3D rendering.
+    """
+    panel_width = int(panel_width)
+    panel_height = int(panel_height)
+    dpi = int(dpi)
+    fig = Figure(
+        figsize=(panel_width / float(dpi), panel_height / float(dpi)),
+        dpi=dpi,
+    )
+    canvas = FigureCanvasAgg(fig)
+    fig.patch.set_facecolor("white")
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_position([0.0, 0.0, 1.0, 1.0])
+    return fig, ax, canvas
+
+
+def _render_pose3d_panel(
+    frame_idx,
+    pose3d_sequences,
+    panel_width,
+    panel_height,
+    fig,
+    ax,
+    canvas,
+    azim_deg=70.0,
+    elev_deg=15.0,
+):
+    """
+    Render one frame of FMPose3D output using the reference Matplotlib style.
+    """
+    panel_width = int(panel_width)
+    panel_height = int(panel_height)
+
+    ax.cla()
+    ax.view_init(elev=float(elev_deg), azim=float(azim_deg))
+
+    left_color = (0.0, 0.0, 1.0)   # blue
+    right_color = (1.0, 0.0, 0.0)  # red
+
+    current_poses = []
+    for seq in pose3d_sequences:
+        if seq is None:
+            continue
+        arr = np.asarray(seq, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[-2:] != (17, 3):
+            continue
+        if frame_idx < 0 or frame_idx >= arr.shape[0]:
+            continue
+        pose_frame = arr[frame_idx]
+        if np.isfinite(pose_frame).any():
+            current_poses.append(pose_frame)
+
+    if current_poses:
+        all_pts = np.concatenate(current_poses, axis=0)
+        all_pts = all_pts[np.isfinite(all_pts).all(axis=1)]
+        if all_pts.size == 0:
+            all_pts = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+
+        root_candidates = [pose[0] for pose in current_poses if np.isfinite(pose[0]).all()]
+        if root_candidates:
+            center = np.mean(root_candidates, axis=0)
+        else:
+            center = np.mean(all_pts, axis=0)
+
+        radius_xy = 0.72
+        radius_z = 0.70
+        if all_pts.size > 0:
+            max_xy = np.max(np.linalg.norm(all_pts[:, :2] - center[:2], axis=1))
+            max_z = np.max(np.abs(all_pts[:, 2] - center[2]))
+            if np.isfinite(max_xy):
+                radius_xy = max(radius_xy, float(max_xy) * 1.15)
+            if np.isfinite(max_z):
+                radius_z = max(radius_z, float(max_z) * 1.15)
+
+        for pose in current_poses:
+            valid = np.isfinite(pose).all(axis=1)
+            for bone_idx, (a, b) in enumerate(zip(H36M_BONES_I, H36M_BONES_J)):
+                if not (valid[a] and valid[b]):
+                    continue
+                x = np.array([pose[a, 0], pose[b, 0]], dtype=np.float32)
+                y = np.array([pose[a, 1], pose[b, 1]], dtype=np.float32)
+                z = np.array([pose[a, 2], pose[b, 2]], dtype=np.float32)
+                ax.plot(x, y, z, lw=2.2, color=left_color if H36M_BONES_LR[bone_idx] else right_color)
+
+        ax.set_xlim3d([center[0] - radius_xy, center[0] + radius_xy])
+        ax.set_ylim3d([center[1] - radius_xy, center[1] + radius_xy])
+        ax.set_zlim3d([center[2] - radius_z, center[2] + radius_z])
+    else:
+        ax.text2D(
+            0.5, 0.5, "No valid 3D pose",
+            transform=ax.transAxes, ha='center', va='center',
+            fontsize=11, color=(0.3, 0.3, 0.3),
+        )
+        ax.set_xlim3d([-1.0, 1.0])
+        ax.set_ylim3d([-1.0, 1.0])
+        ax.set_zlim3d([-1.0, 1.0])
+
+    ax.set_aspect('auto')
+    white = (1.0, 1.0, 1.0, 0.0)
+    ax.xaxis.set_pane_color(white)
+    ax.yaxis.set_pane_color(white)
+    ax.zaxis.set_pane_color(white)
+    ax.tick_params('x', labelbottom=False)
+    ax.tick_params('y', labelleft=False)
+    ax.tick_params('z', labelleft=False)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_zticks([])
+    ax.grid(False)
+    ax.text2D(
+        0.03, 0.97, "FMPose3D (3D)",
+        transform=ax.transAxes, va='top', ha='left',
+        fontsize=11, color=(0.1, 0.1, 0.1),
+    )
+
+    canvas.draw()
+    panel_rgba = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
+    panel_rgb = panel_rgba[:, :, :3]
+    panel_bgr = cv2.cvtColor(panel_rgb, cv2.COLOR_RGB2BGR)
+    if panel_bgr.shape[1] != panel_width or panel_bgr.shape[0] != panel_height:
+        panel_bgr = cv2.resize(panel_bgr, (panel_width, panel_height), interpolation=cv2.INTER_AREA)
+    return panel_bgr
+
+
+def _moving_average_1d(arr_1d, window):
+    """
+    Edge-padded moving average for temporal smoothing.
+    """
+    arr = np.asarray(arr_1d, dtype=np.float32)
+    window = int(max(1, window))
+    if arr.size <= 1 or window <= 1:
+        return arr.copy()
+
+    if window % 2 == 0:
+        window += 1
+    if window > arr.size:
+        window = arr.size if (arr.size % 2 == 1) else max(1, arr.size - 1)
+        if window <= 1:
+            return arr.copy()
+
+    pad = window // 2
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    padded = np.pad(arr, (pad, pad), mode='edge')
+    return np.convolve(padded, kernel, mode='valid').astype(np.float32)
+
+
+def _smooth_pose3d_sequence(pose3d_seq, window=1, passes=1):
+    """
+    Apply repeated temporal moving-average smoothing to (T,17,3) pose sequence.
+    """
+    pose = np.asarray(pose3d_seq, dtype=np.float32)
+    if pose.ndim != 3 or pose.shape[-1] != 3:
+        return pose
+
+    window = int(max(1, window))
+    passes = int(max(1, passes))
+    if window <= 1:
+        return pose
+
+    out = pose.copy()
+    for _ in range(passes):
+        smoothed = out.copy()
+        for j in range(out.shape[1]):
+            for c in range(out.shape[2]):
+                smoothed[:, j, c] = _moving_average_1d(out[:, j, c], window)
+        out = smoothed
+    return out
+
+
+def _stabilize_pose3d_root_z(pose3d_seq, root_idx=0, window=15):
+    """
+    Stabilize global vertical translation by smoothing root-joint z trajectory.
+    """
+    pose = np.asarray(pose3d_seq, dtype=np.float32)
+    if pose.ndim != 3 or pose.shape[-1] != 3 or pose.shape[1] <= root_idx:
+        return pose
+
+    root_z = pose[:, root_idx, 2]
+    root_z_smooth = _moving_average_1d(root_z, window)
+    delta = (root_z_smooth - root_z).astype(np.float32)
+    stabilized = pose.copy()
+    stabilized[:, :, 2] += delta[:, np.newaxis]
+    return stabilized
+
+
+def _infer_pose3d_ensemble(
+    infer_fn,
+    model,
+    model_input,
+    sample_steps,
+    device,
+    joints_left,
+    joints_right,
+    num_samples=1,
+    random_seed=None,
+):
+    """
+    Run stochastic FMPose3D inference multiple times and average predictions.
+    """
+    num_samples = int(max(1, num_samples))
+    use_seed = random_seed is not None
+    torch_mod = None
+    if use_seed:
+        try:
+            import torch as torch_mod
+        except Exception:
+            torch_mod = None
+            use_seed = False
+
+    preds = []
+    for sample_idx in range(num_samples):
+        if use_seed and torch_mod is not None:
+            seed_i = int(random_seed) + sample_idx
+            torch_mod.manual_seed(seed_i)
+            if torch_mod.cuda.is_available():
+                torch_mod.cuda.manual_seed_all(seed_i)
+
+        pred_i = infer_fn(
+            model=model,
+            model_input=model_input,
+            sample_steps=sample_steps,
+            device=device,
+            joints_left=joints_left,
+            joints_right=joints_right,
+        )
+        preds.append(np.asarray(pred_i, dtype=np.float32))
+
+    if len(preds) == 1:
+        return preds[0]
+    return np.mean(np.stack(preds, axis=0), axis=0).astype(np.float32)
+
+
+def _convert_pose3d_zup_to_yup(pose3d_seq):
+    """
+    Convert 3D sequence from Z-up to Y-up coordinates.
+    Rotation around X axis: (x, y, z) -> (x, z, -y).
+    """
+    seq = np.asarray(pose3d_seq, dtype=np.float32)
+    if seq.ndim != 3 or seq.shape[-1] != 3:
+        return seq
+
+    out = seq.copy()
+    out[:, :, 1] = seq[:, :, 2]
+    out[:, :, 2] = -seq[:, :, 1]
+    return out
 
 
 CORRECTION_2D_TO_3D = 1.063  # Corrective factor for height calculation: segments do not perfectly lie in the 2D plane and look shorter than in 3D
@@ -1667,6 +1926,71 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     save_vid = config_dict.get('base').get('save_vid')
     save_img = config_dict.get('base').get('save_img')
     save_pose = config_dict.get('base').get('save_pose')
+
+    def _parse_bool_option(value, default=False):
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            val = value.strip().lower()
+            if val in ['1', 'true', 'yes', 'on']:
+                return True
+            if val in ['0', 'false', 'no', 'off', '']:
+                return False
+        return bool(value)
+
+    pose_3d = config_dict.get('base', {}).get('pose_3d', False)
+    save_pose3d_comparison_vid = config_dict.get('base', {}).get('save_pose3d_comparison_vid', True)
+    pose_3d_backend = str(config_dict.get('base', {}).get('pose_3d_backend', 'fmpose3d')).lower()
+    fmpose3d_checkpoint = config_dict.get('base', {}).get('fmpose3d_checkpoint', '')
+    fmpose3d_device = config_dict.get('base', {}).get('fmpose3d_device', 'auto')
+    fmpose3d_sample_steps = int(config_dict.get('base', {}).get('fmpose3d_sample_steps', 3))
+    fmpose3d_save_npz = _parse_bool_option(config_dict.get('base', {}).get('fmpose3d_save_npz', False), default=False)
+    fmpose3d_save_trc = _parse_bool_option(config_dict.get('base', {}).get('fmpose3d_save_trc', True), default=True)
+    fmpose3d_overwrite_m_trc = _parse_bool_option(config_dict.get('base', {}).get('fmpose3d_overwrite_m_trc', False), default=False)
+    if fmpose3d_overwrite_m_trc and not fmpose3d_save_trc:
+        fmpose3d_save_trc = True
+    fmpose3d_num_samples = int(config_dict.get('base', {}).get('fmpose3d_num_samples', 1))
+    fmpose3d_temporal_smooth_window = int(config_dict.get('base', {}).get('fmpose3d_temporal_smooth_window', 1))
+    fmpose3d_temporal_smooth_passes = int(config_dict.get('base', {}).get('fmpose3d_temporal_smooth_passes', 1))
+    fmpose3d_stabilize_root_z_raw = config_dict.get('base', {}).get('fmpose3d_stabilize_root_z', False)
+    if isinstance(fmpose3d_stabilize_root_z_raw, str):
+        fmpose3d_stabilize_root_z = fmpose3d_stabilize_root_z_raw.strip().lower() in ['1', 'true', 'yes', 'on']
+    else:
+        fmpose3d_stabilize_root_z = bool(fmpose3d_stabilize_root_z_raw)
+    fmpose3d_root_z_window = int(config_dict.get('base', {}).get('fmpose3d_root_z_window', 15))
+    fmpose3d_smooth_profile = str(config_dict.get('base', {}).get('fmpose3d_smooth_profile', 'off')).lower()
+    fmpose3d_seed_raw = config_dict.get('base', {}).get('fmpose3d_seed', '')
+    if fmpose3d_seed_raw in ['', None]:
+        fmpose3d_seed = None
+    else:
+        fmpose3d_seed = int(fmpose3d_seed_raw)
+
+    # Optional smoothing presets for FMPose3D output.
+    if fmpose3d_smooth_profile in ['max', 'maximum', 'ultra']:
+        fmpose3d_num_samples = max(fmpose3d_num_samples, 5)
+        fmpose3d_temporal_smooth_window = max(fmpose3d_temporal_smooth_window, 9)
+        fmpose3d_temporal_smooth_passes = max(fmpose3d_temporal_smooth_passes, 2)
+        fmpose3d_stabilize_root_z = True
+        fmpose3d_root_z_window = max(fmpose3d_root_z_window, 15)
+    elif fmpose3d_smooth_profile in ['balanced', 'medium']:
+        fmpose3d_num_samples = max(fmpose3d_num_samples, 3)
+        fmpose3d_temporal_smooth_window = max(fmpose3d_temporal_smooth_window, 5)
+        fmpose3d_temporal_smooth_passes = max(fmpose3d_temporal_smooth_passes, 1)
+    elif fmpose3d_smooth_profile not in ['off', 'none', '']:
+        logging.warning(f'Unknown fmpose3d_smooth_profile "{fmpose3d_smooth_profile}". Using explicit smoothing parameters only.')
+
+    fmpose3d_num_samples = max(1, int(fmpose3d_num_samples))
+    fmpose3d_temporal_smooth_window = max(1, int(fmpose3d_temporal_smooth_window))
+    fmpose3d_temporal_smooth_passes = max(1, int(fmpose3d_temporal_smooth_passes))
+    fmpose3d_root_z_window = max(1, int(fmpose3d_root_z_window))
+    if fmpose3d_temporal_smooth_window > 1 and fmpose3d_temporal_smooth_window % 2 == 0:
+        fmpose3d_temporal_smooth_window += 1
+    if fmpose3d_root_z_window > 1 and fmpose3d_root_z_window % 2 == 0:
+        fmpose3d_root_z_window += 1
     calculate_angles = config_dict.get('base').get('calculate_angles')
     save_angles = config_dict.get('base').get('save_angles')
 
@@ -1773,6 +2097,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     if save_plots:
         plots_output_dir.mkdir(parents=True, exist_ok=True)
 
+    pose3d_dir = output_dir / 'pose-3d'
+    if pose_3d or config_dict.get('kinematics').get('do_ik') or config_dict.get('kinematics').get('use_augmentation'):
+        pose3d_dir.mkdir(parents=True, exist_ok=True)
+
     # Inverse kinematics settings
     do_ik = config_dict.get('kinematics').get('do_ik')
     use_augmentation = config_dict.get('kinematics').get('use_augmentation')
@@ -1802,8 +2130,6 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         Pose2Sim_config_dict['markerAugmentation']['make_c3d'] = make_c3d
         Pose2Sim_config_dict['kinematics'] = config_dict.get('kinematics')
         # Temporarily recreate Pose2Sim file hierarchy
-        pose3d_dir = Path(output_dir) / 'pose-3d'
-        pose3d_dir.mkdir(parents=True, exist_ok=True)
         kinematics_dir = Path(output_dir) / 'kinematics'
         kinematics_dir.mkdir(parents=True, exist_ok=True)
     
@@ -2165,7 +2491,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             all_frames_Y.append(np.array(valid_Y))
             all_frames_scores.append(np.array(valid_scores))
             
-            if save_angles and calculate_angles:
+            if calculate_angles:
                 all_frames_angles.append(np.array(valid_angles))
             if video_file=='webcam' and save_vid:   # To adjust framerate of output video
                 elapsed_time = (datetime.now() - start_time).total_seconds()
@@ -2188,7 +2514,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     # ====================================================
     all_frames_X_homog = make_homogeneous(all_frames_X)
     all_frames_X_homog = all_frames_X_homog[...,new_keypoints_ids]
-    if calculate_angles or save_angles:
+    if calculate_angles:
         all_frames_X_flipped_homog = make_homogeneous(all_frames_X_flipped)
         all_frames_X_flipped_homog = all_frames_X_flipped_homog[...,new_keypoints_ids]
         all_frames_angles_homog = make_homogeneous(all_frames_angles)
@@ -2239,13 +2565,65 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         else:
             raise ValueError(f"Invalid person_ordering_method: {person_ordering_method}. Must be 'on_click', 'highest_likelihood', 'greatest_displacement', 'first_detected', or 'last_detected'.")
         logging.info(f'Reordered persons: IDs of persons {selected_persons} become {list(range(len(selected_persons)))}.')
-    
+
+    fmpose3d_model = None
+    fmpose3d_meta = None
+    fmpose3d_output_dir = None
+    H36M_17_JOINT_NAMES = None
+    prepare_fmpose3d_input_from_xy = None
+    prepare_fmpose3d_input = None
+    infer_pose3d_sequence = None
+    pose3d_sequences = [None] * len(selected_persons)
+    if pose_3d:
+        if pose_3d_backend != 'fmpose3d':
+            raise ValueError(f'Unsupported pose_3d_backend: {pose_3d_backend}. Only "fmpose3d" is currently supported.')
+        try:
+            from Sports2D.FMPose3D.inference import (
+                load_fmpose3d_model,
+                prepare_fmpose3d_input,
+                infer_pose3d_sequence,
+            )
+            from Sports2D.Utilities.pose3d_adapter import (
+                H36M_17_JOINT_NAMES,
+                prepare_fmpose3d_input_from_xy,
+            )
+        except Exception as exc:
+            raise ImportError(
+                "pose_3d=True requires FMPose3D dependencies. "
+                "Please install required packages (torch/timm/einops) and keep Sports2D/FMPose3D available."
+            ) from exc
+
+        checkpoint_path = Path(fmpose3d_checkpoint) if str(fmpose3d_checkpoint) else Path(
+            'Sports2D/FMPose3D/pre_trained_models/FMpose3D_pretrained_weights.pth'
+        )
+        if not checkpoint_path.is_absolute():
+            project_root = Path(__file__).resolve().parent.parent
+            checkpoint_path = (project_root / checkpoint_path).resolve()
+
+        fmpose3d_model, fmpose3d_meta = load_fmpose3d_model(
+            checkpoint_path=checkpoint_path,
+            device=fmpose3d_device,
+            frames=1,
+        )
+        fmpose3d_output_dir = pose3d_dir / 'fmpose3d'
+        fmpose3d_output_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f'\nFMPose3D enabled: model loaded from {checkpoint_path}.')
+        logging.info(
+            'FMPose3D smoothing config: '
+            f'profile={fmpose3d_smooth_profile}, samples={fmpose3d_num_samples}, '
+            f'temporal_window={fmpose3d_temporal_smooth_window}, temporal_passes={fmpose3d_temporal_smooth_passes}, '
+            f'stabilize_root_z={fmpose3d_stabilize_root_z}, root_z_window={fmpose3d_root_z_window}, '
+            f'save_npz={fmpose3d_save_npz}, save_trc={fmpose3d_save_trc}, overwrite_m_trc={fmpose3d_overwrite_m_trc}.'
+        )
+        if fmpose3d_seed is not None:
+            logging.info(f'FMPose3D deterministic seed base: {fmpose3d_seed}.')
+
 
     #%% ==================================================
     # Post-processing pose
     # ====================================================
     all_frames_X_processed, all_frames_X_flipped_processed, all_frames_Y_processed, all_frames_scores_processed, all_frames_angles_processed = all_frames_X_homog.copy(), all_frames_X_flipped_homog.copy(), all_frames_Y_homog.copy(), all_frames_scores_homog.copy(), all_frames_angles_homog.copy()
-    if save_pose:
+    if save_pose or pose_3d:
         logging.info('\nPost-processing pose:')
         # Process pose for each person
         trc_data, trc_data_unfiltered, score_data = [], [], []
@@ -2255,7 +2633,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             all_frames_X_person = pd.DataFrame(all_frames_X_processed[:,idx_person,:], columns=new_keypoints_names)
             all_frames_Y_person = pd.DataFrame(all_frames_Y_processed[:,idx_person,:], columns=new_keypoints_names)
             score_data.append(pd.DataFrame(all_frames_scores_processed[:,idx_person,:], columns=new_keypoints_names))
-            if calculate_angles or save_angles:
+            if calculate_angles:
                 all_frames_X_flipped_person = pd.DataFrame(all_frames_X_flipped_processed[:,idx_person,:], columns=new_keypoints_names)
 
             # Interpolate
@@ -2280,7 +2658,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
             # Do not process person if no section of min_chunk_size valid frames in a row
             if (first_run_start_min, last_run_end_max) == (0,0):
-                all_frames_X_processed[:,idx_person,:], all_frames_X_flipped_processed[:,idx_person,:], all_frames_Y_processed[:,idx_person,:] = np.nan, np.nan, np.nan
+                all_frames_X_processed[:,idx_person,:] = np.nan
+                all_frames_Y_processed[:,idx_person,:] = np.nan
+                if calculate_angles:
+                    all_frames_X_flipped_processed[:,idx_person,:] = np.nan
                 columns=np.array([[c]*3 for c in all_frames_X_person.columns]).flatten()
                 trc_data_i = pd.DataFrame(0, index=all_frames_X_person.index, columns=['time']+list(columns))
                 trc_data_i['time'] = all_frames_time
@@ -2349,9 +2730,71 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             # Build TRC file
             trc_data_i = trc_data_from_XYZtime(all_frames_X_person_filt, all_frames_Y_person_filt, all_frames_Z_homog, all_frames_time)
             trc_data.append(trc_data_i)
-            if not load_trc_px:
+            if save_pose and not load_trc_px:
                 make_trc_with_trc_data(trc_data_i, str(pose_path_person), fps=fps)
                 logging.info(f'Pose in pixels saved to {pose_path_person.resolve()}.')
+
+            if pose_3d:
+                keypoints_h36m_norm, valid_frames, missing_joints = prepare_fmpose3d_input_from_xy(
+                    all_frames_X_person_filt,
+                    all_frames_Y_person_filt,
+                    cam_width=cam_width,
+                    cam_height=cam_height,
+                )
+                model_input = prepare_fmpose3d_input(
+                    keypoints_h36m_norm,
+                    joints_left=fmpose3d_meta['joints_left'],
+                    joints_right=fmpose3d_meta['joints_right'],
+                    augment=True,
+                )
+                pose3d_seq = _infer_pose3d_ensemble(
+                    infer_fn=infer_pose3d_sequence,
+                    model=fmpose3d_model,
+                    model_input=model_input,
+                    sample_steps=fmpose3d_sample_steps,
+                    device=fmpose3d_meta['device'],
+                    joints_left=fmpose3d_meta['joints_left'],
+                    joints_right=fmpose3d_meta['joints_right'],
+                    num_samples=fmpose3d_num_samples,
+                    random_seed=fmpose3d_seed,
+                )
+                if fmpose3d_num_samples > 1:
+                    logging.info(f'FMPose3D ensemble averaging applied: {fmpose3d_num_samples} stochastic samples.')
+                if fmpose3d_temporal_smooth_window > 1:
+                    pose3d_seq = _smooth_pose3d_sequence(
+                        pose3d_seq,
+                        window=fmpose3d_temporal_smooth_window,
+                        passes=fmpose3d_temporal_smooth_passes,
+                    )
+                    logging.info(
+                        f'FMPose3D temporal smoothing applied: '
+                        f'window={fmpose3d_temporal_smooth_window}, passes={fmpose3d_temporal_smooth_passes}.'
+                    )
+                if fmpose3d_stabilize_root_z:
+                    pose3d_seq = _stabilize_pose3d_root_z(
+                        pose3d_seq,
+                        root_idx=0,
+                        window=fmpose3d_root_z_window,
+                    )
+                    logging.info(f'FMPose3D root-z stabilization applied: window={fmpose3d_root_z_window}.')
+                fmpose3d_output_path = fmpose3d_output_dir / f'person{i:02d}_pose3d.npz'
+                if fmpose3d_save_npz:
+                    np.savez_compressed(
+                        fmpose3d_output_path,
+                        pose3d=pose3d_seq.astype(np.float32),
+                        joint_names=np.array(H36M_17_JOINT_NAMES, dtype=str),
+                        source_model=str(pose_model_name),
+                        fps=np.float32(fps),
+                        frame_indices=np.arange(pose3d_seq.shape[0], dtype=np.int32),
+                        valid_frames=np.asarray(valid_frames, dtype=np.int32),
+                        missing_keypoints=np.array(missing_joints, dtype=str),
+                    )
+                    logging.info(f'3D pose (FMPose3D, NPZ) saved to {fmpose3d_output_path.resolve()}.')
+                elif fmpose3d_output_path.exists():
+                    # Keep TRC-first behavior deterministic when reusing an existing result directory.
+                    fmpose3d_output_path.unlink()
+                    logging.info(f'Removed stale FMPose3D NPZ at {fmpose3d_output_path.resolve()}.')
+                pose3d_sequences[i] = pose3d_seq.astype(np.float32)
 
             # Plotting coordinates before and after interpolation and filtering
             columns_to_concat = []
@@ -2379,7 +2822,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     logging.info(f'Pose plots (px) saved in {plots_output_dir}.')
                     
             all_frames_X_processed[:,idx_person,:], all_frames_Y_processed[:,idx_person,:] = all_frames_X_person_filt, all_frames_Y_person_filt
-            if calculate_angles or save_angles:
+            if calculate_angles:
                 all_frames_X_flipped_processed[:,idx_person,:] = all_frames_X_flipped_person
                 
 
@@ -2512,12 +2955,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
                     # Convert to meters
                     px_to_m_i = [convert_px_to_meters(trc_data[i][kpt_name], first_person_height, height_px, distance_m, cam_width, cam_height, cx, cy, -floor_angle_estim, visible_side=visible_side_i) for kpt_name in new_keypoints_names]
-                    trc_data_m_i = pd.concat([all_frames_time.rename('time')]+px_to_m_i, axis=1)
+                    trc_data_m_i_full = pd.concat([all_frames_time.rename('time')]+px_to_m_i, axis=1)
+                    trc_data_m_i = trc_data_m_i_full.copy()
                     for c_id, c in enumerate(3*np.arange(len(trc_data_m_i.columns[3::3]))+1): # only X coordinates
                         first_run_start, last_run_end = first_run_starts_everyone[i][c_id], last_run_ends_everyone[i][c_id]
                         trc_data_m_i.iloc[:first_run_start,c+2] = np.nan
                         trc_data_m_i.iloc[last_run_end:,c+2] = np.nan
                         trc_data_m_i.iloc[first_run_start:last_run_end,c+2] = trc_data_m_i.iloc[first_run_start:last_run_end,c+2].ffill().bfill()
+
                     first_trim, last_trim = trc_data_m_i.isnull().any(axis=1).idxmin(), trc_data_m_i[::-1].isnull().any(axis=1).idxmin()
                     trc_data_m_i = trc_data_m_i.iloc[first_trim:last_trim+1,:]
                     px_to_m_unfiltered_i = [convert_px_to_meters(trc_data_unfiltered[i][kpt_name], first_person_height, height_px, distance_m, cam_width, cam_height, cx, cy, -floor_angle_estim, visible_side=visible_side_i) for kpt_name in new_keypoints_names]
@@ -2554,7 +2999,6 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 new_visible_side += [visible_side_i]
         else:
             new_visible_side = visible_side.copy()
-
 
     #%% ==================================================
     # Post-processing angles
@@ -2690,16 +3134,32 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     #%% ==================================================
     # Save images/video with processed pose and angles
     # ====================================================
-    if save_vid or save_img:
+    write_pose3d_comparison_vid = bool(pose_3d and save_pose3d_comparison_vid)
+    if save_vid or save_img or write_pose3d_comparison_vid:
         logging.info('\nSaving images of processed pose and angles:')
+        comparison_vid_path = None
+        out_pose3d_comparison_vid = None
+        pose3d_panel_fig = None
+        pose3d_panel_ax = None
+        pose3d_panel_canvas = None
         if save_vid:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out_vid = cv2.VideoWriter(str(vid_output_path.absolute()), fourcc, fps, (cam_width, cam_height))
+        if write_pose3d_comparison_vid:
+            comparison_vid_path = vid_output_path.parent / f'{vid_output_path.stem}_overlay_pose3d.mp4'
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out_pose3d_comparison_vid = cv2.VideoWriter(
+                str(comparison_vid_path.absolute()),
+                fourcc,
+                fps,
+                (cam_width * 2, cam_height),
+            )
+            pose3d_panel_fig, pose3d_panel_ax, pose3d_panel_canvas = _init_pose3d_panel_renderer(cam_width, cam_height)
         
         # Reorder persons
         all_frames_X_processed, all_frames_Y_processed = all_frames_X_processed[:,selected_persons,:], all_frames_Y_processed[:,selected_persons,:]
         all_frames_scores_processed = all_frames_scores_processed[:,selected_persons,:]
-        if save_angles or calculate_angles:
+        if calculate_angles:
             all_frames_X_flipped_processed = all_frames_X_flipped_processed[:,selected_persons,:]
             all_frames_angles_processed = all_frames_angles_processed[:,selected_persons,:]
 
@@ -2736,6 +3196,19 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             backend_name=backend_name, thickness=thickness)
             if calculate_angles:
                 img = draw_angles(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_angles_processed[i], all_frames_X_flipped_processed[i], new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
+            if write_pose3d_comparison_vid and out_pose3d_comparison_vid is not None:
+                pose3d_panel = _render_pose3d_panel(
+                    frame_idx=i,
+                    pose3d_sequences=pose3d_sequences,
+                    panel_width=cam_width,
+                    panel_height=cam_height,
+                    fig=pose3d_panel_fig,
+                    ax=pose3d_panel_ax,
+                    canvas=pose3d_panel_canvas,
+                )
+                img_comparison = np.hstack((img, pose3d_panel))
+                cv2.line(img_comparison, (cam_width, 0), (cam_width, cam_height-1), (200, 200, 200), 1)
+                out_pose3d_comparison_vid.write(img_comparison)
 
             # Save video or images
             if save_vid:
@@ -2752,6 +3225,11 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 resample_video(vid_output_path, fps, actual_framerate)
                 fps = actual_framerate
             logging.info(f"Processed video saved to {vid_output_path.resolve()}.")
+        if write_pose3d_comparison_vid and out_pose3d_comparison_vid is not None:
+            out_pose3d_comparison_vid.release()
+            if pose3d_panel_fig is not None:
+                pose3d_panel_fig.clear()
+            logging.info(f'Pose-3D comparison video saved to {comparison_vid_path.resolve()}.')
         if save_img:
             logging.info(f"Processed images saved to {img_output_dir.resolve()}.")
 
@@ -2834,3 +3312,42 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     shutil.move(file, output_dir)
             pose3d_dir.rmdir()
             kinematics_dir.rmdir()
+
+    #%% ==================================================
+    # Export FMPose3D output as TRC for better Sports2D compatibility
+    # ====================================================
+    if pose_3d and fmpose3d_save_trc:
+        logging.info('\nExporting FMPose3D 3D output to TRC:')
+        logging.info('FMPose3D TRC export coordinate system: Y-up (x, z, -y from model output).')
+        if H36M_17_JOINT_NAMES is None:
+            logging.warning('Skipping FMPose3D TRC export: joint name mapping is unavailable.')
+        else:
+            pose3d_joint_names = list(H36M_17_JOINT_NAMES)
+            for i, pose3d_seq in enumerate(pose3d_sequences):
+                if pose3d_seq is None:
+                    continue
+                seq = np.asarray(pose3d_seq, dtype=np.float32)
+                if seq.ndim != 3 or seq.shape[1:] != (17, 3):
+                    logging.warning(f'Skipping FMPose3D TRC export for person {i}: invalid shape {seq.shape}.')
+                    continue
+                seq = _convert_pose3d_zup_to_yup(seq)
+
+                time_len = seq.shape[0]
+                if len(all_frames_time) >= time_len:
+                    pose3d_time = all_frames_time.iloc[:time_len].reset_index(drop=True).rename('time')
+                else:
+                    pose3d_time = pd.Series(np.arange(time_len, dtype=np.float32) / float(fps), name='time')
+
+                x_df = pd.DataFrame(seq[:, :, 0], columns=pose3d_joint_names)
+                y_df = pd.DataFrame(seq[:, :, 1], columns=pose3d_joint_names)
+                z_df = pd.DataFrame(seq[:, :, 2], columns=pose3d_joint_names)
+                pose3d_trc_data = trc_data_from_XYZtime(x_df, y_df, z_df, pose3d_time)
+
+                fmpose3d_trc_path = pose_output_path.parent / f'{pose_output_path_m.stem}_person{i:02d}_fmpose3d.trc'
+                make_trc_with_trc_data(pose3d_trc_data, str(fmpose3d_trc_path), fps=fps)
+                logging.info(f'FMPose3D TRC saved to {fmpose3d_trc_path.resolve()}.')
+
+                if fmpose3d_overwrite_m_trc:
+                    compat_trc_path = pose_output_path.parent / f'{pose_output_path_m.stem}_person{i:02d}.trc'
+                    make_trc_with_trc_data(pose3d_trc_data, str(compat_trc_path), fps=fps)
+                    logging.info(f'FMPose3D TRC saved to compatibility path {compat_trc_path.resolve()}.')
