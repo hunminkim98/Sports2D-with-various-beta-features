@@ -25,6 +25,8 @@
         sports2d --video_input path_to_video.mp4
     - Run on multiple videos with default parameters:
         sports2d --video_input path_to_video1.mp4 path_to_video2.mp4
+    - Run on all videos inside a folder:
+        sports2d --video_input path_to_video_folder
     - Run on webcam with default parameters: 
         sports2d --video_input webcam
     - Run with custom parameters (all non specified are set to default): 
@@ -274,7 +276,7 @@ DEFAULT_CONFIG =   {'base': {'video_input': ['demo.mp4'],
                     }
 
 CONFIG_HELP =   {'config': ["C", "path to a toml configuration file"],
-                'video_input': ["i", "webcam, or video_path.mp4, or video1_path.avi video2_path.mp4 ... Beware that images won't be saved if paths contain non ASCII characters"],
+                'video_input': ["i", "webcam, video_path.mp4, folder_path (all videos in folder), or video1_path.avi video2_path.mp4 ... Beware that images won't be saved if paths contain non ASCII characters"],
                 'time_range': ["t", "start_time end_time. In seconds. Whole video if not specified. start_time1 end_time1 start_time2 end_time2 ... if multiple videos with different time ranges"],
                 'nb_persons_to_detect': ["n", "number of persons to detect. int or 'all'. 'all' if not specified"],
                 'person_ordering_method': ["", "'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'. 'on_click' if not specified"],
@@ -369,6 +371,11 @@ CONFIG_HELP =   {'config': ["C", "path to a toml configuration file"],
                 'use_custom_logging': ["", "use custom logging. false if not specified"]
                 }
 
+VIDEO_EXTENSIONS = {
+                '.mp4', '.avi', '.mov', '.mkv', '.m4v', '.wmv', '.mpg', '.mpeg',
+                '.webm', '.ts', '.mts', '.m2ts', '.flv', '.3gp'
+                }
+
 
 ## AUTHORSHIP INFORMATION
 __author__ = "David Pagnon"
@@ -389,6 +396,38 @@ def read_config_file(config):
 
     config_dict = toml.load(config)
     return config_dict
+
+
+def _expand_video_input_paths(video_input, video_dir):
+    '''
+    Expand directory entries from video_input into concrete video file paths.
+    '''
+
+    if isinstance(video_input, (str, Path)):
+        video_input = [video_input]
+
+    expanded_video_files = []
+    for entry in video_input:
+        input_path = Path(entry)
+        resolved_path = input_path if input_path.is_absolute() else video_dir / input_path
+
+        if resolved_path.is_dir():
+            directory_videos = sorted(
+                [candidate for candidate in resolved_path.iterdir()
+                 if candidate.is_file() and candidate.suffix.lower() in VIDEO_EXTENSIONS],
+                key=lambda candidate: candidate.name.lower()
+            )
+            if len(directory_videos) == 0:
+                raise FileNotFoundError(f'Error: No video files found in directory {resolved_path}.')
+
+            if input_path.is_absolute():
+                expanded_video_files.extend(directory_videos)
+            else:
+                expanded_video_files.extend([input_path / candidate.name for candidate in directory_videos])
+        else:
+            expanded_video_files.append(input_path)
+
+    return expanded_video_files
 
 
 def base_params(config_dict):
@@ -413,21 +452,19 @@ def base_params(config_dict):
         time_ranges = [None]
     else:
         # video_files
-        if isinstance(video_input, str):
-            video_files = [Path(video_input)]
-        else: 
-            video_files = [Path(v) for v in video_input]
+        video_files = _expand_video_input_paths(video_input, video_dir)
 
         # frame_rates
         frame_rates = []
         for video_file in video_files:
-            video = cv2.VideoCapture(str(video_dir / video_file)) if video_dir else cv2.VideoCapture(str(video_file))
+            video_path = video_file if video_file.is_absolute() else video_dir / video_file
+            video = cv2.VideoCapture(str(video_path))
             if not video.isOpened():
-                raise FileNotFoundError(f'Error: Could not open {video_dir/video_file}. Check that the file exists.')
+                raise FileNotFoundError(f'Error: Could not open {video_path}. Check that the file exists.')
             frame_rate = round(video.get(cv2.CAP_PROP_FPS))
             if frame_rate == 0:
                 frame_rate = 30
-                logging.warning(f'Error: Could not retrieve frame rate from {video_dir/video_file}. Defaulting to 30fps.')
+                logging.warning(f'Error: Could not retrieve frame rate from {video_path}. Defaulting to 30fps.')
             frame_rates.append(frame_rate)
             video.release()
 
@@ -570,6 +607,8 @@ def main():
         sports2d --video_input path_to_video.mp4
     - Run on multiple videos with default parameters:
         sports2d --video_input path_to_video1.mp4 path_to_video2.mp4
+    - Run on all videos inside a folder:
+        sports2d --video_input path_to_video_folder
     - Run on webcam with default parameters: 
         sports2d --video_input webcam
     - Run with custom parameters (all non specified are set to default): 

@@ -12,7 +12,7 @@
 
 
 [base]
-video_input = 'IMG_1911.MOV'   # 'webcam' or '<video_path.ext>', or ['video1_path.mp4', 'video2_path.avi>', ...]
+video_input = '20260215'   # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 

@@ -19,6 +19,7 @@ import toml
 import subprocess
 from pathlib import Path
 import numpy as np
+import pytest
 
 
 ## AUTHORSHIP INFORMATION
@@ -61,6 +62,60 @@ def test_wrap_angle_series_to_principal_output_range():
 
     assert np.all(valid >= -180.0)
     assert np.all(valid <= 180.0)
+
+
+def test_expand_video_input_paths_supports_relative_directory(tmp_path):
+    '''
+    Verify relative directory input is expanded to sorted video files.
+    '''
+
+    from Sports2D.Sports2D import _expand_video_input_paths
+
+    video_dir = tmp_path / 'videos'
+    batch_dir = video_dir / 'batch'
+    nested_dir = batch_dir / 'nested'
+    nested_dir.mkdir(parents=True)
+
+    (batch_dir / 'clip_b.MOV').write_text('')
+    (batch_dir / 'clip_a.mp4').write_text('')
+    (batch_dir / 'notes.txt').write_text('')
+    (nested_dir / 'clip_nested.mp4').write_text('')
+
+    video_files = _expand_video_input_paths('batch', video_dir)
+
+    assert video_files == [Path('batch') / 'clip_a.mp4', Path('batch') / 'clip_b.MOV']
+
+
+def test_expand_video_input_paths_supports_absolute_directory(tmp_path):
+    '''
+    Verify absolute directory input is expanded to sorted absolute video files.
+    '''
+
+    from Sports2D.Sports2D import _expand_video_input_paths
+
+    batch_dir = tmp_path / 'batch'
+    batch_dir.mkdir()
+
+    (batch_dir / 'run_02.mp4').write_text('')
+    (batch_dir / 'run_01.avi').write_text('')
+
+    video_files = _expand_video_input_paths(str(batch_dir), tmp_path)
+
+    assert video_files == [batch_dir / 'run_01.avi', batch_dir / 'run_02.mp4']
+
+
+def test_expand_video_input_paths_raises_on_empty_directory(tmp_path):
+    '''
+    Verify directory input fails with a clear error when no videos are found.
+    '''
+
+    from Sports2D.Sports2D import _expand_video_input_paths
+
+    empty_dir = tmp_path / 'empty'
+    empty_dir.mkdir()
+
+    with pytest.raises(FileNotFoundError, match='No video files found'):
+        _expand_video_input_paths('empty', tmp_path)
 
 
 def test_workflow():
