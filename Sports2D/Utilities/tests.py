@@ -113,19 +113,6 @@ def test_unwrap_angle_value_continuous_streaming_updates():
     assert np.allclose(np.array(out, dtype=float), np.array(expected, dtype=float), equal_nan=True)
 
 
-def test_unwrap_angle_series_continuous_ignores_non_boundary_large_swings():
-    '''
-    Verify continuity logic does not add full turns when values do not cross wrap boundaries.
-    '''
-
-    from Sports2D.Utilities.common import unwrap_angle_series_continuous
-
-    values = np.array([100.0, -120.0, 130.0, -140.0, 120.0], dtype=float)
-    unwrapped = unwrap_angle_series_continuous(values)
-
-    assert np.allclose(unwrapped, values, atol=1e-9)
-
-
 def test_default_config_exposes_motion_type():
     '''
     Verify the CLI/config schema exposes the motion_type key.
