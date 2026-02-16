@@ -15,11 +15,6 @@
 - 2026-02-14: `angles.unwrap_angles` 설정이 추가되었습니다.
   - `true` (기본): 기존 `np.unwrap` 기반 연속성 보정을 수행합니다.
   - `false`: unwrap 단계를 건너뛰고 원시 각도 흐름을 후처리합니다.
-- 2026-02-16: `angles.motion_type` 설정이 추가되었습니다.
-  - `generic` (기본): 기존 동작을 유지합니다.
-  - `throw`: 어깨 관절(`right shoulder`, `left shoulder`)은 `-180/180` 경계에서 끊기지 않도록 연속(360-cycle) 표현을 강제합니다.
-  - 적용 대상: 실시간 오버레이, 저장 영상/이미지 오버레이, 그래프, `.mot` 저장값.
-  - 호환성: 기존 `angle_output_mode`, `unwrap_angles` 설정은 유지되며, `throw`일 때 어깨 각도에만 연속 표현 우선 규칙이 적용됩니다.
 
 ---
 

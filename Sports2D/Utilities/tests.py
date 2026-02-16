@@ -64,66 +64,6 @@ def test_wrap_angle_series_to_principal_output_range():
     assert np.all(valid <= 180.0)
 
 
-def test_unwrap_angle_series_continuous_boundary_crossing():
-    '''
-    Verify series unwrapping keeps continuity through the -180/180 boundary.
-    '''
-
-    from Sports2D.Utilities.common import unwrap_angle_series_continuous
-
-    values = np.array([160.0, 170.0, -170.0, -160.0, -150.0], dtype=float)
-    unwrapped = unwrap_angle_series_continuous(values)
-
-    assert np.allclose(unwrapped, np.array([160.0, 170.0, 190.0, 200.0, 210.0]), atol=1e-9)
-
-
-def test_unwrap_angle_series_continuous_preserves_nan_gaps():
-    '''
-    Verify NaN gaps are preserved and each valid chunk unwraps independently.
-    '''
-
-    from Sports2D.Utilities.common import unwrap_angle_series_continuous
-
-    values = np.array([np.nan, 170.0, -170.0, np.nan, -175.0], dtype=float)
-    unwrapped = unwrap_angle_series_continuous(values)
-
-    assert np.isnan(unwrapped[0])
-    assert np.isnan(unwrapped[3])
-    assert np.allclose(unwrapped[1:3], np.array([170.0, 190.0]), atol=1e-9)
-    assert np.isclose(unwrapped[4], -175.0)
-
-
-def test_unwrap_angle_value_continuous_streaming_updates():
-    '''
-    Verify incremental unwrapping tracks continuity in a streaming scenario.
-    '''
-
-    from Sports2D.Utilities.common import unwrap_angle_value_continuous
-
-    values = [160.0, 170.0, -170.0, -160.0, np.nan, -150.0]
-    out = []
-    prev = np.nan
-    for val in values:
-        curr = unwrap_angle_value_continuous(val, prev)
-        out.append(curr)
-        if not np.isnan(curr):
-            prev = curr
-
-    expected = [160.0, 170.0, 190.0, 200.0, np.nan, 210.0]
-    assert np.allclose(np.array(out, dtype=float), np.array(expected, dtype=float), equal_nan=True)
-
-
-def test_default_config_exposes_motion_type():
-    '''
-    Verify the CLI/config schema exposes the motion_type key.
-    '''
-
-    from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
-
-    assert DEFAULT_CONFIG['angles']['motion_type'] == 'generic'
-    assert 'motion_type' in CONFIG_HELP
-
-
 def test_expand_video_input_paths_supports_relative_directory(tmp_path):
     '''
     Verify relative directory input is expanded to sorted video files.
