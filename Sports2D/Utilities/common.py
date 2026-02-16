@@ -134,36 +134,32 @@ def wrap_angle_series_to_principal(angles):
     return angles
 
 
-def unwrap_angle_series_continuous(angles, period=360.0):
+def unwrap_angle_series_continuous(angles, period=360.0, boundary_margin=165.0, max_cycles=1):
     '''
     Unwrap an angle series to a continuous representation while preserving NaNs.
 
     INPUT:
     - angles: array-like of angle values in degrees
     - period: cycle period in degrees (360 by default)
+    - boundary_margin: boundary zone used to detect wrap crossings (degrees)
+    - max_cycles: absolute cycle-count clamp to prevent runaway accumulation
 
     OUTPUT:
     - np.array of unwrapped continuous angles
     '''
 
     angles = np.asarray(angles, dtype=float).copy()
-    valid_idx = np.where(~np.isnan(angles))[0]
-    if valid_idx.size == 0:
-        return angles
-
-    split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
-    valid_chunks = np.split(valid_idx, split_points)
-    period_rad = np.deg2rad(period)
-
-    for chunk_idx in valid_chunks:
-        chunk_vals = angles[chunk_idx]
-        chunk_unwrapped = np.rad2deg(np.unwrap(np.deg2rad(chunk_vals), period=period_rad))
-        angles[chunk_idx] = chunk_unwrapped
-
+    prev_unwrapped = np.nan
+    for idx, angle in enumerate(angles):
+        curr_unwrapped = unwrap_angle_value_continuous(
+            angle, prev_unwrapped, period=period, boundary_margin=boundary_margin, max_cycles=max_cycles
+        )
+        angles[idx] = curr_unwrapped
+        prev_unwrapped = curr_unwrapped if not np.isnan(curr_unwrapped) else np.nan
     return angles
 
 
-def unwrap_angle_value_continuous(current_angle, previous_unwrapped, period=360.0):
+def unwrap_angle_value_continuous(current_angle, previous_unwrapped, period=360.0, boundary_margin=165.0, max_cycles=1):
     '''
     Incrementally unwrap one angle sample against the previous unwrapped value.
 
@@ -171,6 +167,8 @@ def unwrap_angle_value_continuous(current_angle, previous_unwrapped, period=360.
     - current_angle: current sample in degrees (can be NaN)
     - previous_unwrapped: previous unwrapped sample in degrees (can be NaN)
     - period: cycle period in degrees (360 by default)
+    - boundary_margin: boundary zone used to detect wrap crossings (degrees)
+    - max_cycles: absolute cycle-count clamp to prevent runaway accumulation
 
     OUTPUT:
     - current sample mapped to the closest continuous branch
@@ -184,9 +182,19 @@ def unwrap_angle_value_continuous(current_angle, previous_unwrapped, period=360.
         return current_angle
 
     half_period = period / 2.0
-    delta = current_angle - previous_unwrapped
-    delta = (delta + half_period) % period - half_period
-    return previous_unwrapped + delta
+    previous_wrapped = (previous_unwrapped + half_period) % period - half_period
+    cycle_index = int(round((previous_unwrapped - previous_wrapped) / period))
+
+    crossed_neg_to_pos = previous_wrapped < -boundary_margin and current_angle > boundary_margin
+    crossed_pos_to_neg = previous_wrapped > boundary_margin and current_angle < -boundary_margin
+    if crossed_neg_to_pos:
+        cycle_index -= 1
+    elif crossed_pos_to_neg:
+        cycle_index += 1
+    if max_cycles is not None:
+        cycle_index = int(np.clip(cycle_index, -int(max_cycles), int(max_cycles)))
+
+    return current_angle + cycle_index * period
 
 
 def make_homogeneous(list_of_arrays):

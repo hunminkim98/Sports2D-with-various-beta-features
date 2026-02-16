@@ -2144,11 +2144,13 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         for shoulder_idx in throw_shoulder_angle_indices:
                             prev_angle = person_state.get(shoulder_idx, np.nan)
                             continuous_angle = unwrap_angle_value_continuous(
-                                person_angles_flipped[shoulder_idx], prev_angle, period=360.0
+                                person_angles_flipped[shoulder_idx], prev_angle, period=360.0, boundary_margin=165.0
                             )
                             person_angles_flipped[shoulder_idx] = continuous_angle
                             if not np.isnan(continuous_angle):
                                 person_state[shoulder_idx] = continuous_angle
+                            else:
+                                person_state[shoulder_idx] = np.nan
 
                     valid_angles.append(person_angles)
                     valid_angles_flipped.append(person_angles_flipped)
@@ -2620,6 +2622,40 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         # Process angles for each person
         for i, idx_person in enumerate(selected_persons):
             angles_path_person = angles_output_path.parent / (angles_output_path.stem + f'_person{i:02d}.mot')
+
+            active_throw_shoulder_names = set()
+            if apply_throw_shoulder_continuity and throw_shoulder_angle_indices:
+                throw_shoulder_candidates = []
+                for shoulder_idx in throw_shoulder_angle_indices:
+                    shoulder_series = all_frames_angles_homog[:, idx_person, shoulder_idx]
+                    shoulder_series = shoulder_series[~np.isnan(shoulder_series)]
+                    if shoulder_series.size < 2:
+                        continue
+                    crossings = np.sum(
+                        ((shoulder_series[:-1] > 165.0) & (shoulder_series[1:] < -165.0))
+                        | ((shoulder_series[:-1] < -165.0) & (shoulder_series[1:] > 165.0))
+                    )
+                    near_boundary = np.sum(np.abs(shoulder_series) >= 170.0)
+                    if crossings >= 1 and near_boundary >= 3:
+                        throw_shoulder_candidates.append((shoulder_idx, crossings, near_boundary))
+
+                active_throw_shoulder_indices = []
+                if throw_shoulder_candidates:
+                    # Use the dominant throwing shoulder in this clip to avoid runaway accumulation on the non-throwing side.
+                    active_throw_shoulder_indices = [
+                        max(throw_shoulder_candidates, key=lambda x: (x[1], x[2]))[0]
+                    ]
+
+                for shoulder_idx in active_throw_shoulder_indices:
+                    valid_mask = ~np.isnan(all_frames_angles_homog[:, idx_person, shoulder_idx])
+                    all_frames_angles_homog[valid_mask, idx_person, shoulder_idx] = unwrap_angle_series_continuous(
+                        all_frames_angles_homog[valid_mask, idx_person, shoulder_idx],
+                        period=360.0,
+                        boundary_margin=165.0,
+                        max_cycles=1,
+                    )
+                    active_throw_shoulder_names.add(angle_names[shoulder_idx])
+
             all_frames_angles_person = pd.DataFrame(all_frames_angles_homog[:,idx_person,:], columns=angle_names)
 
             # Flip angles for left side when flip_left_right false
@@ -2703,12 +2739,19 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
             all_frames_angles_person_export = all_frames_angles_person_filt.copy()
             if apply_throw_shoulder_continuity:
-                for shoulder_name in throw_shoulder_angle_names:
+                for shoulder_name in active_throw_shoulder_names:
                     if shoulder_name in all_frames_angles_person_export.columns:
-                        all_frames_angles_person_export[shoulder_name] = unwrap_angle_series_continuous(
+                        shoulder_series = unwrap_angle_series_continuous(
                             all_frames_angles_person_export[shoulder_name].to_numpy(),
                             period=360.0,
+                            boundary_margin=165.0,
+                            max_cycles=1,
                         )
+                        valid_mask = ~np.isnan(shoulder_series)
+                        shoulder_series[valid_mask] = np.rad2deg(
+                            np.unwrap(np.deg2rad(shoulder_series[valid_mask]), period=np.deg2rad(360.0))
+                        )
+                        all_frames_angles_person_export[shoulder_name] = shoulder_series
 
             if angle_output_mode == 'bounded_principal':
                 for ang_name in all_frames_angles_person_export.columns:
@@ -2717,7 +2760,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         continue
                     # Keep segment orientations continuous; bound joint angles to principal range.
                     if ang_params[1] in ['flexion', 'dorsiflexion']:
-                        if apply_throw_shoulder_continuity and ang_name in throw_shoulder_angle_names:
+                        if apply_throw_shoulder_continuity and ang_name in active_throw_shoulder_names:
                             continue
                         all_frames_angles_person_export[ang_name] = wrap_angle_series_to_principal(
                             all_frames_angles_person_export[ang_name].to_numpy()
