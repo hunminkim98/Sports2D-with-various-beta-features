@@ -196,6 +196,7 @@ segment_angles = ['Right foot', 'Left foot', 'Right shank', 'Left shank', 'Right
 # Processing parameters
 flip_left_right = false  # Same angles whether the participant faces left/right. Set it to false if you want timeseries to be continuous even when the participant switches their stance.
 correct_segment_angles_with_floor_angle = true # If the camera is tilted, corrects segment angles as regards to the floor angle. Set to false if it is the floor which is actually tilted
+motion_type = 'generic' # 'generic' or 'throw'. 'throw' keeps shoulders in continuous 360-cycle representation across realtime display and saved outputs.
 angle_output_mode = 'legacy_continuous' # 'legacy_continuous' keeps unwrapped continuity, 'bounded_principal' wraps joint-angle outputs to [-180,180] for mot/video overlays.
 unwrap_angles = false # true keeps np.unwrap continuity correction; false disables unwrap in angle post-processing.
 

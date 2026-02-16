@@ -1725,10 +1725,18 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     angle_names = [angle_name.lower() for angle_name in angle_names]
     flip_left_right = config_dict.get('angles').get('flip_left_right')
     correct_segment_angles_with_floor_angle = config_dict.get('angles').get('correct_segment_angles_with_floor_angle')
+    motion_type = str(config_dict.get('angles').get('motion_type', 'generic')).lower()
     angle_output_mode = str(config_dict.get('angles').get('angle_output_mode', 'legacy_continuous')).lower()
     unwrap_angles = config_dict.get('angles').get('unwrap_angles', True)
+    if motion_type not in ['generic', 'throw']:
+        raise ValueError(f"Invalid motion_type: {motion_type}. Must be 'generic' or 'throw'.")
     if angle_output_mode not in ['legacy_continuous', 'bounded_principal']:
         raise ValueError(f"Invalid angle_output_mode: {angle_output_mode}. Must be 'legacy_continuous' or 'bounded_principal'.")
+    apply_throw_shoulder_continuity = (motion_type == 'throw')
+    throw_shoulder_angle_names = {'right shoulder', 'left shoulder'}
+    throw_shoulder_angle_indices = [
+        idx for idx, ang_name in enumerate(angle_names) if ang_name in throw_shoulder_angle_names
+    ]
 
     # Post-processing settings
     interpolate = config_dict.get('post-processing').get('interpolate')    
@@ -1958,6 +1966,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     all_frames_X, all_frames_X_flipped, all_frames_Y, all_frames_scores, all_frames_angles = [], [], [], [], []
     # Keep a valid keypoint schema even when early frames contain no detected persons.
     new_keypoints_names, new_keypoints_ids = keypoints_names.copy(), keypoints_ids.copy()
+    realtime_shoulder_unwrap_state = {}
     frame_processing_times = []
     frame_count = 0
     first_frame = max(int(t0 * fps), frame_range[0])
@@ -2129,6 +2138,17 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         person_angles_flipped = list(-np.array(person_angles))
                     else:
                         person_angles_flipped = person_angles.copy()
+
+                    if apply_throw_shoulder_continuity and throw_shoulder_angle_indices:
+                        person_state = realtime_shoulder_unwrap_state.setdefault(person_idx, {})
+                        for shoulder_idx in throw_shoulder_angle_indices:
+                            prev_angle = person_state.get(shoulder_idx, np.nan)
+                            continuous_angle = unwrap_angle_value_continuous(
+                                person_angles_flipped[shoulder_idx], prev_angle, period=360.0
+                            )
+                            person_angles_flipped[shoulder_idx] = continuous_angle
+                            if not np.isnan(continuous_angle):
+                                person_state[shoulder_idx] = continuous_angle
 
                     valid_angles.append(person_angles)
                     valid_angles_flipped.append(person_angles_flipped)
@@ -2582,6 +2602,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     # ====================================================
     if save_angles and calculate_angles:
         logging.info('\nPost-processing angles (without inverse kinematics):')
+        logging.info(f'Motion type: {motion_type}.')
         logging.info(f'Angle output mode: {angle_output_mode}.')
         logging.info(f'Unwrap angles: {unwrap_angles}.')
 
@@ -2681,6 +2702,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         all_frames_angles_person_filt[ang_name] -= np.degrees(floor_angle_estim)
 
             all_frames_angles_person_export = all_frames_angles_person_filt.copy()
+            if apply_throw_shoulder_continuity:
+                for shoulder_name in throw_shoulder_angle_names:
+                    if shoulder_name in all_frames_angles_person_export.columns:
+                        all_frames_angles_person_export[shoulder_name] = unwrap_angle_series_continuous(
+                            all_frames_angles_person_export[shoulder_name].to_numpy(),
+                            period=360.0,
+                        )
+
             if angle_output_mode == 'bounded_principal':
                 for ang_name in all_frames_angles_person_export.columns:
                     ang_params = angle_dict.get(ang_name)
@@ -2688,6 +2717,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         continue
                     # Keep segment orientations continuous; bound joint angles to principal range.
                     if ang_params[1] in ['flexion', 'dorsiflexion']:
+                        if apply_throw_shoulder_continuity and ang_name in throw_shoulder_angle_names:
+                            continue
                         all_frames_angles_person_export[ang_name] = wrap_angle_series_to_principal(
                             all_frames_angles_person_export[ang_name].to_numpy()
                         )

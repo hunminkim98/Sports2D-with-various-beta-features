@@ -134,6 +134,61 @@ def wrap_angle_series_to_principal(angles):
     return angles
 
 
+def unwrap_angle_series_continuous(angles, period=360.0):
+    '''
+    Unwrap an angle series to a continuous representation while preserving NaNs.
+
+    INPUT:
+    - angles: array-like of angle values in degrees
+    - period: cycle period in degrees (360 by default)
+
+    OUTPUT:
+    - np.array of unwrapped continuous angles
+    '''
+
+    angles = np.asarray(angles, dtype=float).copy()
+    valid_idx = np.where(~np.isnan(angles))[0]
+    if valid_idx.size == 0:
+        return angles
+
+    split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
+    valid_chunks = np.split(valid_idx, split_points)
+    period_rad = np.deg2rad(period)
+
+    for chunk_idx in valid_chunks:
+        chunk_vals = angles[chunk_idx]
+        chunk_unwrapped = np.rad2deg(np.unwrap(np.deg2rad(chunk_vals), period=period_rad))
+        angles[chunk_idx] = chunk_unwrapped
+
+    return angles
+
+
+def unwrap_angle_value_continuous(current_angle, previous_unwrapped, period=360.0):
+    '''
+    Incrementally unwrap one angle sample against the previous unwrapped value.
+
+    INPUT:
+    - current_angle: current sample in degrees (can be NaN)
+    - previous_unwrapped: previous unwrapped sample in degrees (can be NaN)
+    - period: cycle period in degrees (360 by default)
+
+    OUTPUT:
+    - current sample mapped to the closest continuous branch
+    '''
+
+    current_angle = float(current_angle)
+    previous_unwrapped = float(previous_unwrapped)
+    if np.isnan(current_angle):
+        return np.nan
+    if np.isnan(previous_unwrapped):
+        return current_angle
+
+    half_period = period / 2.0
+    delta = current_angle - previous_unwrapped
+    delta = (delta + half_period) % period - half_period
+    return previous_unwrapped + delta
+
+
 def make_homogeneous(list_of_arrays):
     '''
     Make a list of arrays (or a list of lists) homogeneous by padding with nans
