@@ -155,6 +155,11 @@ pip install .
   pip install sports2d
   ```
 
+- **Install optional Qt realtime UI backend**:
+  ``` cmd
+  pip install sports2d[ui]
+  ```
+
 
 <br>
 
@@ -485,6 +490,8 @@ sports2d --help
 'result_dir': ["r", "current directory if not specified"],
 'webcam_id': ["w", "webcam ID. 0 if not specified"],
 'show_realtime_results': ["R", "show results in real-time. true if not specified"],
+'realtime_ui_backend': ["", "real-time UI backend: 'opencv' or 'qt'. opencv if not specified"],
+'realtime_window_title': ["", "title of the real-time preview window. 'UmFit realtime' if not specified"],
 'display_angle_values_on': ["a", '"body", "list", "body" "list", or "none". body list if not specified'],
 'show_graphs': ["G", "show plots of raw and processed results. true if not specified"],
 'save_graphs': ["", "save position and angle plots of raw and processed results. true if not specified"],

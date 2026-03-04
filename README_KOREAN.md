@@ -154,6 +154,11 @@ pip install .
   pip install sports2d
   ```
 
+- **Qt 기반 실시간 UI 설치 (선택사항)**:
+  ``` cmd
+  pip install sports2d[ui]
+  ```
+
 <br>
 
 #### SynthPose 설치 (선택사항)
@@ -587,6 +592,8 @@ sports2d --help
 'result_dir': ["r", "지정하지 않으면 현재 디렉토리"],
 'webcam_id': ["w", "웹캠 ID. 지정하지 않으면 0"],
 'show_realtime_results': ["R", "실시간 결과 표시. 지정하지 않으면 true"],
+'realtime_ui_backend': ["", "실시간 UI 백엔드: 'opencv' 또는 'qt'. 지정하지 않으면 opencv"],
+'realtime_window_title': ["", "실시간 미리보기 창 제목. 지정하지 않으면 'UmFit realtime'"],
 'display_angle_values_on': ["a", '"body", "list", "body" "list", 또는 "none". 지정하지 않으면 body list'],
 'show_graphs': ["G", "원시 및 처리된 결과의 플롯 표시. 지정하지 않으면 true"],
 'save_graphs': ["", "원시 및 처리된 결과의 위치 및 각도 플롯 저장. 지정하지 않으면 true"],

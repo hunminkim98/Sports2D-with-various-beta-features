@@ -23,13 +23,17 @@
 '''
 
 from abc import ABC, abstractmethod
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Optional, Sequence
 import numpy as np
 import logging
 
 
 # Retry delay for tracker initialization (multi-threading conflicts)
 TRACKER_INIT_RETRY_DELAY = 3  # seconds
+
+# COCO class IDs
+PERSON_CLASS_ID = 0
+SPORTS_BALL_CLASS_ID = 32
 
 
 ## AUTHORSHIP INFORMATION
@@ -117,6 +121,151 @@ class PoseBackend(ABC):
         """
         pass
 
+    @property
+    def last_detections(self) -> Dict[str, np.ndarray]:
+        """
+        Optional per-frame detection metadata.
+
+        Returns:
+            Dict[str, np.ndarray]: Backend-specific detection outputs.
+            Empty by default for backends that do not expose detections.
+        """
+        return {}
+
+
+class _RTMLibMultiClassTracker:
+    """
+    Internal RTMLib tracker that keeps person+ball detector outputs.
+
+    It runs one multiclass detector pass, routes only person bboxes to pose
+    estimation, and stores ball bboxes in `last_detections`.
+    """
+
+    def __init__(
+        self,
+        model_class,
+        mode: str,
+        det_frequency: int,
+        backend: str,
+        device: str,
+        num_keypoints: int,
+        ball_class_ids: Optional[Sequence[int]] = None,
+    ):
+        self._num_keypoints = int(num_keypoints)
+        self._det_frequency = max(1, int(det_frequency))
+        self._person_class_id = PERSON_CLASS_ID
+        self._ball_class_ids = set(ball_class_ids or [SPORTS_BALL_CLASS_ID])
+        self._frame_count = 0
+        self._cached_person_boxes = np.empty((0, 4), dtype=np.float32)
+        self.last_detections: Dict[str, np.ndarray] = {}
+
+        solution = model_class(
+            mode=mode,
+            to_openpose=False,
+            backend=backend,
+            device=device,
+        )
+
+        if not hasattr(solution, 'det_model') or not hasattr(solution, 'pose_model'):
+            raise ValueError(
+                "RTMLib multiclass mode requires a top-down detector + pose model."
+            )
+
+        self._det_model = solution.det_model
+        self._pose_model = solution.pose_model
+
+        if not hasattr(self._det_model, 'mode'):
+            raise ValueError("RTMLib detector does not expose `mode` for multiclass.")
+        self._det_model.mode = 'multiclass'
+
+    @staticmethod
+    def _ensure_xyxy(boxes) -> np.ndarray:
+        if boxes is None:
+            return np.empty((0, 4), dtype=np.float32)
+        boxes = np.asarray(boxes)
+        if boxes.size == 0:
+            return np.empty((0, 4), dtype=np.float32)
+        if boxes.ndim == 1:
+            boxes = boxes.reshape(1, -1)
+        if boxes.shape[1] < 4:
+            return np.empty((0, 4), dtype=np.float32)
+        return boxes[:, :4].astype(np.float32, copy=False)
+
+    def _empty_pose_outputs(self):
+        return (
+            np.empty((0, self._num_keypoints, 2), dtype=np.float32),
+            np.empty((0, self._num_keypoints), dtype=np.float32),
+        )
+
+    def _update_detections(self, frame: np.ndarray) -> np.ndarray:
+        try:
+            det_outputs = self._det_model(frame)
+        except Exception:
+            self.last_detections = {
+                'boxes': np.empty((0, 4), dtype=np.float32),
+                'classes': np.empty((0,), dtype=np.int32),
+                'person_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_boxes': np.empty((0, 4), dtype=np.float32),
+            }
+            return np.empty((0, 4), dtype=np.float32)
+
+        if isinstance(det_outputs, tuple) and len(det_outputs) >= 2:
+            boxes = self._ensure_xyxy(det_outputs[0])
+            classes = np.asarray(det_outputs[1], dtype=np.int32).reshape(-1)
+        else:
+            boxes = self._ensure_xyxy(det_outputs)
+            classes = np.full((len(boxes),), self._person_class_id, dtype=np.int32)
+
+        if len(classes) != len(boxes):
+            classes = np.full((len(boxes),), self._person_class_id, dtype=np.int32)
+
+        person_mask = classes == self._person_class_id
+        ball_mask = np.isin(classes, list(self._ball_class_ids))
+        person_boxes = boxes[person_mask]
+        ball_boxes = boxes[ball_mask]
+
+        self.last_detections = {
+            'boxes': boxes,
+            'classes': classes,
+            'person_boxes': person_boxes,
+            'ball_boxes': ball_boxes,
+        }
+        return person_boxes
+
+    def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        run_detection = (
+            self._frame_count % self._det_frequency == 0
+            or len(self._cached_person_boxes) == 0
+        )
+
+        if run_detection:
+            person_boxes = self._update_detections(frame)
+            self._cached_person_boxes = person_boxes
+        else:
+            person_boxes = self._cached_person_boxes
+            self.last_detections = {
+                'boxes': np.empty((0, 4), dtype=np.float32),
+                'classes': np.empty((0,), dtype=np.int32),
+                'person_boxes': person_boxes,
+                'ball_boxes': np.empty((0, 4), dtype=np.float32),
+            }
+
+        self._frame_count += 1
+
+        if len(person_boxes) == 0:
+            return self._empty_pose_outputs()
+
+        try:
+            keypoints, scores = self._pose_model(frame, bboxes=person_boxes)
+            return keypoints, scores
+        except Exception:
+            return self._empty_pose_outputs()
+
+    def reset(self) -> None:
+        self._frame_count = 0
+        self._cached_person_boxes = np.empty((0, 4), dtype=np.float32)
+        self.last_detections = {}
+
 
 class RTMLibBackend(PoseBackend):
     """
@@ -168,38 +317,85 @@ class RTMLibBackend(PoseBackend):
         device = pose_config.get('device', 'auto')
         self._backend, self._device = setup_backend_device(backend, device)
 
-        # 3. Tracker initialization with retry for multi-threading
         det_frequency = pose_config.get('det_frequency', 4)
-        try:
-            self._tracker = setup_pose_tracker(
-                self._ModelClass, det_frequency, self._mode,
-                False, self._backend, self._device
-            )
-        except RuntimeError as e:
-            # Retry once for multi-threading initialization issues
-            import time
-            logging.warning(f'RTMLib tracker init retry due to: {e}')
-            time.sleep(TRACKER_INIT_RETRY_DELAY)
-            self._tracker = setup_pose_tracker(
-                self._ModelClass, det_frequency, self._mode,
-                False, self._backend, self._device
-            )
+        detect_ball = bool(pose_config.get('detect_ball', False))
+        ball_class_ids = pose_config.get('ball_class_ids', [SPORTS_BALL_CLASS_ID])
+        if isinstance(ball_class_ids, int):
+            ball_class_ids = [ball_class_ids]
+        elif isinstance(ball_class_ids, (list, tuple, set)):
+            try:
+                ball_class_ids = [int(c) for c in ball_class_ids]
+            except Exception:
+                ball_class_ids = [SPORTS_BALL_CLASS_ID]
 
         # Cache keypoint names and count
         self._keypoint_names = [node.name for node in PreOrderIter(self._pose_model) if node.id is not None]
         self._num_keypoints = len(self._keypoint_names)
+        self._last_detections: Dict[str, np.ndarray] = {}
+        self._supports_ball_detection = False
+
+        # 3. Tracker initialization with retry for multi-threading
+        def _init_default_tracker():
+            try:
+                return setup_pose_tracker(
+                    self._ModelClass, det_frequency, self._mode,
+                    False, self._backend, self._device
+                )
+            except RuntimeError as e:
+                # Retry once for multi-threading initialization issues
+                import time
+                logging.warning(f'RTMLib tracker init retry due to: {e}')
+                time.sleep(TRACKER_INIT_RETRY_DELAY)
+                return setup_pose_tracker(
+                    self._ModelClass, det_frequency, self._mode,
+                    False, self._backend, self._device
+                )
+
+        if detect_ball:
+            try:
+                self._tracker = _RTMLibMultiClassTracker(
+                    model_class=self._ModelClass,
+                    mode=self._mode,
+                    det_frequency=det_frequency,
+                    backend=self._backend,
+                    device=self._device,
+                    num_keypoints=self._num_keypoints,
+                    ball_class_ids=ball_class_ids,
+                )
+                self._supports_ball_detection = True
+            except Exception as e:
+                logging.warning(
+                    f'Ball detection requested but multiclass tracker init failed: {e}. '
+                    'Falling back to standard RTMLib tracker.'
+                )
+                self._tracker = _init_default_tracker()
+        else:
+            self._tracker = _init_default_tracker()
 
         logging.info(f'RTMLibBackend initialized: model={pose_model_name}, mode={self._mode}, '
-                     f'backend={self._backend}, device={self._device}, keypoints={self._num_keypoints}')
+                     f'backend={self._backend}, device={self._device}, keypoints={self._num_keypoints}, '
+                     f'ball_detection={self._supports_ball_detection}')
 
     def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Run pose estimation. Returns (keypoints, scores)."""
-        return self._tracker(frame)
+        outputs = self._tracker(frame)
+        if isinstance(outputs, tuple) and len(outputs) >= 2:
+            keypoints, scores = outputs[0], outputs[1]
+        else:
+            keypoints, scores = outputs
+
+        if self._supports_ball_detection and hasattr(self._tracker, 'last_detections'):
+            self._last_detections = getattr(self._tracker, 'last_detections', {}) or {}
+        else:
+            self._last_detections = {}
+
+        return keypoints, scores
 
     def reset(self) -> None:
         """Reset tracker state."""
         if hasattr(self._tracker, 'reset'):
             self._tracker.reset()
+        self._last_detections = {}
 
     @property
     def skeleton_tree(self):
@@ -219,6 +415,10 @@ class RTMLibBackend(PoseBackend):
     def keypoint_names(self) -> List[str]:
         """Return keypoint names from skeleton tree."""
         return self._keypoint_names
+
+    @property
+    def last_detections(self) -> Dict[str, np.ndarray]:
+        return self._last_detections
 
 
 class SynthPoseBackend(PoseBackend):
@@ -263,6 +463,14 @@ class SynthPoseBackend(PoseBackend):
         'balanced': 'base',      # VitPose-base (balanced)
         'lightweight': 'base',   # Fallback to base (lightweight not supported)
     }
+    # Explicit SynthPose model-size override mapping
+    SYNTHPOSE_MODEL_SIZE_TO_VITPOSE = {
+        'performance': 'huge',
+        'balanced': 'base',
+        'lightweight': 'base',   # lightweight not available in HF model family
+        'huge': 'huge',
+        'base': 'base',
+    }
 
     def __init__(self, config_dict: dict):
         """
@@ -292,59 +500,109 @@ class SynthPoseBackend(PoseBackend):
         pose_config = config_dict.get('pose', {})
         pose_model = pose_config.get('pose_model', 'synthpose').lower()
         mode = pose_config.get('mode', 'balanced').lower()
-
-        # Determine VitPose size: explicit pose_model takes precedence, then mode
-        if pose_model == 'synthpose_base':
-            # Explicit base model requested
-            self._mode = 'base'
-        elif pose_model == 'synthpose':
-            # Generic synthpose - use mode parameter for model selection
-            if mode == 'lightweight':
+        synthpose_model_size = pose_config.get('synthpose_model_size', '')
+        if synthpose_model_size in [None, '', 'auto', 'none']:
+            synthpose_model_size = pose_config.get('synthpose_detector_size', '')
+            if synthpose_model_size not in [None, '', 'auto', 'none']:
                 logging.warning(
-                    "SynthPose does not support 'lightweight' mode. "
-                    "VitPose-base (balanced) will be used instead. "
-                    "For maximum accuracy, use mode='performance' (VitPose-huge)."
+                    "`synthpose_detector_size` is deprecated. "
+                    "Use `synthpose_model_size` to control VitPose model size."
                 )
-                self._mode = 'base'
-            elif mode == 'performance':
-                self._mode = 'huge'
+        synthpose_model_size = str(synthpose_model_size).lower() if synthpose_model_size not in [None, ''] else ''
+
+        # Determine VitPose size:
+        # 1) explicit synthpose_model_size override
+        # 2) explicit pose_model
+        # 3) mode-based fallback
+        if synthpose_model_size:
+            if synthpose_model_size in self.SYNTHPOSE_MODEL_SIZE_TO_VITPOSE:
+                self._mode = self.SYNTHPOSE_MODEL_SIZE_TO_VITPOSE[synthpose_model_size]
             else:
-                # balanced or any other value defaults to base
-                self._mode = self.MODE_TO_VITPOSE.get(mode, 'base')
-        else:
-            # Unknown pose_model, default to huge
-            self._mode = 'huge'
+                logging.warning(
+                    f"Unknown synthpose_model_size '{synthpose_model_size}'. "
+                    "Falling back to pose_model/mode selection."
+                )
+                synthpose_model_size = ''
+
+        if not synthpose_model_size:
+            if pose_model == 'synthpose_base':
+                # Explicit base model requested
+                self._mode = 'base'
+            elif pose_model == 'synthpose':
+                # Generic synthpose - use mode parameter for model selection
+                if mode == 'lightweight':
+                    logging.warning(
+                        "SynthPose does not support 'lightweight' mode. "
+                        "VitPose-base (balanced) will be used instead. "
+                        "For maximum accuracy, use mode='performance' (VitPose-huge)."
+                    )
+                    self._mode = 'base'
+                elif mode == 'performance':
+                    self._mode = 'huge'
+                else:
+                    # balanced or any other value defaults to base
+                    self._mode = self.MODE_TO_VITPOSE.get(mode, 'base')
+            else:
+                # Unknown pose_model, default to huge
+                self._mode = 'huge'
+
+        # Detectors must depend on mode parameter
+        detector_mode = mode if mode in ['performance', 'balanced', 'lightweight'] else 'balanced'
+        if detector_mode != mode:
+            logging.warning(f"Unsupported mode '{mode}' for SynthPose detector. Using 'balanced'.")
+
+        if synthpose_model_size == 'lightweight':
+            logging.warning(
+                "synthpose_model_size='lightweight' maps to VitPose-base "
+                "because no lightweight HF VitPose is available."
+            )
 
         # Device selection (config takes priority, 'auto' triggers detection in tracker)
         device = pose_config.get('device', 'auto')
+        detector_threshold = pose_config.get(
+            'person_detection_threshold',
+            pose_config.get('keypoint_likelihood_threshold', 0.3),
+        )
 
         # Initialize tracker
         self._tracker = SynthPosePoseTracker(
             mode=self._mode,
             device=device,
             det_frequency=pose_config.get('det_frequency', 4),
-            person_threshold=pose_config.get('keypoint_likelihood_threshold', 0.3),
-            detector=pose_config.get('synthpose_detector', 'yolox')
+            person_threshold=detector_threshold,
+            detector=pose_config.get('synthpose_detector', 'yolox'),
+            detect_ball=bool(pose_config.get('detect_ball', False)),
+            ball_class_ids=pose_config.get('ball_class_ids', [SPORTS_BALL_CLASS_ID]),
+            # Detector size is controlled by mode parameter.
+            detector_size=detector_mode,
+            ball_nms_score_threshold=pose_config.get('ball_nms_score_threshold', 0.2),
         )
 
         # Store skeleton tree and keypoint names
         self._skeleton_tree = create_synthpose_skeleton()
         self._keypoint_names = list(SYNTHPOSE_KEYPOINT_NAMES)
+        self._last_detections: Dict[str, np.ndarray] = {}
 
         # Log initialization with mode mapping info
-        mode_info = f"config_mode='{mode}' → vitpose='{self._mode}'"
+        mode_info = f"config_mode='{mode}'"
+        if synthpose_model_size:
+            mode_info += f", synthpose_model_size='{synthpose_model_size}'"
+        mode_info += f" → vitpose='{self._mode}'"
         logging.info(f'SynthPoseBackend initialized: {mode_info}, '
                      f'detector={pose_config.get("synthpose_detector", "yolox")}, '
                      f'device={self._tracker.device}, keypoints=52')
 
     def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Run pose estimation. Returns (keypoints, scores)."""
-        return self._tracker(frame)
+        keypoints, scores = self._tracker(frame)
+        self._last_detections = getattr(self._tracker, 'last_detections', {}) or {}
+        return keypoints, scores
 
     def reset(self) -> None:
         """Reset tracker state."""
         self._tracker.frame_count = 0
         self._tracker.prev_boxes = None
+        self._last_detections = {}
 
     @property
     def skeleton_tree(self):
@@ -364,6 +622,10 @@ class SynthPoseBackend(PoseBackend):
     def keypoint_names(self) -> List[str]:
         """Return 52 SynthPose keypoint names."""
         return self._keypoint_names
+
+    @property
+    def last_detections(self) -> Dict[str, np.ndarray]:
+        return self._last_detections
 
 
 def create_pose_backend(config_dict: dict) -> PoseBackend:

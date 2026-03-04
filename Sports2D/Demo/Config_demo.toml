@@ -12,7 +12,7 @@
 
 
 [base]
-video_input = '20260215'   # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
+video_input = 'webcam'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
@@ -33,9 +33,11 @@ video_dir = ''    # If empty, video dir is current dir
 
 # Webcam parameters
 webcam_id = 0 # your webcam id (0 is default)
-input_size = [1280, 720] # [W, H]. Lower resolution will be faster but less precise.
+input_size = [1920, 1080] # [W, H]. Lower resolution will be faster but less precise.
 
 show_realtime_results = true
+realtime_ui_backend = 'qt' # 'opencv' or 'qt' (requires pip install sports2d[ui])
+realtime_window_title = 'UmFit realtime'
 save_vid = true
 save_img = false
 save_pose = true
@@ -70,7 +72,7 @@ slowmo_factor = 1       # 1 for normal speed. For a video recorded at 240 fps an
 ##   Note: SynthPose outputs 52 anatomical keypoints including HALPE_26 + additional markers.
 ##   Models are automatically downloaded from HuggingFace on first use (~2GB).
 ##
-pose_model = 'synthpose'
+pose_model = 'whole_body_wrist'
 
 ## ============================================================
 ## SynthPose Person Detector Selection
@@ -84,6 +86,12 @@ pose_model = 'synthpose'
 ##       Sports2D/models/rtdetrv4/
 ##
 synthpose_detector = 'yolox'
+## Optional SynthPose HF model size override (independent from mode):
+##   - 'performance' -> VitPose-huge
+##   - 'balanced' or 'lightweight' -> VitPose-base
+##   - or explicit: 'huge', 'base'
+## Leave empty to use pose_model + mode logic.
+synthpose_model_size = 'huge'
 
 ## ============================================================
 ## Mode Selection (Works for both RTMLib and SynthPose)
@@ -99,7 +107,11 @@ synthpose_detector = 'yolox'
 ##   - 'balanced': VitPose-base (faster, good accuracy)
 ##   - 'lightweight': NOT SUPPORTED → Falls back to VitPose-base with warning
 ##
-## Note: If pose_model='synthpose_base' is set explicitly, mode is ignored.
+## Note:
+##   - mode controls detector scale (lightweight/balanced/performance) for all detectors.
+##   - synthpose_model_size controls only the SynthPose HF model size.
+##   - If pose_model='synthpose_base' is set explicitly and synthpose_model_size is empty,
+##     mode still controls detector scale while VitPose stays base.
 ##
 mode = 'performance'
 
@@ -135,7 +147,7 @@ det_frequency = 1       # Run person detection only every N frames, and inbetwee
 ##   - 'mps': Force Apple Metal (macOS only)
 ##   - 'cpu': Force CPU inference
 ##
-device = 'auto'
+device = 'cuda'
 
 ## ============================================================
 ## Backend Selection (RTMLib only, ignored for SynthPose)
@@ -155,10 +167,20 @@ tracking_mode = 'sports2d' # 'sports2d' or 'deepsort'. 'deepsort' is slower, har
                   # Requires `pip install torch torchvision torchreid gdown tensorboard`
 
 # Processing parameters
-keypoint_likelihood_threshold = 0.5 # Keypoints whose likelihood is lower will not be taken into account
+keypoint_likelihood_threshold = 2.0 # Keypoints whose likelihood is lower will not be taken into account
+person_detection_threshold = 0.3    # Object detector threshold (person/ball)
 average_likelihood_threshold = 0.5  # Person will be ignored if average likelihood of good keypoints is lower than this value
 keypoint_number_threshold = 0.3     # Person will be ignored if the number of good keypoints (above keypoint_likelihood_threshold) is less than this fraction
 max_distance = 250  # in px or None # If a person is detected further than max_distance from its position on the previous frame, it will be considered as a new one
+
+# Optional multiclass sports ball overlay (RTMLib only)
+detect_ball = false
+ball_trail_length = 20     # Number of recent frames shown in the trajectory
+ball_trail_alpha = 0.35     # Transparency in [0,1]
+ball_radius = 4             # Ball center marker radius (px)
+ball_max_jump_px = 'none'      # Reject detections that jump too far between frames; use 'none' to disable
+ball_nms_score_threshold = 0.1  # Lower = higher recall (can add false positives)
+ball_color = [0, 0, 0]      # BGR (OpenCV), default black
 
 
 [px_to_meters_conversion]
@@ -172,7 +194,7 @@ floor_angle = 'auto' # float, 'from_kinematics', 'from_calib', or 'auto' # 'auto
 xy_origin = ['auto'] # [px_x,px_y], or ['from kinematics'], ['from_calib'], or ['auto']. # BETWEEN BRACKETS! # ['auto'] is equivalent to ['from_kinematics'], ie origin estimated at first foot contact, direction is direction of motion. ['from_calib'] calculates it from a calibration file. Use [px_x,px_y] to manually specify it in pixels (px_y points downwards)
 
 # Compensate for perspective effects, which make the further limb look smaller. 1-2% coordinate error at 10 m, less if the camera is further away
-perspective_value = 10 # Either camera-to-person distance (m), or focal length (px), or field-of-view (degrees or radians), or '' if perspective_unit=='from_calib'
+perspective_value = 5 # Either camera-to-person distance (m), or focal length (px), or field-of-view (degrees or radians), or '' if perspective_unit=='from_calib'
 perspective_unit = 'distance_m' # 'distance_m', 'f_px', 'fov_deg', 'fov_rad', or 'from_calib'
 
 # Optional distortion coefficients
@@ -183,7 +205,7 @@ calib_file = ''      # Calibration file in the Pose2Sim toml format, or '' if no
 
 
 [angles]
-display_angle_values_on = ['body', 'list'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
+display_angle_values_on = ['body'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
 fontSize = 0.5
 
 # Select joint angles among
