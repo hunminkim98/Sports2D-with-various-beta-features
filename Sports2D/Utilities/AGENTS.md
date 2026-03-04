@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-02-13 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-03-02 -->
 
 # AGENTS.md
 
@@ -22,7 +22,7 @@
 - Use `pytest -v Sports2D/Utilities/tests.py` as the baseline for utility changes.
 - Keep error messages explicit for optional dependencies (for example missing SynthPose extras).
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-02-13
+Last reviewed: 2026-03-02
 
 Topics in this folder:
 - `pose_backend.py`
@@ -30,3 +30,4 @@ Topics in this folder:
 - `synthpose_skeleton.py`
 - `common.py`
 - `tests.py`
+- `IMG_*_Sports2D/` artifact output directories

@@ -1,4 +1,4 @@
-<!-- Generated: 2026-02-13 | Updated: 2026-02-13 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-03-02 -->
 
 # AGENTS.md
 
@@ -30,7 +30,7 @@
 - Preserve manual sections across regeneration.
 - Use stable headings so future tooling can update safely.
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-02-13
+Last reviewed: 2026-03-02
 
 Covered AGENTS files:
 - `AGENTS.md`
@@ -38,12 +38,10 @@ Covered AGENTS files:
 - `.github/workflows/AGENTS.md`
 - `Content/AGENTS.md`
 - `Sports2D/AGENTS.md`
-- `Sports2D/Utilities/AGENTS.md`
 - `Sports2D/Demo/AGENTS.md`
+- `Sports2D/Utilities/AGENTS.md`
 - `Sports2D/models/AGENTS.md`
-- `Sports2D/models/RT-DETRv4/AGENTS.md`
 - `Sports2D/models/rtdetrv4/AGENTS.md`
-- `SynthPose_PM/AGENTS.md`
 
 Suggested upkeep:
 - Update this list if new AGENTS files are added or moved.

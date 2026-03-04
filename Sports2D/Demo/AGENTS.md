@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-02-13 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-03-02 -->
 
 # AGENTS.md
 
@@ -20,7 +20,11 @@
 - Pair config changes with `process.py`/`Sports2D.py` behavior changes where needed.
 
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-02-13
+Last reviewed: 2026-03-02
 
 Current tracked demo assets:
 - `Config_demo.toml`
+- `Calib_demo.toml`
+- `KakaoTalk_20260302_180005068.mp4`
+- `KakaoTalk_20260302_180005068_Sports2D/`
+- `logs.txt*`

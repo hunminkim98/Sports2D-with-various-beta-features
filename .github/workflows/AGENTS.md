@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-02-13 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-03-02 -->
 
 # AGENTS.md
 
@@ -20,7 +20,7 @@
 - Ensure changes do not break existing publish or CI flow semantics.
 
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-02-13
+Last reviewed: 2026-03-02
 
 Tracked workflows:
 - `continuous-integration.yml`

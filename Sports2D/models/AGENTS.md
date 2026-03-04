@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-02-13 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-03-02 -->
 
 # AGENTS.md
 
@@ -21,8 +21,8 @@
 - Keep changes here limited to metadata and reference docs unless runtime is being deliberately changed.
 - Validate import/loading paths when touch points affect runtime model loading.
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-02-13
+Last reviewed: 2026-03-02
 
 Tracked model areas:
-- `RT-DETRv4/`
+- `RT-DETRv4/` (currently empty placeholder directory)
 - `rtdetrv4/`

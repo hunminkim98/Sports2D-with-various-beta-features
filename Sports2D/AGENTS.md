@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-02-13 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-03-02 -->
 
 # AGENTS.md
 
@@ -22,7 +22,7 @@
 - Run `flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics` before finalizing.
 - Add changelog notes or inline rationale when touching dependency/feature boundaries.
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-02-13
+Last reviewed: 2026-03-02
 
 Subtrees tracked here:
 - `Utilities/`

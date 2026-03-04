@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-02-13 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-03-02 -->
 
 # AGENTS.md
 
@@ -16,8 +16,7 @@
 - If the file must change, add an explicit reason and update checksums or source link where possible.
 
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-02-13
+Last reviewed: 2026-03-02
 
-Files expected:
+Files tracked:
 - `README.md`
-- `RTv4-X-hgnet.pth`
