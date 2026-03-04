@@ -64,6 +64,82 @@ def test_wrap_angle_series_to_principal_output_range():
     assert np.all(valid <= 180.0)
 
 
+def test_extract_ball_centers_parses_xyxy_boxes():
+    '''
+    Verify ball center extraction from detector xyxy boxes.
+    '''
+
+    from Sports2D.process import extract_ball_centers
+
+    detection_meta = {
+        'ball_boxes': np.array([
+            [10.0, 20.0, 30.0, 40.0],
+            [100.0, 200.0, 140.0, 260.0],
+        ])
+    }
+    centers = extract_ball_centers(detection_meta)
+
+    assert centers == [(20, 30), (120, 230)]
+
+
+def test_select_ball_center_applies_nearest_and_jump_gate():
+    '''
+    Verify ball center selection favors continuity and can reject large jumps.
+    '''
+
+    from Sports2D.process import select_ball_center
+
+    candidates = [(100, 100), (220, 220), (103, 98)]
+    chosen = select_ball_center(candidates, previous_center=(101, 101), max_jump_px=20)
+    rejected = select_ball_center(candidates, previous_center=(0, 0), max_jump_px=10)
+
+    assert chosen == (103, 98)
+    assert rejected is None
+
+
+def test_default_config_exposes_realtime_ui_options():
+    '''
+    Verify realtime UI options are present in config defaults and CLI help.
+    '''
+
+    from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
+
+    assert DEFAULT_CONFIG['base']['realtime_ui_backend'] == 'opencv'
+    assert DEFAULT_CONFIG['base']['realtime_window_title'] == 'UmFit realtime'
+    assert 'realtime_ui_backend' in CONFIG_HELP
+    assert 'realtime_window_title' in CONFIG_HELP
+
+
+def test_create_realtime_display_falls_back_to_opencv_when_qt_unavailable(monkeypatch):
+    '''
+    Verify qt backend request falls back to OpenCV backend when Qt import fails.
+    '''
+
+    from Sports2D.Utilities import realtime_display
+
+    class DummyDisplay:
+        backend_name = 'opencv'
+
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    def raise_qt_import_error():
+        raise ImportError('PySide6 missing')
+
+    monkeypatch.setattr(realtime_display, '_load_qt_display_class', raise_qt_import_error)
+    monkeypatch.setattr(realtime_display, 'OpenCVRealtimeDisplay', DummyDisplay)
+
+    display = realtime_display.create_realtime_display(
+        backend='qt',
+        window_title='Test',
+        display_width=640,
+        display_height=480,
+    )
+
+    assert isinstance(display, DummyDisplay)
+
+
 def test_expand_video_input_paths_supports_relative_directory(tmp_path):
     '''
     Verify relative directory input is expanded to sorted video files.

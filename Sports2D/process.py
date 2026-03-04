@@ -67,6 +67,7 @@ import shutil
 import os
 import re
 import platform
+import time
 from importlib.metadata import version
 from datetime import datetime
 import itertools as it
@@ -97,6 +98,7 @@ except ImportError:
 
 # Unified pose backend abstraction
 from Sports2D.Utilities.pose_backend import create_pose_backend
+from Sports2D.Utilities.realtime_display import create_realtime_display
 
 from Sports2D.Utilities.common import *
 from Pose2Sim.common import *
@@ -331,10 +333,38 @@ def setup_webcam(webcam_id, vid_output_path, input_size):
     - fps: int. The frame rate of the webcam
     '''
 
-    #, cv2.CAP_DSHOW launches faster but only works for windows and esc key does not work
-    cap = cv2.VideoCapture(webcam_id) 
-    if not cap.isOpened():
-        raise ValueError(f"Error: Could not open webcam #{webcam_id}. Make sure that your webcam is available and has the right 'webcam_id' (check in your Config.toml file).")
+    # On Windows, try multiple backends because virtual cameras may not support
+    # index capture on a specific backend.
+    selected_backend = "default"
+    cap = None
+    if platform.system() == "Windows":
+        backend_candidates = [
+            ("DSHOW", cv2.CAP_DSHOW),
+            ("MSMF", cv2.CAP_MSMF),
+            ("default", None),
+        ]
+        for backend_name, backend_api in backend_candidates:
+            test_cap = cv2.VideoCapture(webcam_id, backend_api) if backend_api is not None else cv2.VideoCapture(webcam_id)
+            if not test_cap.isOpened():
+                test_cap.release()
+                continue
+            # Ensure backend can really produce frames (some backends open but never read).
+            ok, _ = test_cap.read()
+            if ok:
+                cap = test_cap
+                selected_backend = backend_name
+                break
+            test_cap.release()
+    else:
+        cap = cv2.VideoCapture(webcam_id)
+
+    if cap is None or not cap.isOpened():
+        raise ValueError(
+            f"Error: Could not open webcam #{webcam_id} with available backends. "
+            "If you use a virtual camera (e.g., Camo), verify that the app is running and try another webcam_id."
+        )
+    if platform.system() == "Windows":
+        logging.info(f"Webcam #{webcam_id} opened with backend: {selected_backend}")
 
     # set width and height to closest available for the webcam
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, input_size[0])
@@ -1664,6 +1694,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
     # Output settings    
     show_realtime_results = config_dict.get('base').get('show_realtime_results')
+    realtime_ui_backend = config_dict.get('base').get('realtime_ui_backend', 'opencv')
+    realtime_window_title = config_dict.get('base').get('realtime_window_title', 'UmFit realtime')
     save_vid = config_dict.get('base').get('save_vid')
     save_img = config_dict.get('base').get('save_img')
     save_pose = config_dict.get('base').get('save_pose')
@@ -1842,18 +1874,36 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         start_time = get_start_time_ffmpeg(video_file_path)
         frame_range = [int((time_range[0]-start_time) * frame_rate), int((time_range[1]-start_time) * frame_rate)] if time_range else [0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT))]
         frame_iterator = tqdm(range(*frame_range)) # use a progress bar
-    if show_realtime_results:
-        try: 
-            screen_width, screen_height = get_screen_size()
-            display_width, display_height = calculate_display_size(cam_width, cam_height, screen_width, screen_height, margin=50)
-            cv2.namedWindow(f'{video_file} Sports2D', cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(f'{video_file} Sports2D', display_width, display_height)
-        except: # if Pose2Sim < v0.10.29
-            cv2.namedWindow(f'{video_file} Sports2D', cv2.WINDOW_NORMAL + cv2.WINDOW_KEEPRATIO)
-
     # Select the appropriate model based on the model_type
     logging.info('\nEstimating pose...')
     pose_model_name = pose_model
+    backend_name = 'rtmlib'
+    display_runtime_backend = 'initializing'
+    realtime_display = None
+    display_paused = False
+    stop_requested = False
+    dropped_frames = 0
+    session_start_perf = time.perf_counter()
+
+    if show_realtime_results:
+        try:
+            screen_width, screen_height = get_screen_size()
+            display_width, display_height = calculate_display_size(cam_width, cam_height, screen_width, screen_height, margin=50)
+        except Exception:
+            display_width, display_height = cam_width, cam_height
+
+        realtime_display = create_realtime_display(
+            backend=realtime_ui_backend,
+            window_title=realtime_window_title,
+            display_width=display_width,
+            display_height=display_height,
+            model_name=pose_model_name,
+            runtime_backend=display_runtime_backend,
+            webcam_id=webcam_id if video_file == 'webcam' else None,
+            save_video=(save_vid or video_file == 'webcam'),
+            frame_size=(cam_width, cam_height),
+        )
+        realtime_display.set_session_state('Initializing')
     
     # Check if SynthPose is requested
     use_synthpose = pose_model_name.lower() in ['synthpose', 'synthpose_base']
@@ -1889,6 +1939,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         if not '_px' in str(load_trc_px): 
             logging.error(f'\n{load_trc_px} file needs to be in px, not in meters.')
         logging.info(f'\nUsing a pose file instead of running pose estimation and tracking: {load_trc_px}.')
+        display_runtime_backend = 'trc'
+        backend_name = 'trc'
         # Load pose file in px
         Q_coords, _, time_col, keypoints_names, _ = read_trc(load_trc_px)
         t0 = time_col[0]
@@ -1917,6 +1969,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         try:
             pose_tracker = create_pose_backend(config_dict)
             backend_name = pose_tracker.backend_name
+            display_runtime_backend = backend_name
             use_synthpose = (backend_name == 'synthpose')
             logging.info(f'{pose_tracker.backend_name} tracker initialized with {pose_tracker.num_keypoints} keypoints')
         except Exception as e:
@@ -1960,12 +2013,17 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     new_keypoints_names, new_keypoints_ids = keypoints_names.copy(), keypoints_ids.copy()
     frame_processing_times = []
     frame_count = 0
-    first_frame = max(int(t0 * fps), frame_range[0])
-    last_frame = min(int(tf * fps), frame_range[1]-1)
+    if np.isfinite(tf):
+        first_frame = max(int(t0 * fps), frame_range[0])
+        last_frame = min(int(tf * fps), frame_range[1]-1)
+    else:
+        first_frame = frame_range[0]
+        last_frame = frame_range[1]-1
     if first_frame >= last_frame:
         logging.error('Error: No frames to process. Check that your time_range is coherent with the video duration.')
         raise ValueError('Error: No frames to process. Check that your time_range is coherent with the video duration.')
     
+    consecutive_grab_failures = 0
     while cap.isOpened():
         # Skip to the starting frame
         if frame_count < first_frame:
@@ -1974,6 +2032,19 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             continue
 
         for frame_nb in frame_iterator:
+            if show_realtime_results and realtime_display is not None:
+                while display_paused:
+                    pause_events = realtime_display.poll_events(delay_ms=30)
+                    if pause_events.get('stop'):
+                        stop_requested = True
+                        break
+                    if pause_events.get('toggle_pause') or pause_events.get('resume'):
+                        display_paused = False
+                        realtime_display.set_session_state('Live')
+                        break
+                if stop_requested:
+                    break
+
             start_time = datetime.now()
             success, frame = cap.read()
             frame_count += 1
@@ -1981,6 +2052,19 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             # If frame not grabbed
             if not success:
                 logging.warning(f"Failed to grab frame {frame_count-1}.")
+                dropped_frames += 1
+                consecutive_grab_failures += 1
+                if show_realtime_results and realtime_display is not None:
+                    if consecutive_grab_failures >= 3:
+                        realtime_display.set_session_state('Camera Lost')
+                    fail_events = realtime_display.poll_events(delay_ms=1)
+                    if fail_events.get('stop'):
+                        stop_requested = True
+                        break
+                    if fail_events.get('toggle_pause'):
+                        display_paused = not display_paused
+                        realtime_display.set_session_state('Paused' if display_paused else 'Live')
+
                 kpt_count = len(new_keypoints_names)
                 nan_pose = np.full((1, kpt_count), np.nan)
                 all_frames_X.append(nan_pose.copy())
@@ -1990,6 +2074,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 if save_angles and calculate_angles:
                     all_frames_angles.append(np.full((1, len(angle_names)), np.nan))
                 continue
+            consecutive_grab_failures = 0
 
             # Retrieve pose or Estimate pose and track people
             if load_trc_px: 
@@ -2034,7 +2119,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     #             cv2.circle(frame, (int(kpt[0]), int(kpt[1])), 3, colors[person_idx%len(colors)], -1)
                     #     if not np.isnan(bboxes[person_idx]).any():
                     #         cv2.rectangle(frame, (int(bboxes[person_idx][0]), int(bboxes[person_idx][1])), (int(bboxes[person_idx][2]), int(bboxes[person_idx][3])), colors[person_idx%len(colors)], 1)
-                    # cv2.imshow(f'{video_file} Sports2D', frame)
+                    # cv2.imshow('UmFit realtime', frame)
 
                     # Track poses across frames
                     if tracking_mode == 'deepsort':
@@ -2053,7 +2138,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     #             cv2.circle(frame, (int(kpt[0]), int(kpt[1])), 3, colors[person_idx%len(colors)], -1)
                     #         # if not np.isnan(bboxes[person_idx]).any():
                     #         #     cv2.rectangle(frame, (int(bboxes[person_idx][0]), int(bboxes[person_idx][1])), (int(bboxes[person_idx][2]), int(bboxes[person_idx][3])), colors[person_idx%len(colors)], 1)
-                    #     cv2.imshow(f'{video_file} Sports2D', frame)
+                    #     cv2.imshow('UmFit realtime', frame)
                     # # if (cv2.waitKey(1) & 0xFF) == ord('q') or (cv2.waitKey(1) & 0xFF) == 27:
                     # #     break
                     # # input()
@@ -2063,14 +2148,19 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             
             # Process coordinates and compute angles
             valid_X, valid_Y, valid_scores = [], [], []
+            render_X, render_Y, render_scores = [], [], []
             valid_X_flipped, valid_angles_flipped, valid_angles = [], [], []
             for person_idx in range(len(keypoints)):
                 if load_trc_px:
                     person_X = keypoints[person_idx][:,0]
                     person_Y = keypoints[person_idx][:,1]
                     person_scores = scores[person_idx]
+                    person_render_X, person_render_Y, person_render_scores = person_X.copy(), person_Y.copy(), person_scores.copy()
                 else:
                     # Retrieve keypoints and scores for the person, remove low-confidence keypoints
+                    person_X_raw = keypoints[person_idx][:,0]
+                    person_Y_raw = keypoints[person_idx][:,1]
+                    person_scores_raw = scores[person_idx]
                     person_X, person_Y = np.where(scores[person_idx][:, np.newaxis] < keypoint_likelihood_threshold, np.nan, keypoints[person_idx]).T
                     person_scores = np.where(scores[person_idx] < keypoint_likelihood_threshold, np.nan, scores[person_idx])
 
@@ -2082,6 +2172,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         person_X = np.full_like(person_X, np.nan)
                         person_Y = np.full_like(person_Y, np.nan)
                         person_scores = np.full_like(person_scores, np.nan)
+                    person_render_X, person_render_Y, person_render_scores = person_X, person_Y, person_scores
 
                     
                     
@@ -2136,6 +2227,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 valid_X.append(person_X)
                 valid_Y.append(person_Y)
                 valid_scores.append(person_scores)
+                render_X.append(person_render_X)
+                render_Y.append(person_render_Y)
+                render_scores.append(person_render_scores)
 
             # Keep frame arrays homogeneous when no person is detected in a frame.
             if len(valid_X) == 0:
@@ -2143,6 +2237,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 valid_X = [np.full(kpt_count, np.nan)]
                 valid_Y = [np.full(kpt_count, np.nan)]
                 valid_scores = [np.full(kpt_count, np.nan)]
+                render_X = [np.full(kpt_count, np.nan)]
+                render_Y = [np.full(kpt_count, np.nan)]
+                render_scores = [np.full(kpt_count, np.nan)]
                 if calculate_angles:
                     valid_X_flipped = [np.full(kpt_count, np.nan)]
                     nan_angles = np.full(len(angle_names), np.nan)
@@ -2150,7 +2247,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     valid_angles_flipped = [nan_angles.copy()]
 
             # Draw keypoints and skeleton
-            if show_realtime_results:
+            if show_realtime_results and realtime_display is not None:
                 img = frame.copy()
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (255,255,255), thickness+1, cv2.LINE_AA)
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (0,0,255), thickness, cv2.LINE_AA)
@@ -2168,12 +2265,39 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     kpt_names_for_draw = realtime_kpt_names
                 else:
                     kpt_names_for_draw = None
-                img = draw_pose(img, valid_X, valid_Y, valid_scores, pose_model,
+                img = draw_pose(img, render_X, render_Y, render_scores, pose_model,
                                 keypoint_names=kpt_names_for_draw, backend_name=backend_name, thickness=thickness)
                 if calculate_angles:
                     img = draw_angles(img, valid_X, valid_Y, valid_angles_flipped, valid_X_flipped, new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
-                cv2.imshow(f'{video_file} Sports2D', img)
-                if (cv2.waitKey(1) & 0xFF) == ord('q') or (cv2.waitKey(1) & 0xFF) == 27:
+
+                frame_elapsed = max((datetime.now() - start_time).total_seconds(), 1e-6)
+                detected_persons = int(sum(0 if np.isnan(np.asarray(person)).all() else 1 for person in valid_X))
+
+                realtime_display.render(
+                    img,
+                    stats={
+                        'state': 'Paused' if display_paused else 'Live',
+                        'ui_fps': 1.0 / frame_elapsed,
+                        'inference_ms': frame_elapsed * 1000.0,
+                        'detected_persons': detected_persons,
+                        'dropped_frames': dropped_frames,
+                        'model': pose_model_name,
+                        'backend': display_runtime_backend,
+                        'webcam_id': webcam_id if video_file == 'webcam' else None,
+                        'elapsed_seconds': time.perf_counter() - session_start_perf,
+                        'camera_resolution': f'{cam_width}x{cam_height}',
+                        'save_status': 'Saving video' if (save_vid or video_file == 'webcam') else 'Not saving',
+                    },
+                )
+                display_events = realtime_display.poll_events(delay_ms=1)
+                if display_events.get('toggle_pause'):
+                    display_paused = not display_paused
+                    realtime_display.set_session_state('Paused' if display_paused else 'Live')
+                if display_events.get('resume'):
+                    display_paused = False
+                    realtime_display.set_session_state('Live')
+                if display_events.get('stop'):
+                    stop_requested = True
                     break
 
                 # # Debugging
@@ -2190,6 +2314,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             if video_file=='webcam' and save_vid:   # To adjust framerate of output video
                 elapsed_time = (datetime.now() - start_time).total_seconds()
                 frame_processing_times.append(elapsed_time)
+            if stop_requested:
+                break
 
         # End of the video is reached
         cap.release()
@@ -2199,8 +2325,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             if video_file == "webcam":
                 vid_output_path.absolute().rename(video_file_path)
 
-        if show_realtime_results:
-            cv2.destroyAllWindows()
+        if show_realtime_results and realtime_display is not None:
+            realtime_display.close()
 
 
     #%% ==================================================
