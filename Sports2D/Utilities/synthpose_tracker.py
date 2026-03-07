@@ -93,6 +93,7 @@ class SynthPosePoseTracker:
                  detector='yolox',
                  detect_ball=False,
                  ball_class_ids=None,
+                 ball_detection_threshold=0.1,
                  detector_size='balanced',
                  ball_nms_score_threshold=0.2):
         '''
@@ -137,6 +138,7 @@ class SynthPosePoseTracker:
             self.ball_class_ids = [int(ball_class_ids)]
         self.last_detections = {}
         self.detector_size = self._resolve_detector_size(detector_size)
+        self.ball_detection_threshold = float(np.clip(ball_detection_threshold, 0.01, 0.9))
         self.ball_nms_score_threshold = float(np.clip(ball_nms_score_threshold, 0.01, 0.9))
         
         # Frame tracking for detection frequency
@@ -156,11 +158,14 @@ class SynthPosePoseTracker:
         
         logging.info(
             'SynthPose initializing: hf_model_size=%s (VitPose), '
-            'detector_type=%s, detector_size=%s (mode-driven), device=%s',
+            'detector_type=%s, detector_size=%s (mode-driven), device=%s, '
+            'person_thr=%.3f, ball_thr=%.3f',
             self.mode,
             self.detector_type,
             self.detector_size,
             self.device,
+            self.person_threshold,
+            self.ball_detection_threshold,
         )
         
         # Load models
@@ -243,7 +248,7 @@ class SynthPosePoseTracker:
             }
             model_url = coco_yolox_models.get(self.detector_size, coco_yolox_models['m'])
             input_size = (640, 640)
-            score_thr = min(float(self.person_threshold), 0.1)
+            score_thr = self.ball_detection_threshold
             nms_thr = self.ball_nms_score_threshold
             detector_mode = 'multiclass'
             weights_variant = 'coco'
@@ -479,8 +484,10 @@ class SynthPosePoseTracker:
             self.last_detections = {
                 'boxes': np.empty((0, 4), dtype=np.float32),
                 'classes': np.empty((0,), dtype=np.int32),
+                'scores': np.empty((0,), dtype=np.float32),
                 'person_boxes': np.empty((0, 4), dtype=np.float32),
                 'ball_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_scores': np.empty((0,), dtype=np.float32),
             }
         
         # No persons detected
@@ -528,24 +535,38 @@ class SynthPosePoseTracker:
             self.last_detections = {
                 'boxes': np.empty((0, 4), dtype=np.float32),
                 'classes': np.empty((0,), dtype=np.int32),
+                'scores': np.empty((0,), dtype=np.float32),
                 'person_boxes': np.empty((0, 4), dtype=np.float32),
                 'ball_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_scores': np.empty((0,), dtype=np.float32),
             }
             return np.array([])
 
         if isinstance(detector_outputs, tuple) and len(detector_outputs) >= 2:
             bboxes = np.asarray(detector_outputs[0], dtype=np.float32)
             classes = np.asarray(detector_outputs[1], dtype=np.int32).reshape(-1)
+            if len(detector_outputs) >= 3:
+                detection_scores = np.asarray(detector_outputs[2], dtype=np.float32).reshape(-1)
+            elif bboxes.ndim == 2 and bboxes.shape[1] >= 5:
+                detection_scores = bboxes[:, 4].astype(np.float32, copy=False)
+            else:
+                detection_scores = np.full((len(bboxes),), np.nan, dtype=np.float32)
         else:
             bboxes = np.asarray(detector_outputs, dtype=np.float32)
             classes = np.full((len(bboxes),), PERSON_CLASS_ID, dtype=np.int32)
+            if bboxes.ndim == 2 and bboxes.shape[1] >= 5:
+                detection_scores = bboxes[:, 4].astype(np.float32, copy=False)
+            else:
+                detection_scores = np.full((len(bboxes),), np.nan, dtype=np.float32)
 
         if bboxes.size == 0:
             self.last_detections = {
                 'boxes': np.empty((0, 4), dtype=np.float32),
                 'classes': np.empty((0,), dtype=np.int32),
+                'scores': np.empty((0,), dtype=np.float32),
                 'person_boxes': np.empty((0, 4), dtype=np.float32),
                 'ball_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_scores': np.empty((0,), dtype=np.float32),
             }
             return np.array([])
 
@@ -555,8 +576,10 @@ class SynthPosePoseTracker:
             self.last_detections = {
                 'boxes': np.empty((0, 4), dtype=np.float32),
                 'classes': np.empty((0,), dtype=np.int32),
+                'scores': np.empty((0,), dtype=np.float32),
                 'person_boxes': np.empty((0, 4), dtype=np.float32),
                 'ball_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_scores': np.empty((0,), dtype=np.float32),
             }
             return np.array([])
 
@@ -564,18 +587,23 @@ class SynthPosePoseTracker:
             score_mask = bboxes[:, 4] >= self.person_threshold
             bboxes = bboxes[score_mask]
             classes = classes[score_mask]
+            detection_scores = detection_scores[score_mask] if len(detection_scores) == len(score_mask) else np.full((len(bboxes),), np.nan, dtype=np.float32)
             if len(bboxes) == 0:
                 self.last_detections = {
                     'boxes': np.empty((0, 4), dtype=np.float32),
                     'classes': np.empty((0,), dtype=np.int32),
+                    'scores': np.empty((0,), dtype=np.float32),
                     'person_boxes': np.empty((0, 4), dtype=np.float32),
                     'ball_boxes': np.empty((0, 4), dtype=np.float32),
+                    'ball_scores': np.empty((0,), dtype=np.float32),
                 }
                 return np.array([])
 
         bboxes = bboxes[:, :4]
         if len(classes) != len(bboxes):
             classes = np.full((len(bboxes),), PERSON_CLASS_ID, dtype=np.int32)
+        if len(detection_scores) != len(bboxes):
+            detection_scores = np.full((len(bboxes),), np.nan, dtype=np.float32)
 
         person_mask = classes == PERSON_CLASS_ID
         person_boxes_xyxy = bboxes[person_mask]
@@ -587,8 +615,10 @@ class SynthPosePoseTracker:
         if self.detect_ball:
             ball_mask = np.isin(classes, self.ball_class_ids)
             ball_boxes_xyxy = bboxes[ball_mask]
+            ball_scores_xyxy = detection_scores[ball_mask]
         else:
             ball_boxes_xyxy = np.empty((0, 4), dtype=np.float32)
+            ball_scores_xyxy = np.empty((0,), dtype=np.float32)
 
         # Convert from (x1, y1, x2, y2) to COCO format (x, y, w, h) for VitPose
         person_boxes_coco = np.zeros((len(person_boxes_xyxy), 4))
@@ -601,8 +631,10 @@ class SynthPosePoseTracker:
         self.last_detections = {
             'boxes': bboxes,
             'classes': classes,
+            'scores': detection_scores,
             'person_boxes': person_boxes_xyxy,
             'ball_boxes': ball_boxes_xyxy,
+            'ball_scores': ball_scores_xyxy,
         }
 
         return person_boxes_coco
@@ -627,25 +659,30 @@ class SynthPosePoseTracker:
         results = self.rtdetr_processor.post_process_object_detection(
             outputs, 
             target_sizes=_torch.tensor([(height, width)]),
-            threshold=self.person_threshold
+            threshold=min(self.person_threshold, self.ball_detection_threshold)
         )
         result = results[0]
 
         labels = result["labels"].cpu().numpy()
+        scores = result["scores"].cpu().numpy()
         all_boxes_voc = result["boxes"].cpu().numpy()
-        person_mask = labels == PERSON_CLASS_ID
+        person_mask = (labels == PERSON_CLASS_ID) & (scores >= self.person_threshold)
         person_boxes_voc = all_boxes_voc[person_mask]
         if self.detect_ball:
-            ball_mask = np.isin(labels, self.ball_class_ids)
+            ball_mask = np.isin(labels, self.ball_class_ids) & (scores >= self.ball_detection_threshold)
             ball_boxes_voc = all_boxes_voc[ball_mask]
+            ball_scores_voc = scores[ball_mask].astype(np.float32, copy=False)
         else:
             ball_boxes_voc = np.empty((0, 4), dtype=np.float32)
+            ball_scores_voc = np.empty((0,), dtype=np.float32)
 
         self.last_detections = {
             'boxes': all_boxes_voc,
             'classes': labels.astype(np.int32, copy=False),
+            'scores': scores.astype(np.float32, copy=False),
             'person_boxes': person_boxes_voc,
             'ball_boxes': ball_boxes_voc,
+            'ball_scores': ball_scores_voc,
         }
         
         if len(person_boxes_voc) == 0:
@@ -686,17 +723,21 @@ class SynthPosePoseTracker:
         if self.detect_ball:
             ball_mask = _torch.zeros_like(person_mask, dtype=_torch.bool)
             for cls_id in self.ball_class_ids:
-                ball_mask = ball_mask | ((labels_0 == cls_id) & (scores_0 >= self.person_threshold))
+                ball_mask = ball_mask | ((labels_0 == cls_id) & (scores_0 >= self.ball_detection_threshold))
             ball_boxes_voc = boxes_0[ball_mask].cpu().numpy()
+            ball_scores_voc = scores_0[ball_mask].cpu().numpy().astype(np.float32, copy=False)
         else:
             ball_boxes_voc = np.empty((0, 4), dtype=np.float32)
+            ball_scores_voc = np.empty((0,), dtype=np.float32)
 
         valid_mask = scores_0 >= self.person_threshold
         self.last_detections = {
             'boxes': boxes_0[valid_mask].cpu().numpy(),
             'classes': labels_0[valid_mask].cpu().numpy().astype(np.int32, copy=False),
+            'scores': scores_0[valid_mask].cpu().numpy().astype(np.float32, copy=False),
             'person_boxes': person_boxes_voc,
             'ball_boxes': ball_boxes_voc,
+            'ball_scores': ball_scores_voc,
         }
         
         if len(person_boxes_voc) == 0:

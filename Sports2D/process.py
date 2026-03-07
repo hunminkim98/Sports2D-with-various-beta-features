@@ -161,6 +161,686 @@ def draw_pose(img, all_X, all_Y, all_scores, pose_model, keypoint_names=None,
     return img
 
 
+def _ensure_xyxy_boxes(boxes):
+    '''
+    Normalize detector boxes to Nx4 xyxy float32.
+    '''
+    if boxes is None:
+        return np.empty((0, 4), dtype=np.float32)
+    boxes = np.asarray(boxes)
+    if boxes.size == 0:
+        return np.empty((0, 4), dtype=np.float32)
+    if boxes.ndim == 1:
+        boxes = boxes.reshape(1, -1)
+    if boxes.shape[1] < 4:
+        return np.empty((0, 4), dtype=np.float32)
+    return boxes[:, :4].astype(np.float32, copy=False)
+
+
+def _ensure_score_vector(scores, expected_len=None):
+    '''
+    Normalize detector confidence scores to a float32 vector.
+    '''
+    if scores is None:
+        score_arr = np.empty((0,), dtype=np.float32)
+    else:
+        score_arr = np.asarray(scores, dtype=np.float32).reshape(-1)
+
+    if expected_len is None:
+        return score_arr
+
+    expected_len = max(0, int(expected_len))
+    if expected_len == 0:
+        return np.empty((0,), dtype=np.float32)
+    if len(score_arr) == expected_len:
+        return score_arr
+    if len(score_arr) == 0:
+        return np.full((expected_len,), np.nan, dtype=np.float32)
+    if len(score_arr) > expected_len:
+        return score_arr[:expected_len]
+    padded = np.full((expected_len,), np.nan, dtype=np.float32)
+    padded[:len(score_arr)] = score_arr
+    return padded
+
+
+def extract_ball_centers(detection_meta):
+    '''
+    Extract integer ball centers from xyxy detector boxes.
+
+    INPUTS:
+    - detection_meta: dict containing optional `ball_boxes` key in xyxy format.
+
+    OUTPUTS:
+    - List of `(x, y)` integer centers.
+    '''
+    detection_meta = detection_meta or {}
+    ball_boxes = _ensure_xyxy_boxes(detection_meta.get('ball_boxes'))
+    centers = []
+    for x1, y1, x2, y2 in ball_boxes:
+        if np.isnan([x1, y1, x2, y2]).any():
+            continue
+        cx = int(round((x1 + x2) * 0.5))
+        cy = int(round((y1 + y2) * 0.5))
+        centers.append((cx, cy))
+    return centers
+
+
+def _centers_to_keypoints(centers):
+    '''
+    Convert Nx2 centers to keypoint tensor expected by sort_people_sports2d: Nx1x2.
+    '''
+    centers = np.asarray(centers, dtype=np.float32)
+    if centers.size == 0:
+        return np.empty((0, 1, 2), dtype=np.float32)
+    if centers.ndim == 1:
+        centers = centers.reshape(1, -1)
+    if centers.shape[1] < 2:
+        return np.empty((0, 1, 2), dtype=np.float32)
+    return centers[:, :2].reshape(-1, 1, 2).astype(np.float32, copy=False)
+
+
+def _parse_ball_selection_mode(value, default='auto'):
+    '''
+    Parse ball track selection mode ('auto' or 'id').
+    '''
+    mode = str(default if value is None else value).strip().lower()
+    if mode not in ['auto', 'id']:
+        logging.warning(
+            "Invalid ball_selection_mode '%s'. Falling back to '%s'.",
+            value,
+            default,
+        )
+        mode = default
+    return mode
+
+
+def _parse_ball_ordering_method(value, default='first_detected'):
+    '''
+    Parse ball ordering method for auto track selection.
+    '''
+    supported_methods = [
+        'on_click',
+        'highest_likelihood',
+        'largest_size',
+        'smallest_size',
+        'greatest_displacement',
+        'least_displacement',
+        'first_detected',
+        'last_detected',
+    ]
+    method = str(default if value is None else value).strip().lower()
+    if method not in supported_methods:
+        logging.warning(
+            "Invalid ball_ordering_method '%s'. Falling back to '%s'.",
+            value,
+            default,
+        )
+        method = default
+    return method
+
+
+def _parse_ball_selected_id(value):
+    '''
+    Parse selected ball track ID. Negative values disable explicit selection.
+    '''
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _parse_video_codec(value, default='mp4v'):
+    '''
+    Parse output video codec.
+
+    Supported values:
+    - mp4v: MPEG-4 Part 2 (OpenCV-native default)
+    - h264: H.264/AVC (finalized via ffmpeg)
+    '''
+
+    codec = str(default if value is None else value).strip().lower()
+    aliases = {
+        'h264': 'h264',
+        'h.264': 'h264',
+        'avc1': 'h264',
+        'mp4v': 'mp4v',
+        'mpeg4': 'mp4v',
+    }
+    codec = aliases.get(codec, codec)
+    if codec not in ['h264', 'mp4v']:
+        raise ValueError(
+            f"Invalid video_codec '{value}'. Supported values are 'mp4v' and 'h264'."
+        )
+    return codec
+
+
+def track_balls_sports2d(ball_boxes, previous_keypoints, previous_track_ids,
+                         previous_missing_counts, next_track_id,
+                         ball_scores=None,
+                         max_dist=120.0, max_missing_frames=12):
+    '''
+    Associate ball detections across frames using Sports2D Hungarian tracker.
+
+    INPUTS:
+    - ball_boxes: Nx4 xyxy detections for current frame.
+    - ball_scores: detector confidence scores aligned with ball_boxes.
+    - previous_keypoints: previous tracking state as Nx1x2 centers.
+    - previous_track_ids: list of track IDs aligned with previous_keypoints.
+    - previous_missing_counts: per-track consecutive missing frame counters.
+    - next_track_id: next integer ID to assign.
+    - max_dist: association distance threshold in pixels (None disables threshold).
+    - max_missing_frames: drop tracks missing for more than this many frames.
+
+    OUTPUTS:
+    - tracked_balls: list of dicts with keys id, center, box, visible, missing.
+    - updated_keypoints, updated_track_ids, updated_missing_counts, next_track_id
+    '''
+    ball_boxes = _ensure_xyxy_boxes(ball_boxes)
+    ball_scores = _ensure_score_vector(ball_scores, expected_len=len(ball_boxes))
+    centers = np.asarray(extract_ball_centers({'ball_boxes': ball_boxes}), dtype=np.float32)
+    current_keypoints = _centers_to_keypoints(centers)
+
+    previous_track_ids = list(previous_track_ids or [])
+    previous_missing_counts = list(previous_missing_counts or [])
+    if previous_keypoints is None:
+        previous_keypoints = np.empty((0, 1, 2), dtype=np.float32)
+    previous_keypoints = np.asarray(previous_keypoints, dtype=np.float32)
+
+    if len(previous_track_ids) != len(previous_keypoints):
+        previous_track_ids = previous_track_ids[:len(previous_keypoints)]
+    if len(previous_missing_counts) != len(previous_keypoints):
+        previous_missing_counts = previous_missing_counts[:len(previous_keypoints)]
+
+    if len(previous_keypoints) == 0:
+        tracked_balls = []
+        updated_track_ids = []
+        updated_missing_counts = []
+        if len(current_keypoints) == 0:
+            return tracked_balls, current_keypoints, updated_track_ids, updated_missing_counts, int(next_track_id)
+        for idx in range(len(current_keypoints)):
+            track_id = int(next_track_id)
+            next_track_id += 1
+            center = (
+                int(round(float(current_keypoints[idx, 0, 0]))),
+                int(round(float(current_keypoints[idx, 0, 1]))),
+            )
+            tracked_balls.append({
+                'id': track_id,
+                'center': center,
+                'box': ball_boxes[idx].astype(np.float32, copy=False),
+                'score': float(ball_scores[idx]) if idx < len(ball_scores) else float('nan'),
+                'visible': True,
+                'missing': 0,
+            })
+            updated_track_ids.append(track_id)
+            updated_missing_counts.append(0)
+        return tracked_balls, current_keypoints, updated_track_ids, updated_missing_counts, int(next_track_id)
+
+    sorted_prev_keypoints, sorted_keypoints, sorted_ids = sort_people_sports2d(
+        previous_keypoints,
+        current_keypoints,
+        scores=None,
+        max_dist=max_dist,
+    )
+
+    n_prev = len(previous_track_ids)
+    tracked_balls = []
+    updated_keypoints = []
+    updated_track_ids = []
+    updated_missing_counts = []
+
+    for row_idx, curr_idx in enumerate(np.asarray(sorted_ids, dtype=np.int64)):
+        if row_idx < n_prev:
+            track_id = int(previous_track_ids[row_idx])
+            prev_missing = int(previous_missing_counts[row_idx]) if row_idx < len(previous_missing_counts) else 0
+        else:
+            track_id = int(next_track_id)
+            next_track_id += 1
+            prev_missing = 0
+
+        is_visible = int(curr_idx) >= 0 and int(curr_idx) < len(ball_boxes)
+        missing_count = 0 if is_visible else prev_missing + 1
+        if missing_count > int(max_missing_frames):
+            continue
+
+        if is_visible:
+            curr_idx = int(curr_idx)
+            kp = current_keypoints[curr_idx]
+            center = (
+                int(round(float(kp[0, 0]))),
+                int(round(float(kp[0, 1]))),
+            )
+            box = ball_boxes[curr_idx].astype(np.float32, copy=False)
+            score = float(ball_scores[curr_idx]) if curr_idx < len(ball_scores) else float('nan')
+        else:
+            kp = sorted_prev_keypoints[row_idx]
+            if np.isnan(kp).any():
+                center = None
+            else:
+                center = (
+                    int(round(float(kp[0, 0]))),
+                    int(round(float(kp[0, 1]))),
+                )
+            box = None
+            score = float('nan')
+
+        tracked_balls.append({
+            'id': track_id,
+            'center': center,
+            'box': box,
+            'score': score,
+            'visible': bool(is_visible),
+            'missing': int(missing_count),
+        })
+        updated_keypoints.append(kp)
+        updated_track_ids.append(track_id)
+        updated_missing_counts.append(int(missing_count))
+
+    if len(updated_keypoints) > 0:
+        updated_keypoints = np.asarray(updated_keypoints, dtype=np.float32).reshape(-1, 1, 2)
+    else:
+        updated_keypoints = np.empty((0, 1, 2), dtype=np.float32)
+
+    return (
+        tracked_balls,
+        updated_keypoints,
+        updated_track_ids,
+        updated_missing_counts,
+        int(next_track_id),
+    )
+
+
+def _update_ball_track_stats(track_stats_by_id, tracked_balls, frame_index):
+    '''
+    Update per-track statistics used by ball ordering methods.
+    '''
+    track_stats_by_id = track_stats_by_id or {}
+    for track in tracked_balls or []:
+        if 'id' not in track:
+            continue
+        track_id = int(track.get('id'))
+        stats = track_stats_by_id.get(track_id)
+        if stats is None:
+            stats = {
+                'first_seen_frame': int(frame_index),
+                'last_seen_frame': int(frame_index),
+                'visible_count': 0,
+                'area_sum': 0.0,
+                'area_count': 0,
+                'score_sum': 0.0,
+                'score_count': 0,
+                'displacement_sum': 0.0,
+                'last_center': None,
+            }
+            track_stats_by_id[track_id] = stats
+        else:
+            stats['last_seen_frame'] = int(frame_index)
+
+        if not track.get('visible', False):
+            continue
+        center = track.get('center')
+        if center is None:
+            continue
+
+        center = (int(center[0]), int(center[1]))
+        stats['visible_count'] += 1
+
+        box = track.get('box')
+        if box is not None:
+            box_arr = _ensure_xyxy_boxes([box])
+            if len(box_arr) > 0:
+                x1, y1, x2, y2 = box_arr[0]
+                area = max(0.0, float((x2 - x1) * (y2 - y1)))
+                if np.isfinite(area):
+                    stats['area_sum'] += area
+                    stats['area_count'] += 1
+
+        score = track.get('score')
+        if score is not None:
+            score = float(score)
+            if np.isfinite(score):
+                stats['score_sum'] += score
+                stats['score_count'] += 1
+
+        last_center = stats.get('last_center')
+        if last_center is not None:
+            stats['displacement_sum'] += float(np.hypot(center[0] - last_center[0], center[1] - last_center[1]))
+        stats['last_center'] = center
+
+    return track_stats_by_id
+
+
+def _has_ball_confidence_stats(track_ids, track_stats_by_id):
+    '''
+    Whether any candidate track has detector confidence stats.
+    '''
+    for track_id in track_ids or []:
+        stats = (track_stats_by_id or {}).get(int(track_id), {})
+        if int(stats.get('score_count', 0)) > 0:
+            return True
+    return False
+
+
+def _rank_ball_track_ids(track_ids, track_stats_by_id, ordering_method='first_detected'):
+    '''
+    Rank candidate track IDs according to ordering method.
+    '''
+    candidate_ids = [int(track_id) for track_id in (track_ids or [])]
+    if len(candidate_ids) == 0:
+        return []
+
+    method = str(ordering_method or 'first_detected').strip().lower()
+    if method == 'on_click':
+        method = 'first_detected'
+    if method == 'highest_likelihood' and not _has_ball_confidence_stats(candidate_ids, track_stats_by_id):
+        method = 'first_detected'
+
+    def _first_seen(track_id):
+        stats = (track_stats_by_id or {}).get(int(track_id), {})
+        return int(stats.get('first_seen_frame', int(1e9)))
+
+    def _metric(track_id):
+        stats = (track_stats_by_id or {}).get(int(track_id), {})
+        first_seen = _first_seen(track_id)
+        if method == 'last_detected':
+            return (-first_seen, int(track_id))
+        if method == 'highest_likelihood':
+            score_count = int(stats.get('score_count', 0))
+            mean_score = (float(stats.get('score_sum', 0.0)) / score_count) if score_count > 0 else float('-inf')
+            return (-mean_score, first_seen, int(track_id))
+        if method == 'largest_size':
+            area_count = int(stats.get('area_count', 0))
+            mean_area = (float(stats.get('area_sum', 0.0)) / area_count) if area_count > 0 else float('-inf')
+            return (-mean_area, first_seen, int(track_id))
+        if method == 'smallest_size':
+            area_count = int(stats.get('area_count', 0))
+            mean_area = (float(stats.get('area_sum', 0.0)) / area_count) if area_count > 0 else float('inf')
+            return (mean_area, first_seen, int(track_id))
+        if method == 'greatest_displacement':
+            return (-float(stats.get('displacement_sum', 0.0)), first_seen, int(track_id))
+        if method == 'least_displacement':
+            return (float(stats.get('displacement_sum', 0.0)), first_seen, int(track_id))
+        return (first_seen, int(track_id))
+
+    return sorted(candidate_ids, key=_metric)
+
+
+def select_ball_track_id(tracked_balls, selection_mode='auto', requested_track_id=None,
+                         previous_selected_id=None, previous_selected_center=None,
+                         ordering_method='first_detected', track_stats_by_id=None):
+    '''
+    Select active ball track ID and its center for trajectory rendering.
+
+    OUTPUTS:
+    - selected_track_id: int or None
+    - selected_center: `(x, y)` or None
+    '''
+    tracked_balls = tracked_balls or []
+    track_stats_by_id = track_stats_by_id or {}
+    tracks_by_id = {int(track.get('id')): track for track in tracked_balls if 'id' in track}
+    visible_tracks = [
+        track for track in tracked_balls
+        if track.get('visible', False) and track.get('center') is not None
+    ]
+
+    if selection_mode == 'id':
+        selected_track_id = requested_track_id if requested_track_id is not None else previous_selected_id
+        if selected_track_id is None:
+            return None, None
+        track = tracks_by_id.get(int(selected_track_id))
+        if track is None or not track.get('visible', False):
+            return int(selected_track_id), None
+        return int(selected_track_id), tuple(track.get('center'))
+
+    # Keep stable selection by default; 'last_detected' intentionally tracks the latest arrivals.
+    if ordering_method != 'last_detected' and previous_selected_id is not None:
+        previous_track = tracks_by_id.get(int(previous_selected_id))
+        if previous_track is not None:
+            if previous_track.get('visible', False) and previous_track.get('center') is not None:
+                return int(previous_selected_id), tuple(previous_track.get('center'))
+            return int(previous_selected_id), None
+
+    active_track_ids = [int(track.get('id')) for track in tracked_balls if 'id' in track]
+    visible_track_ids = [int(track.get('id')) for track in visible_tracks if 'id' in track]
+    candidate_track_ids = visible_track_ids if len(visible_track_ids) > 0 else active_track_ids
+    if len(candidate_track_ids) == 0:
+        return None, None
+
+    ranked_track_ids = _rank_ball_track_ids(
+        candidate_track_ids,
+        track_stats_by_id=track_stats_by_id,
+        ordering_method=ordering_method,
+    )
+    if len(ranked_track_ids) == 0:
+        return None, None
+
+    selected_track_id = int(ranked_track_ids[0])
+    selected_track = tracks_by_id.get(selected_track_id)
+    if selected_track is None or not selected_track.get('visible', False) or selected_track.get('center') is None:
+        return selected_track_id, None
+    return selected_track_id, tuple(selected_track.get('center'))
+
+
+def _ball_track_color(track_id, base_color=(0, 0, 0), selected=False, has_selected=False):
+    '''
+    Deterministic BGR color for ball track ID.
+    '''
+    if track_id is None:
+        return tuple(base_color)
+    palette = (
+        int((37 * int(track_id) + 29) % 200 + 30),
+        int((97 * int(track_id) + 53) % 200 + 30),
+        int((57 * int(track_id) + 91) % 200 + 30),
+    )
+    blended = tuple(
+        int(np.clip(0.35 * int(base_color[idx]) + 0.65 * palette[idx], 0, 255))
+        for idx in range(3)
+    )
+    if selected:
+        return blended
+    if has_selected:
+        return tuple(int(np.clip(0.55 * c, 0, 255)) for c in blended)
+    return blended
+
+
+def select_ball_center(candidates, previous_center=None, max_jump_px=120, min_movement_px=2.0,
+                       previous_velocity=None, lock_radius_px=35.0, switch_margin_px=8.0):
+    '''
+    Select a single center candidate with temporal continuity constraints.
+
+    INPUTS:
+    - candidates: list of `(x, y)` centers for current frame.
+    - previous_center: previous accepted center or None.
+    - max_jump_px: max allowed movement from previous center. None disables gating.
+    - min_movement_px: tiny-jitter suppression threshold.
+    - previous_velocity: optional `(vx, vy)` estimated from recent frames.
+    - lock_radius_px: keep tracking within this radius unless a clearly better candidate appears.
+    - switch_margin_px: required score improvement to switch outside lock radius.
+
+    OUTPUTS:
+    - selected `(x, y)` or `None` if rejected/unavailable.
+    '''
+    if not candidates:
+        return None
+    if previous_center is None:
+        return tuple(candidates[0])
+
+    candidates_arr = np.asarray(candidates, dtype=np.float32).reshape(-1, 2)
+    previous_center_arr = np.asarray(previous_center, dtype=np.float32).reshape(2,)
+    if previous_velocity is None:
+        previous_velocity_arr = np.zeros(2, dtype=np.float32)
+    else:
+        previous_velocity_arr = np.asarray(previous_velocity, dtype=np.float32).reshape(2,)
+    predicted_center = previous_center_arr + previous_velocity_arr
+
+    dists_prev = np.linalg.norm(candidates_arr - previous_center_arr[None, :], axis=1)
+    dists_pred = np.linalg.norm(candidates_arr - predicted_center[None, :], axis=1)
+    speed = float(np.linalg.norm(previous_velocity_arr))
+    use_prediction = speed >= 0.75
+    if use_prediction:
+        continuity_scores = 0.25 * dists_prev + 0.75 * dists_pred
+    else:
+        continuity_scores = dists_prev.copy()
+
+    lock_radius = max(float(min_movement_px), float(lock_radius_px))
+    near_idx = np.where(dists_prev <= lock_radius)[0]
+    far_idx = np.where(dists_prev > lock_radius)[0]
+    if len(near_idx) > 0:
+        near_sorted = near_idx[np.argsort(continuity_scores[near_idx])]
+        locked_near = int(near_idx[np.argmin(dists_prev[near_idx])])
+        best_near = int(near_sorted[0])
+        primary_idx = locked_near
+        # Avoid unstable flip-flop between nearby candidates unless improvement is clear.
+        if continuity_scores[best_near] + float(switch_margin_px) < continuity_scores[locked_near]:
+            primary_idx = best_near
+
+        far_sorted = far_idx[np.argsort(continuity_scores[far_idx])] if len(far_idx) > 0 else np.array([], dtype=np.int64)
+        if len(far_sorted) > 0:
+            best_far = int(far_sorted[0])
+            # Keep a lock on nearby candidates unless far candidate is clearly better.
+            if continuity_scores[best_far] + float(switch_margin_px) < continuity_scores[primary_idx]:
+                primary_idx = best_far
+
+            ordered_rest = [idx for idx in np.concatenate((near_sorted, far_sorted)) if int(idx) != int(primary_idx)]
+            ordered_idx = np.asarray([int(primary_idx)] + [int(i) for i in ordered_rest], dtype=np.int64)
+        else:
+            ordered_rest = [idx for idx in near_sorted if int(idx) != int(primary_idx)]
+            ordered_idx = np.asarray([int(primary_idx)] + [int(i) for i in ordered_rest], dtype=np.int64)
+    else:
+        ordered_idx = np.argsort(continuity_scores)
+
+    selected_idx = int(ordered_idx[0])
+    for idx in ordered_idx:
+        idx = int(idx)
+        if dists_prev[idx] >= float(min_movement_px):
+            selected_idx = idx
+            break
+
+    selected = (
+        int(round(float(candidates_arr[selected_idx, 0]))),
+        int(round(float(candidates_arr[selected_idx, 1]))),
+    )
+    selected_dist = float(dists_prev[selected_idx])
+
+    if max_jump_px is not None and selected_dist > float(max_jump_px):
+        return None
+    if selected_dist < float(min_movement_px):
+        return (
+            int(round(float(previous_center_arr[0]))),
+            int(round(float(previous_center_arr[1]))),
+        )
+    return selected
+
+
+def _parse_ball_max_jump_px(value, default=120.0):
+    '''
+    Parse ball max-jump config. Supports numeric values and 'none'.
+    '''
+    if value is None:
+        return float(default)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ['', 'none', 'null']:
+            return None
+    try:
+        parsed = float(value)
+        if parsed <= 0:
+            return None
+        return parsed
+    except Exception:
+        logging.warning(
+            "Invalid ball_max_jump_px '%s'. Falling back to %s.",
+            value,
+            default,
+        )
+        return float(default)
+
+
+def _parse_ball_color(color_value, default=(0, 0, 0)):
+    '''
+    Parse BGR color triplet and clip to uint8 range.
+    '''
+    if not isinstance(color_value, (list, tuple)) or len(color_value) < 3:
+        return tuple(default)
+    try:
+        parsed = [int(np.clip(int(v), 0, 255)) for v in color_value[:3]]
+    except Exception:
+        return tuple(default)
+    return tuple(parsed)
+
+
+def draw_ball_overlay(img, ball_boxes, ball_center, trail_points,
+                      color=(0, 0, 0), radius=4, trail_alpha=0.35,
+                      tracked_balls=None, selected_track_id=None, show_ids=False):
+    '''
+    Draw optional ball bbox, IDs, center, and trajectory trail on image.
+    '''
+    ball_boxes = _ensure_xyxy_boxes(ball_boxes)
+    tracked_balls = tracked_balls or []
+    has_selected = selected_track_id is not None
+
+    if len(tracked_balls) > 0:
+        for track in tracked_balls:
+            if not track.get('visible', False):
+                continue
+            box = track.get('box')
+            if box is None:
+                continue
+            box = _ensure_xyxy_boxes([box])
+            if len(box) == 0:
+                continue
+            x1, y1, x2, y2 = box[0]
+            track_id = int(track.get('id'))
+            is_selected = has_selected and track_id == int(selected_track_id)
+            track_color = _ball_track_color(
+                track_id,
+                base_color=color,
+                selected=is_selected,
+                has_selected=has_selected,
+            )
+            thickness = 3 if is_selected else 2
+            cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), track_color, thickness)
+            if show_ids:
+                label = f'ball {track_id}'
+                label_pos = (int(x1), max(0, int(y1) - 7))
+                cv2.putText(
+                    img,
+                    label,
+                    label_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    img,
+                    label,
+                    label_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    track_color,
+                    1,
+                    cv2.LINE_AA,
+                )
+    else:
+        for x1, y1, x2, y2 in ball_boxes:
+            cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+
+    if trail_points and len(trail_points) >= 2:
+        overlay = img.copy()
+        line_thickness = max(1, int(round(radius * 0.75)))
+        for p1, p2 in zip(trail_points[:-1], trail_points[1:]):
+            cv2.line(overlay, tuple(p1), tuple(p2), color, line_thickness, cv2.LINE_AA)
+        img = cv2.addWeighted(overlay, float(np.clip(trail_alpha, 0.0, 1.0)),
+                              img, 1.0 - float(np.clip(trail_alpha, 0.0, 1.0)), 0)
+
+    if ball_center is not None:
+        cv2.circle(img, tuple(ball_center), int(max(1, radius)), color, -1)
+    return img
+
+
 # SynthPose-specific drawing functions (private)
 def _draw_synthpose_keypoints(img, all_X, all_Y, all_scores, keypoint_names=None, thickness=1):
     '''
@@ -1106,17 +1786,95 @@ def get_personIDs_on_click(video_file_path, frame_range, all_frames_X_homog, all
     return selected_persons
 
 
-def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
+def _build_ball_click_pose_coords(all_frames_ball_tracks):
     '''
-    Interactive UI to select persons from a video by clicking on their bounding boxes.
+    Build click-select pose-like coordinates for ball tracks from tracked ball boxes.
+
+    OUTPUTS:
+    - all_pose_coords: shape (Nframes, Ntracks, 2, 2) with 2 keypoints per track (bbox corners)
+    - ordered_track_ids: list of track IDs in first-appearance order
+    '''
+    ordered_track_ids = []
+    known_track_ids = set()
+    for frame_tracks in all_frames_ball_tracks or []:
+        for track in frame_tracks or []:
+            if 'id' not in track:
+                continue
+            track_id = int(track.get('id'))
+            if track_id in known_track_ids:
+                continue
+            known_track_ids.add(track_id)
+            ordered_track_ids.append(track_id)
+
+    n_frames = len(all_frames_ball_tracks or [])
+    n_tracks = len(ordered_track_ids)
+    all_pose_coords = np.full((n_frames, n_tracks, 2, 2), np.nan, dtype=np.float32)
+    if n_tracks == 0:
+        return all_pose_coords, ordered_track_ids
+
+    track_slot = {track_id: idx for idx, track_id in enumerate(ordered_track_ids)}
+    for frame_idx, frame_tracks in enumerate(all_frames_ball_tracks or []):
+        for track in frame_tracks or []:
+            if 'id' not in track:
+                continue
+            slot_idx = track_slot.get(int(track.get('id')))
+            if slot_idx is None:
+                continue
+            box = track.get('box')
+            if box is None:
+                continue
+            box_arr = _ensure_xyxy_boxes([box])
+            if len(box_arr) == 0:
+                continue
+            x1, y1, x2, y2 = box_arr[0]
+            all_pose_coords[frame_idx, slot_idx, 0] = [x1, y1]
+            all_pose_coords[frame_idx, slot_idx, 1] = [x2, y2]
+    return all_pose_coords, ordered_track_ids
+
+
+def get_ball_trackIDs_on_click(video_file_path, frame_range, all_frames_ball_tracks):
+    '''
+    Select one ball track ID by clicking ball boxes on a post-processing UI.
+    '''
+    all_pose_coords, ordered_track_ids = _build_ball_click_pose_coords(all_frames_ball_tracks)
+    if len(ordered_track_ids) == 0:
+        return []
+
+    selected_slots = select_persons_on_vid(
+        video_file_path,
+        frame_range,
+        all_pose_coords,
+        candidate_labels=[f'ball {track_id}' for track_id in ordered_track_ids],
+        window_title='Select ball track to follow',
+        selection_label='Selected ball',
+        allow_multiple=False,
+    )
+    return [
+        int(ordered_track_ids[slot_idx])
+        for slot_idx in selected_slots
+        if int(slot_idx) >= 0 and int(slot_idx) < len(ordered_track_ids)
+    ]
+
+
+def select_persons_on_vid(video_file_path, frame_range, all_pose_coords,
+                          candidate_labels=None,
+                          window_title='Select the persons to analyze in the desired order',
+                          selection_label='Selected',
+                          allow_multiple=True):
+    '''
+    Interactive UI to select tracks from a video by clicking on bounding boxes.
     
     INPUTS:
     - video_file_path: path to video file
     - frame_range: tuple (start_frame, end_frame)
-    - all_pose_coords: keypoints coordinates. shape (Nframes, Npersons, Nkpts, Ndims)
+    - all_pose_coords: keypoints coordinates. shape (Nframes, Ntracks, Nkpts, Ndims)
+    - candidate_labels: optional labels for candidate tracks
+    - window_title: UI window title
+    - selection_label: status text prefix
+    - allow_multiple: allow selecting multiple IDs when True
         
     OUTPUT:
-    - selected_persons : list with indices of selected persons
+    - selected_persons : list with indices of selected tracks
     '''
 
     BACKGROUND_COLOR = 'white'
@@ -1126,29 +1884,28 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
     LINE_UNSELECTED_COLOR = 'white'
     LINE_SELECTED_COLOR = 'darkorange'
 
+    def _format_selected_text():
+        if len(selected_persons) == 0:
+            return 'None'
+        return ', '.join([str(candidate_labels[idx]) for idx in selected_persons])
 
     def get_frame(frame_idx):
         """Get frame with caching"""
         actual_frame_idx = start_frame + frame_idx
         
-        # Check cache first
         if actual_frame_idx in frame_cache:
-            # Move to end of cache order (recently used)
             cache_order.remove(actual_frame_idx)
             cache_order.append(actual_frame_idx)
             return frame_cache[actual_frame_idx]
         
-        # Load from video
         cap.set(cv2.CAP_PROP_POS_FRAMES, actual_frame_idx)
         success, frame = cap.read()
         if not success:
             raise ValueError(f"Could not read frame {actual_frame_idx}")
         
-        # Add to cache
         frame_cache[actual_frame_idx] = frame.copy()
         cache_order.append(actual_frame_idx)
         
-        # Remove old frames if cache too large
         while len(frame_cache) > cache_size:
             oldest_frame = cache_order.pop(0)
             if oldest_frame in frame_cache:
@@ -1156,14 +1913,11 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
         
         return frame
     
-
     def update_frame(val):
-        # Update image
         frame_idx = int(frame_slider.val)
         frame = get_frame(frame_idx)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Update bboxes and annotations
         for items in [rects, annotations]:
             for item in items:
                 item.remove()
@@ -1181,7 +1935,7 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
                 rects.append(rect)
 
                 annotation = ax_video.text(
-                    x_min, y_min - 10, f'{person_idx}', color=LINE_UNSELECTED_COLOR, fontsize=7, fontweight='normal',
+                    x_min, y_min - 10, f'{candidate_labels[person_idx]}', color=LINE_UNSELECTED_COLOR, fontsize=7, fontweight='normal',
                     bbox=dict(facecolor=UNSELECTED_COLOR, edgecolor=LINE_UNSELECTED_COLOR, boxstyle='square,pad=0.3'), path_effects=[patheffects.withSimplePatchShadow()], zorder=3
                 )
                 annotations.append(annotation)
@@ -1190,10 +1944,8 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
                 ax_video.add_patch(rect)
                 rects.append(rect)
 
-        # Update plot
         img_plot.set_data(frame_rgb)
         fig.canvas.draw_idle()
-
 
     def on_click(event):
         if event.inaxes != ax_video:
@@ -1202,28 +1954,29 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
         frame_idx = int(frame_slider.val)
         x, y = event.xdata, event.ydata
         
-        # Check if click is inside any bounding box
         for person_idx, bbox in enumerate(all_bboxes[frame_idx]):
             if ~np.isnan(bbox).any():
                 x_min, y_min, x_max, y_max = bbox.astype(int)
                 if x_min <= x <= x_max and y_min <= y <= y_max:
-                    # Toggle selection
                     if person_idx in selected_persons:
                         rects[person_idx].set_linewidth(1)
                         rects[person_idx].set_edgecolor(LINE_UNSELECTED_COLOR)
                         selected_persons.remove(person_idx)
                     else:
+                        if not allow_multiple:
+                            for selected_idx in selected_persons.copy():
+                                if selected_idx < len(rects):
+                                    rects[selected_idx].set_linewidth(1)
+                                    rects[selected_idx].set_edgecolor(LINE_UNSELECTED_COLOR)
+                            selected_persons.clear()
                         rects[person_idx].set_linewidth(2)
                         rects[person_idx].set_edgecolor(LINE_SELECTED_COLOR)
                         selected_persons.append(person_idx)
                     
-                    # Update display
-                    status_text.set_text(f"Selected: {selected_persons}")
-                    # draw_bounding_boxes(frame_idx)
+                    status_text.set_text(f"{selection_label}: {_format_selected_text()}")
                     fig.canvas.draw_idle()
                     break
     
-
     def on_hover(event):
         if event.inaxes != ax_video:
             return
@@ -1231,9 +1984,8 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
         frame_idx = int(frame_slider.val)
         x, y = event.xdata, event.ydata
 
-        # Change color on hover
         for person_idx, bbox in enumerate(all_bboxes[frame_idx]):
-            if person_idx >= len(rects):  # Skip if rect doesn't exist
+            if person_idx >= len(rects):
                 continue
             if ~np.isnan(bbox).any():
                 x_min, y_min, x_max, y_max = bbox.astype(int)
@@ -1251,52 +2003,50 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
                         rects[person_idx].set_edgecolor(LINE_UNSELECTED_COLOR)
                 fig.canvas.draw_idle()
 
-
     def on_ok(event):
         plt.close(fig)
 
-
-    # Open video
     cap = cv2.VideoCapture(video_file_path)
     if not cap.isOpened():
         raise ValueError(f"Could not open video: {video_file_path}")
     start_frame, end_frame = frame_range
     
-
-    # Frame cache for efficiency - only keep recently accessed frames
     frame_cache = {}
-    cache_size = 20  # Keep last 20 frames in memory
+    cache_size = 20
     cache_order = []
 
-    # Calculate bounding boxes for each person in each frame
     selected_persons = []
     n_frames, n_persons = all_pose_coords.shape[0], all_pose_coords.shape[1]
+    if candidate_labels is None:
+        candidate_labels = list(range(n_persons))
+    else:
+        candidate_labels = list(candidate_labels)
+    if len(candidate_labels) < n_persons:
+        candidate_labels = candidate_labels + list(range(len(candidate_labels), n_persons))
+
     all_bboxes = []
     for frame_idx in range(n_frames):
         frame_bboxes = []
         for person_idx in range(n_persons):
-            # Get keypoints for current person
             keypoints = all_pose_coords[frame_idx, person_idx]
             valid_keypoints = keypoints[~np.isnan(keypoints).all(axis=1)]
             if len(valid_keypoints) > 0:
-                # Calculate bounding box
                 x_min, y_min = np.min(valid_keypoints, axis=0)
                 x_max, y_max = np.max(valid_keypoints, axis=0)
                 frame_bboxes.append((x_min, y_min, x_max, y_max))
             else:
-                frame_bboxes.append((np.nan, np.nan, np.nan, np.nan))  # No valid bounding box for this person
+                frame_bboxes.append((np.nan, np.nan, np.nan, np.nan))
         all_bboxes.append(frame_bboxes)
-    all_bboxes = np.array(all_bboxes)  # Shape: (Nframes, Npersons, 4)
+    all_bboxes = np.array(all_bboxes)
     
-    # Create figure, axes, and slider
     first_frame = get_frame(0)
     frame_height, frame_width = first_frame.shape[:2]
     is_vertical = frame_height > frame_width
     if is_vertical:
-        fig_height = frame_height / 250  # For vertical videos
+        fig_height = frame_height / 250
     else:
-        fig_height = max(frame_height / 300, 6)  # For horizontal videos
-    fig = plt.figure(figsize=(8, fig_height), num=f'Select the persons to analyze in the desired order')
+        fig_height = max(frame_height / 300, 6)
+    fig = plt.figure(figsize=(8, fig_height), num=window_title)
     fig.patch.set_facecolor(BACKGROUND_COLOR)
 
     video_axes_height = 0.7 if is_vertical else 0.6
@@ -1304,7 +2054,6 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
     ax_video.axis('off')
     ax_video.set_facecolor(BACKGROUND_COLOR)    
 
-    # First image
     frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
     rects, annotations = [], []
     for person_idx, bbox in enumerate(all_bboxes[0]):
@@ -1317,14 +2066,13 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
             ) 
             ax_video.add_patch(rect)
             annotation = ax_video.text(
-                x_min, y_min - 10, f'{person_idx}', color=LINE_UNSELECTED_COLOR, fontsize=7, fontweight='normal',
+                x_min, y_min - 10, f'{candidate_labels[person_idx]}', color=LINE_UNSELECTED_COLOR, fontsize=7, fontweight='normal',
                 bbox=dict(facecolor=UNSELECTED_COLOR, edgecolor=LINE_UNSELECTED_COLOR, boxstyle='square,pad=0.3', path_effects=[patheffects.withSimplePatchShadow()]), zorder=3
             )
             rects.append(rect)
             annotations.append(annotation)
     img_plot = ax_video.imshow(frame_rgb)
 
-    # Slider
     ax_slider = plt.axes([ax_video.get_position().x0, ax_video.get_position().y0-0.05, ax_video.get_position().width, 0.04])
     ax_slider.set_facecolor(BACKGROUND_COLOR)
     frame_slider = Slider(
@@ -1341,17 +2089,13 @@ def select_persons_on_vid(video_file_path, frame_range, all_pose_coords):
     frame_slider.poly.set_linewidth(1)
     frame_slider.valtext.set_visible(False)
 
-
-    # Status text and OK button
     ax_status = plt.axes([ax_video.get_position().x0, ax_video.get_position().y0-0.1, 2*ax_video.get_position().width/3, 0.04])
     ax_status.axis('off')
-    status_text = ax_status.text(0.0, 0.5, f"Selected: None", color='black', fontsize=10)
+    status_text = ax_status.text(0.0, 0.5, f"{selection_label}: None", color='black', fontsize=10)
 
     ax_button = plt.axes([ax_video.get_position().x0 + 3*ax_video.get_position().width/4, ax_video.get_position().y0-0.1, ax_video.get_position().width/4, 0.04])
     ok_button = Button(ax_button, 'OK', color=BACKGROUND_COLOR)
     
-
-    # Connect events
     frame_slider.on_changed(update_frame)
     fig.canvas.mpl_connect('button_press_event', on_click)
     fig.canvas.mpl_connect('motion_notify_event', on_hover)
@@ -1697,6 +2441,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     realtime_ui_backend = config_dict.get('base').get('realtime_ui_backend', 'opencv')
     realtime_window_title = config_dict.get('base').get('realtime_window_title', 'UmFit realtime')
     save_vid = config_dict.get('base').get('save_vid')
+    video_codec = _parse_video_codec(config_dict.get('base').get('video_codec', 'mp4v'))
     save_img = config_dict.get('base').get('save_img')
     save_pose = config_dict.get('base').get('save_pose')
     calculate_angles = config_dict.get('base').get('calculate_angles')
@@ -1727,6 +2472,29 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     average_likelihood_threshold = config_dict.get('pose').get('average_likelihood_threshold')
     keypoint_number_threshold = config_dict.get('pose').get('keypoint_number_threshold')
     max_distance = config_dict.get('pose').get('max_distance', None)
+    detect_ball = bool(config_dict.get('pose').get('detect_ball', False))
+    ball_trail_length = max(1, int(config_dict.get('pose').get('ball_trail_length', 20)))
+    ball_trail_alpha = float(np.clip(config_dict.get('pose').get('ball_trail_alpha', 0.35), 0.0, 1.0))
+    ball_radius = max(1, int(config_dict.get('pose').get('ball_radius', 4)))
+    ball_max_jump_px = _parse_ball_max_jump_px(config_dict.get('pose').get('ball_max_jump_px', 120))
+    ball_color = _parse_ball_color(config_dict.get('pose').get('ball_color', [0, 0, 0]))
+    ball_tracking_mode = str(config_dict.get('pose').get('ball_tracking_mode', 'sports2d')).strip().lower()
+    ball_ordering_method = _parse_ball_ordering_method(
+        config_dict.get('pose').get('ball_ordering_method', 'first_detected'),
+    )
+    ball_selection_mode = _parse_ball_selection_mode(
+        config_dict.get('pose').get('ball_selection_mode', 'auto'),
+    )
+    ball_selected_id = _parse_ball_selected_id(config_dict.get('pose').get('ball_selected_id', -1))
+    ball_tracking_max_distance = _parse_ball_max_jump_px(
+        config_dict.get('pose').get('ball_tracking_max_distance', 120),
+        default=120.0,
+    )
+    ball_track_max_missing_frames = max(
+        0,
+        int(config_dict.get('pose').get('ball_track_max_missing_frames', 12)),
+    )
+    ball_show_ids = bool(config_dict.get('pose').get('ball_show_ids', True))
 
     # Pixel to meters conversion
     to_meters = config_dict.get('px_to_meters_conversion').get('to_meters')
@@ -1800,6 +2568,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     plots_output_dir = output_dir / f'{output_dir_name}_graphs'
     img_output_dir = output_dir / f'{output_dir_name}_img'
     vid_output_path = output_dir / f'{output_dir_name}.mp4'
+    vid_output_tmp_path = output_dir / f'{output_dir_name}__tmp.mp4'
     pose_output_path = output_dir / f'{output_dir_name}_px.trc'
     pose_output_path_m = output_dir / f'{output_dir_name}_m.trc'
     angles_output_path = output_dir / f'{output_dir_name}_angles.mot'
@@ -1984,6 +2753,26 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         logging.info(f'{"All persons are" if nb_persons_to_detect=="all" else f"{nb_persons_to_detect} persons are" if nb_persons_to_detect>1 else "1 person is"} analyzed. Person ordering method is {person_ordering_method}.')
         logging.info(f"{keypoint_likelihood_threshold=}, {average_likelihood_threshold=}, {keypoint_number_threshold=}")
 
+    ball_overlay_enabled = detect_ball and not load_trc_px
+    if detect_ball and load_trc_px:
+        logging.warning('detect_ball=true is ignored when loading poses from TRC.')
+    if ball_overlay_enabled and not hasattr(pose_tracker, 'last_detections'):
+        logging.warning('detect_ball=true requested but backend does not expose detection metadata. Disabling ball overlay.')
+        ball_overlay_enabled = False
+    ball_multi_id_tracking = ball_overlay_enabled and ball_tracking_mode == 'sports2d'
+    if ball_overlay_enabled and ball_tracking_mode != 'sports2d':
+        logging.warning(
+            "Unsupported ball_tracking_mode '%s'. Falling back to legacy single-ball selection.",
+            ball_tracking_mode,
+        )
+    if ball_multi_id_tracking and ball_selection_mode == 'auto':
+        logging.info("Ball auto-selection ordering method is '%s'.", ball_ordering_method)
+    if ball_multi_id_tracking and ball_selection_mode == 'id' and ball_selected_id is None:
+        logging.warning(
+            "ball_selection_mode='id' requires ball_selected_id >= 0. Falling back to auto selection."
+        )
+        ball_selection_mode = 'auto'
+
     if flip_left_right:
         try:
             Ltoe_idx = keypoints_ids[keypoints_names.index('LBigToe')]
@@ -2009,6 +2798,19 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     logging.info(f"\nProcessing video stream...")
     # logging.info(f"{'Video, ' if save_vid else ''}{'Images, ' if save_img else ''}{'Pose, ' if save_pose else ''}{'Angles ' if save_angles else ''}{'and ' if save_angles or save_img or save_pose or save_vid else ''}Logs will be saved in {result_dir}.")
     all_frames_X, all_frames_X_flipped, all_frames_Y, all_frames_scores, all_frames_angles = [], [], [], [], []
+    all_frames_ball_centers, all_frames_ball_boxes = [], []
+    all_frames_ball_tracks, all_frames_selected_ball_ids = [], []
+    ball_trail_points = []
+    ball_trail_points_by_id = {}
+    ball_previous_center = None
+    ball_previous_velocity = None
+    ball_selected_track_id = ball_selected_id if ball_selection_mode == 'id' else None
+    ball_prev_keypoints = np.empty((0, 1, 2), dtype=np.float32)
+    ball_track_ids = []
+    ball_track_missing_counts = []
+    next_ball_track_id = 0
+    ball_track_stats_by_id = {}
+    ball_warned_missing_likelihood = False
     # Keep a valid keypoint schema even when early frames contain no detected persons.
     new_keypoints_names, new_keypoints_ids = keypoints_names.copy(), keypoints_ids.copy()
     frame_processing_times = []
@@ -2048,6 +2850,11 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             start_time = datetime.now()
             success, frame = cap.read()
             frame_count += 1
+            frame_ball_center = None
+            frame_ball_boxes = np.empty((0, 4), dtype=np.float32)
+            frame_ball_scores = np.empty((0,), dtype=np.float32)
+            frame_ball_tracks = []
+            frame_selected_ball_id = ball_selected_track_id if ball_multi_id_tracking else None
 
             # If frame not grabbed
             if not success:
@@ -2071,6 +2878,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 all_frames_X_flipped.append(nan_pose.copy())
                 all_frames_Y.append(nan_pose.copy())
                 all_frames_scores.append(nan_pose.copy())
+                all_frames_ball_centers.append(None)
+                all_frames_ball_boxes.append(np.empty((0, 4), dtype=np.float32))
+                all_frames_ball_tracks.append([])
+                all_frames_selected_ball_ids.append(frame_selected_ball_id)
                 if save_angles and calculate_angles:
                     all_frames_angles.append(np.full((1, len(angle_names)), np.nan))
                 continue
@@ -2087,9 +2898,12 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 if video_file == "webcam":
                     out_vid.write(frame)
 
+                detection_meta = {}
                 try: # Frames with no detection cause errors on MacOS CoreMLExecutionProvider
                     # Detect poses
                     keypoints, scores = pose_tracker(frame)
+                    if ball_overlay_enabled:
+                        detection_meta = getattr(pose_tracker, 'last_detections', {}) or {}
 
                     # Non maximum suppression (at pose level, not detection, and only using likely keypoints)
                     frame_shape = frame.shape
@@ -2142,9 +2956,114 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     # # if (cv2.waitKey(1) & 0xFF) == ord('q') or (cv2.waitKey(1) & 0xFF) == 27:
                     # #     break
                     # # input()
-                except:
+                except Exception as e:
+                    logging.debug('Pose estimation failed at frame %s: %s', frame_count - 1, e)
                     keypoints = np.full((1,kpt_id_max,2), fill_value=np.nan)
                     scores = np.full((1,kpt_id_max), fill_value=np.nan)
+                    detection_meta = {}
+
+                if ball_overlay_enabled:
+                    frame_ball_boxes = _ensure_xyxy_boxes(detection_meta.get('ball_boxes'))
+                    frame_ball_scores = _ensure_score_vector(
+                        detection_meta.get('ball_scores'),
+                        expected_len=len(frame_ball_boxes),
+                    )
+                    if ball_multi_id_tracking:
+                        previous_selected_track_id = ball_selected_track_id
+                        frame_ball_tracks, ball_prev_keypoints, ball_track_ids, ball_track_missing_counts, next_ball_track_id = track_balls_sports2d(
+                            frame_ball_boxes,
+                            ball_prev_keypoints,
+                            ball_track_ids,
+                            ball_track_missing_counts,
+                            next_ball_track_id,
+                            ball_scores=frame_ball_scores,
+                            max_dist=ball_tracking_max_distance,
+                            max_missing_frames=ball_track_max_missing_frames,
+                        )
+                        ball_track_stats_by_id = _update_ball_track_stats(
+                            ball_track_stats_by_id,
+                            frame_ball_tracks,
+                            frame_index=frame_nb,
+                        )
+                        active_ball_track_ids = [int(track.get('id')) for track in frame_ball_tracks if 'id' in track]
+                        if ball_selection_mode == 'auto':
+                            if (
+                                ball_ordering_method == 'highest_likelihood'
+                                and len(active_ball_track_ids) > 0
+                                and not ball_warned_missing_likelihood
+                                and not _has_ball_confidence_stats(active_ball_track_ids, ball_track_stats_by_id)
+                            ):
+                                logging.warning(
+                                    "ball_ordering_method='highest_likelihood' requested but detector confidence "
+                                    "is unavailable. Falling back to 'first_detected' behavior."
+                                )
+                                ball_warned_missing_likelihood = True
+                        frame_selected_ball_id, selected_center = select_ball_track_id(
+                            frame_ball_tracks,
+                            selection_mode=ball_selection_mode,
+                            requested_track_id=ball_selected_id,
+                            previous_selected_id=ball_selected_track_id,
+                            previous_selected_center=ball_previous_center,
+                            ordering_method=ball_ordering_method,
+                            track_stats_by_id=ball_track_stats_by_id,
+                        )
+
+                        frame_ball_center = selected_center
+                        if frame_ball_center is not None:
+                            gate_reference = ball_previous_center if frame_selected_ball_id == previous_selected_track_id else None
+                            if gate_reference is not None and ball_max_jump_px is not None:
+                                jump_dist = float(np.hypot(
+                                    frame_ball_center[0] - gate_reference[0],
+                                    frame_ball_center[1] - gate_reference[1],
+                                ))
+                                if jump_dist > float(ball_max_jump_px):
+                                    frame_ball_center = None
+
+                        if frame_selected_ball_id is None:
+                            ball_previous_center = None
+                        elif frame_ball_center is not None:
+                            ball_previous_center = frame_ball_center
+                            selected_trail = ball_trail_points_by_id.get(frame_selected_ball_id, [])
+                            selected_trail.append(tuple(frame_ball_center))
+                            if len(selected_trail) > ball_trail_length:
+                                selected_trail = selected_trail[-ball_trail_length:]
+                            ball_trail_points_by_id[frame_selected_ball_id] = selected_trail
+
+                        ball_selected_track_id = frame_selected_ball_id
+                        ball_previous_velocity = None
+                    else:
+                        ball_candidates = extract_ball_centers({'ball_boxes': frame_ball_boxes})
+                        frame_ball_center = select_ball_center(
+                            ball_candidates,
+                            previous_center=ball_previous_center,
+                            max_jump_px=ball_max_jump_px,
+                            previous_velocity=ball_previous_velocity,
+                        )
+                        if frame_ball_center is not None:
+                            if ball_previous_center is not None:
+                                frame_velocity = (
+                                    float(frame_ball_center[0] - ball_previous_center[0]),
+                                    float(frame_ball_center[1] - ball_previous_center[1]),
+                                )
+                                if ball_previous_velocity is None:
+                                    ball_previous_velocity = frame_velocity
+                                else:
+                                    smoothing = 0.75
+                                    ball_previous_velocity = (
+                                        smoothing * float(ball_previous_velocity[0]) + (1.0 - smoothing) * frame_velocity[0],
+                                        smoothing * float(ball_previous_velocity[1]) + (1.0 - smoothing) * frame_velocity[1],
+                                    )
+                            else:
+                                ball_previous_velocity = (0.0, 0.0)
+                            ball_previous_center = frame_ball_center
+                            ball_trail_points.append(frame_ball_center)
+                            if len(ball_trail_points) > ball_trail_length:
+                                ball_trail_points = ball_trail_points[-ball_trail_length:]
+                        elif ball_previous_velocity is not None:
+                            ball_previous_velocity = (
+                                0.6 * float(ball_previous_velocity[0]),
+                                0.6 * float(ball_previous_velocity[1]),
+                            )
             
             # Process coordinates and compute angles
             valid_X, valid_Y, valid_scores = [], [], []
@@ -2269,9 +3188,32 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                                 keypoint_names=kpt_names_for_draw, backend_name=backend_name, thickness=thickness)
                 if calculate_angles:
                     img = draw_angles(img, valid_X, valid_Y, valid_angles_flipped, valid_X_flipped, new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
+                if ball_overlay_enabled:
+                    selected_trail_points = ball_trail_points
+                    if ball_multi_id_tracking:
+                        selected_trail_points = ball_trail_points_by_id.get(frame_selected_ball_id, [])
+                    img = draw_ball_overlay(
+                        img,
+                        frame_ball_boxes,
+                        frame_ball_center,
+                        selected_trail_points,
+                        color=ball_color,
+                        radius=ball_radius,
+                        trail_alpha=ball_trail_alpha,
+                        tracked_balls=frame_ball_tracks if ball_multi_id_tracking else None,
+                        selected_track_id=frame_selected_ball_id if ball_multi_id_tracking else None,
+                        show_ids=ball_show_ids and ball_multi_id_tracking,
+                    )
 
                 frame_elapsed = max((datetime.now() - start_time).total_seconds(), 1e-6)
                 detected_persons = int(sum(0 if np.isnan(np.asarray(person)).all() else 1 for person in valid_X))
+                if ball_overlay_enabled:
+                    if ball_multi_id_tracking:
+                        detected_balls = int(sum(1 for t in frame_ball_tracks if t.get('visible', False)))
+                    else:
+                        detected_balls = int(len(frame_ball_boxes))
+                else:
+                    detected_balls = 0
 
                 realtime_display.render(
                     img,
@@ -2280,6 +3222,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         'ui_fps': 1.0 / frame_elapsed,
                         'inference_ms': frame_elapsed * 1000.0,
                         'detected_persons': detected_persons,
+                        'detected_balls': detected_balls,
                         'dropped_frames': dropped_frames,
                         'model': pose_model_name,
                         'backend': display_runtime_backend,
@@ -2308,6 +3251,27 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             all_frames_X_flipped.append(np.array(valid_X_flipped))
             all_frames_Y.append(np.array(valid_Y))
             all_frames_scores.append(np.array(valid_scores))
+            all_frames_ball_centers.append(frame_ball_center)
+            all_frames_ball_boxes.append(frame_ball_boxes.copy())
+            frame_ball_tracks_snapshot = []
+            for track in frame_ball_tracks:
+                frame_ball_tracks_snapshot.append({
+                    'id': int(track.get('id')),
+                    'center': tuple(track.get('center')) if track.get('center') is not None else None,
+                    'box': (
+                        np.asarray(track.get('box'), dtype=np.float32).copy()
+                        if track.get('box') is not None else None
+                    ),
+                    'score': (
+                        float(track.get('score'))
+                        if track.get('score') is not None and np.isfinite(float(track.get('score')))
+                        else float('nan')
+                    ),
+                    'visible': bool(track.get('visible', False)),
+                    'missing': int(track.get('missing', 0)),
+                })
+            all_frames_ball_tracks.append(frame_ball_tracks_snapshot)
+            all_frames_selected_ball_ids.append(frame_selected_ball_id)
             
             if save_angles and calculate_angles:
                 all_frames_angles.append(np.array(valid_angles))
@@ -2385,6 +3349,36 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         else:
             raise ValueError(f"Invalid person_ordering_method: {person_ordering_method}. Must be 'on_click', 'highest_likelihood', 'greatest_displacement', 'first_detected', or 'last_detected'.")
         logging.info(f'Reordered persons: IDs of persons {selected_persons} become {list(range(len(selected_persons)))}.')
+
+    if (
+        ball_multi_id_tracking
+        and ball_selection_mode == 'auto'
+        and ball_ordering_method == 'on_click'
+    ):
+        selected_ball_ids = get_ball_trackIDs_on_click(
+            video_file_path,
+            frame_range,
+            all_frames_ball_tracks,
+        )
+        if len(selected_ball_ids) == 0:
+            logging.warning(
+                "No ball selected in on_click UI. Keeping automatic ball selection results."
+            )
+        else:
+            selected_ball_track_id = int(selected_ball_ids[0])
+            logging.info("Selected ball track on_click: ball %s", selected_ball_track_id)
+            for frame_idx, frame_tracks in enumerate(all_frames_ball_tracks):
+                all_frames_selected_ball_ids[frame_idx] = selected_ball_track_id
+                selected_center = None
+                for track in frame_tracks:
+                    if int(track.get('id', -1)) != selected_ball_track_id:
+                        continue
+                    if not track.get('visible', False):
+                        break
+                    center = track.get('center')
+                    selected_center = tuple(center) if center is not None else None
+                    break
+                all_frames_ball_centers[frame_idx] = selected_center
     
 
     #%% ==================================================
@@ -2855,8 +3849,12 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     if save_vid or save_img:
         logging.info('\nSaving images of processed pose and angles:')
         if save_vid:
+            if vid_output_tmp_path.exists():
+                vid_output_tmp_path.unlink()
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out_vid = cv2.VideoWriter(str(vid_output_path.absolute()), fourcc, fps, (cam_width, cam_height))
+            out_vid = cv2.VideoWriter(str(vid_output_tmp_path.absolute()), fourcc, fps, (cam_width, cam_height))
+            if not out_vid.isOpened():
+                raise ValueError(f"Failed to open temporary video writer at {vid_output_tmp_path}.")
         
         # Reorder persons
         all_frames_X_processed, all_frames_Y_processed = all_frames_X_processed[:,selected_persons,:], all_frames_Y_processed[:,selected_persons,:]
@@ -2883,6 +3881,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         first_frame = frame_range[0]
         first_trim = 0
         last_trim = all_frames_X_processed.shape[0]
+        ball_replay_trail = []
+        ball_replay_trails_by_id = {}
         cap = cv2.VideoCapture(video_file_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame+first_trim)
         for i in range(first_trim, last_trim):
@@ -2898,6 +3898,44 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             backend_name=backend_name, thickness=thickness)
             if calculate_angles:
                 img = draw_angles(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_angles_processed[i], all_frames_X_flipped_processed[i], new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
+            if ball_overlay_enabled and i < len(all_frames_ball_centers):
+                frame_ball_center = all_frames_ball_centers[i]
+                frame_ball_boxes = all_frames_ball_boxes[i] if i < len(all_frames_ball_boxes) else np.empty((0, 4), dtype=np.float32)
+                frame_ball_tracks = all_frames_ball_tracks[i] if i < len(all_frames_ball_tracks) else []
+                frame_selected_ball_id = all_frames_selected_ball_ids[i] if i < len(all_frames_selected_ball_ids) else None
+                if ball_multi_id_tracking:
+                    selected_center = None
+                    if frame_selected_ball_id is not None:
+                        for track in frame_ball_tracks:
+                            if int(track.get('id')) == int(frame_selected_ball_id) and track.get('visible', False):
+                                selected_center = tuple(track.get('center')) if track.get('center') is not None else None
+                                break
+                    frame_ball_center = selected_center
+                    if frame_selected_ball_id is not None and selected_center is not None:
+                        replay_trail = ball_replay_trails_by_id.get(frame_selected_ball_id, [])
+                        replay_trail.append(selected_center)
+                        if len(replay_trail) > ball_trail_length:
+                            replay_trail = replay_trail[-ball_trail_length:]
+                        ball_replay_trails_by_id[frame_selected_ball_id] = replay_trail
+                    draw_trail = ball_replay_trails_by_id.get(frame_selected_ball_id, [])
+                else:
+                    if frame_ball_center is not None:
+                        ball_replay_trail.append(tuple(frame_ball_center))
+                        if len(ball_replay_trail) > ball_trail_length:
+                            ball_replay_trail = ball_replay_trail[-ball_trail_length:]
+                    draw_trail = ball_replay_trail
+                img = draw_ball_overlay(
+                    img,
+                    frame_ball_boxes,
+                    frame_ball_center,
+                    draw_trail,
+                    color=ball_color,
+                    radius=ball_radius,
+                    trail_alpha=ball_trail_alpha,
+                    tracked_balls=frame_ball_tracks if ball_multi_id_tracking else None,
+                    selected_track_id=frame_selected_ball_id if ball_multi_id_tracking else None,
+                    show_ids=ball_show_ids and ball_multi_id_tracking,
+                )
 
             # Save video or images
             if save_vid:
@@ -2908,11 +3946,47 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
         if save_vid:
             out_vid.release()
+            final_fps = None
             if video_file == 'webcam':
-                actual_framerate = len(frame_processing_times) / sum(frame_processing_times)
-                logging.info(f"Rewriting webcam video based on the averate framerate {actual_framerate}.")
-                resample_video(vid_output_path, fps, actual_framerate)
-                fps = actual_framerate
+                total_processing_time = sum(frame_processing_times)
+                if total_processing_time > 0:
+                    final_fps = len(frame_processing_times) / total_processing_time
+                    logging.info(
+                        "Rewriting webcam processed video with average framerate %.3f fps.",
+                        final_fps,
+                    )
+                else:
+                    logging.warning(
+                        "Could not compute webcam average framerate (no timing samples). "
+                        "Keeping the original writer framerate %.3f fps.",
+                        fps,
+                    )
+
+            try:
+                if video_codec == 'h264' or final_fps is not None:
+                    transcode_video_ffmpeg(
+                        vid_output_tmp_path,
+                        vid_output_path,
+                        codec=video_codec,
+                        source_fps=fps if final_fps is not None else None,
+                        desired_framerate=final_fps,
+                    )
+                    if vid_output_tmp_path.exists():
+                        vid_output_tmp_path.unlink()
+                else:
+                    if vid_output_path.exists():
+                        vid_output_path.unlink()
+                    vid_output_tmp_path.rename(vid_output_path)
+            except Exception as e:
+                logging.error(
+                    "Failed to finalize processed video with codec '%s': %s",
+                    video_codec,
+                    e,
+                )
+                raise
+
+            if final_fps is not None:
+                fps = final_fps
             logging.info(f"Processed video saved to {vid_output_path.resolve()}.")
         if save_img:
             logging.info(f"Processed images saved to {img_output_dir.resolve()}.")

@@ -133,50 +133,80 @@ class PoseBackend(ABC):
         return {}
 
 
-class _RTMLibMultiClassTracker:
+class _RTMLibBallAwareTracker:
     """
-    Internal RTMLib tracker that keeps person+ball detector outputs.
+    Wrapper tracker that preserves standard RTMLib person pose behavior and
+    runs a separate COCO detector for optional ball metadata.
+    """
 
-    It runs one multiclass detector pass, routes only person bboxes to pose
-    estimation, and stores ball bboxes in `last_detections`.
-    """
+    MODE_TO_COCO_SIZE = {
+        'performance': 'x',
+        'balanced': 'm',
+        'lightweight': 's',
+    }
+
+    COCO_YOLOX_MODELS = {
+        's': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx',
+        'm': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_m.onnx',
+        'l': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_l.onnx',
+        'x': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_x.onnx',
+    }
 
     def __init__(
         self,
-        model_class,
+        pose_tracker,
         mode: str,
         det_frequency: int,
         backend: str,
         device: str,
         num_keypoints: int,
         ball_class_ids: Optional[Sequence[int]] = None,
+        ball_detection_threshold: float = 0.1,
+        ball_nms_score_threshold: float = 0.2,
     ):
+        from rtmlib import YOLOX
+
+        self._pose_tracker = pose_tracker
         self._num_keypoints = int(num_keypoints)
         self._det_frequency = max(1, int(det_frequency))
-        self._person_class_id = PERSON_CLASS_ID
-        self._ball_class_ids = set(ball_class_ids or [SPORTS_BALL_CLASS_ID])
         self._frame_count = 0
-        self._cached_person_boxes = np.empty((0, 4), dtype=np.float32)
-        self.last_detections: Dict[str, np.ndarray] = {}
+        self._ball_class_ids = set(ball_class_ids or [SPORTS_BALL_CLASS_ID])
+        self.last_detections: Dict[str, np.ndarray] = self._empty_detections()
 
-        solution = model_class(
-            mode=mode,
-            to_openpose=False,
-            backend=backend,
-            device=device,
+        requested_size = self.MODE_TO_COCO_SIZE.get(str(mode).lower(), 'm')
+        detector_url = self.COCO_YOLOX_MODELS.get(requested_size, self.COCO_YOLOX_MODELS['m'])
+        detector_backend = backend if backend != 'auto' else 'onnxruntime'
+        detector_device = 'cuda' if device == 'cuda' else 'cpu'
+
+        self._ball_detector = YOLOX(
+            onnx_model=detector_url,
+            model_input_size=(640, 640),
+            mode='multiclass',
+            nms_thr=float(np.clip(ball_nms_score_threshold, 0.01, 0.9)),
+            score_thr=float(np.clip(ball_detection_threshold, 0.01, 0.9)),
+            backend=detector_backend,
+            device=detector_device,
+        )
+        logging.info(
+            'RTMLib ball detector initialized (weights=coco/%s, backend=%s, device=%s, '
+            'score_thr=%s, nms_thr=%s)',
+            requested_size,
+            detector_backend,
+            detector_device,
+            float(np.clip(ball_detection_threshold, 0.01, 0.9)),
+            float(np.clip(ball_nms_score_threshold, 0.01, 0.9)),
         )
 
-        if not hasattr(solution, 'det_model') or not hasattr(solution, 'pose_model'):
-            raise ValueError(
-                "RTMLib multiclass mode requires a top-down detector + pose model."
-            )
-
-        self._det_model = solution.det_model
-        self._pose_model = solution.pose_model
-
-        if not hasattr(self._det_model, 'mode'):
-            raise ValueError("RTMLib detector does not expose `mode` for multiclass.")
-        self._det_model.mode = 'multiclass'
+    @staticmethod
+    def _empty_detections() -> Dict[str, np.ndarray]:
+        return {
+            'boxes': np.empty((0, 4), dtype=np.float32),
+            'classes': np.empty((0,), dtype=np.int32),
+            'scores': np.empty((0,), dtype=np.float32),
+            'person_boxes': np.empty((0, 4), dtype=np.float32),
+            'ball_boxes': np.empty((0, 4), dtype=np.float32),
+            'ball_scores': np.empty((0,), dtype=np.float32),
+        }
 
     @staticmethod
     def _ensure_xyxy(boxes) -> np.ndarray:
@@ -191,80 +221,101 @@ class _RTMLibMultiClassTracker:
             return np.empty((0, 4), dtype=np.float32)
         return boxes[:, :4].astype(np.float32, copy=False)
 
-    def _empty_pose_outputs(self):
-        return (
-            np.empty((0, self._num_keypoints, 2), dtype=np.float32),
-            np.empty((0, self._num_keypoints), dtype=np.float32),
-        )
-
-    def _update_detections(self, frame: np.ndarray) -> np.ndarray:
-        try:
-            det_outputs = self._det_model(frame)
-        except Exception:
-            self.last_detections = {
-                'boxes': np.empty((0, 4), dtype=np.float32),
-                'classes': np.empty((0,), dtype=np.int32),
-                'person_boxes': np.empty((0, 4), dtype=np.float32),
-                'ball_boxes': np.empty((0, 4), dtype=np.float32),
-            }
+    @staticmethod
+    def _person_boxes_from_keypoints(keypoints) -> np.ndarray:
+        kpts = np.asarray(keypoints)
+        if kpts.size == 0 or kpts.ndim != 3 or kpts.shape[-1] < 2:
             return np.empty((0, 4), dtype=np.float32)
+        person_boxes = []
+        for person_kpts in kpts:
+            valid = ~np.isnan(person_kpts[:, 0]) & ~np.isnan(person_kpts[:, 1])
+            if not np.any(valid):
+                continue
+            xs = person_kpts[valid, 0]
+            ys = person_kpts[valid, 1]
+            person_boxes.append([np.min(xs), np.min(ys), np.max(xs), np.max(ys)])
+        if not person_boxes:
+            return np.empty((0, 4), dtype=np.float32)
+        return np.asarray(person_boxes, dtype=np.float32)
 
-        if isinstance(det_outputs, tuple) and len(det_outputs) >= 2:
-            boxes = self._ensure_xyxy(det_outputs[0])
-            classes = np.asarray(det_outputs[1], dtype=np.int32).reshape(-1)
+    def _run_ball_detection(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        run_detection = (
+            self._frame_count % self._det_frequency == 0
+            or self._frame_count == 0
+        )
+        if not run_detection:
+            return (
+                np.empty((0, 4), dtype=np.float32),
+                np.empty((0,), dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+
+        try:
+            detector_outputs = self._ball_detector(frame)
+        except Exception as e:
+            logging.debug('RTMLib ball detector failed on frame %s: %s', self._frame_count, e)
+            return (
+                np.empty((0, 4), dtype=np.float32),
+                np.empty((0,), dtype=np.int32),
+                np.empty((0,), dtype=np.float32),
+            )
+
+        if isinstance(detector_outputs, tuple) and len(detector_outputs) >= 2:
+            raw_boxes = np.asarray(detector_outputs[0], dtype=np.float32)
+            boxes = self._ensure_xyxy(raw_boxes)
+            classes = np.asarray(detector_outputs[1], dtype=np.int32).reshape(-1)
+            if len(detector_outputs) >= 3:
+                scores = np.asarray(detector_outputs[2], dtype=np.float32).reshape(-1)
+            elif raw_boxes.ndim == 2 and raw_boxes.shape[1] >= 5:
+                scores = raw_boxes[:, 4].astype(np.float32, copy=False)
+            else:
+                scores = np.full((len(boxes),), np.nan, dtype=np.float32)
         else:
-            boxes = self._ensure_xyxy(det_outputs)
-            classes = np.full((len(boxes),), self._person_class_id, dtype=np.int32)
+            raw_boxes = np.asarray(detector_outputs, dtype=np.float32)
+            boxes = self._ensure_xyxy(raw_boxes)
+            classes = np.empty((0,), dtype=np.int32)
+            if raw_boxes.ndim == 2 and raw_boxes.shape[1] >= 5:
+                scores = raw_boxes[:, 4].astype(np.float32, copy=False)
+            else:
+                scores = np.full((len(boxes),), np.nan, dtype=np.float32)
 
         if len(classes) != len(boxes):
-            classes = np.full((len(boxes),), self._person_class_id, dtype=np.int32)
+            classes = np.empty((0,), dtype=np.int32)
+            boxes = np.empty((0, 4), dtype=np.float32)
+            scores = np.empty((0,), dtype=np.float32)
+        if len(scores) != len(boxes):
+            scores = np.full((len(boxes),), np.nan, dtype=np.float32)
+        return boxes, classes, scores
 
-        person_mask = classes == self._person_class_id
-        ball_mask = np.isin(classes, list(self._ball_class_ids))
-        person_boxes = boxes[person_mask]
-        ball_boxes = boxes[ball_mask]
+    def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        keypoints, scores = self._pose_tracker(frame)
+        person_boxes = self._person_boxes_from_keypoints(keypoints)
+        boxes, classes, det_scores = self._run_ball_detection(frame)
+
+        if len(classes) > 0 and len(boxes) > 0:
+            ball_mask = np.isin(classes, list(self._ball_class_ids))
+            ball_boxes = boxes[ball_mask]
+            ball_scores = det_scores[ball_mask] if len(det_scores) == len(boxes) else np.full((len(ball_boxes),), np.nan, dtype=np.float32)
+        else:
+            ball_boxes = np.empty((0, 4), dtype=np.float32)
+            ball_scores = np.empty((0,), dtype=np.float32)
 
         self.last_detections = {
             'boxes': boxes,
             'classes': classes,
+            'scores': det_scores,
             'person_boxes': person_boxes,
             'ball_boxes': ball_boxes,
+            'ball_scores': ball_scores,
         }
-        return person_boxes
-
-    def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        run_detection = (
-            self._frame_count % self._det_frequency == 0
-            or len(self._cached_person_boxes) == 0
-        )
-
-        if run_detection:
-            person_boxes = self._update_detections(frame)
-            self._cached_person_boxes = person_boxes
-        else:
-            person_boxes = self._cached_person_boxes
-            self.last_detections = {
-                'boxes': np.empty((0, 4), dtype=np.float32),
-                'classes': np.empty((0,), dtype=np.int32),
-                'person_boxes': person_boxes,
-                'ball_boxes': np.empty((0, 4), dtype=np.float32),
-            }
-
         self._frame_count += 1
-
-        if len(person_boxes) == 0:
-            return self._empty_pose_outputs()
-
-        try:
-            keypoints, scores = self._pose_model(frame, bboxes=person_boxes)
-            return keypoints, scores
-        except Exception:
-            return self._empty_pose_outputs()
+        return keypoints, scores
 
     def reset(self) -> None:
         self._frame_count = 0
-        self._cached_person_boxes = np.empty((0, 4), dtype=np.float32)
-        self.last_detections = {}
+        if hasattr(self._pose_tracker, 'reset'):
+            self._pose_tracker.reset()
+        self.last_detections = self._empty_detections()
 
 
 class RTMLibBackend(PoseBackend):
@@ -320,6 +371,14 @@ class RTMLibBackend(PoseBackend):
         det_frequency = pose_config.get('det_frequency', 4)
         detect_ball = bool(pose_config.get('detect_ball', False))
         ball_class_ids = pose_config.get('ball_class_ids', [SPORTS_BALL_CLASS_ID])
+        ball_detection_threshold = pose_config.get(
+            'ball_detection_threshold',
+            0.1,
+        )
+        ball_nms_score_threshold = pose_config.get(
+            'ball_nms_score_threshold',
+            0.2,
+        )
         if isinstance(ball_class_ids, int):
             ball_class_ids = [ball_class_ids]
         elif isinstance(ball_class_ids, (list, tuple, set)):
@@ -353,19 +412,22 @@ class RTMLibBackend(PoseBackend):
 
         if detect_ball:
             try:
-                self._tracker = _RTMLibMultiClassTracker(
-                    model_class=self._ModelClass,
+                default_tracker = _init_default_tracker()
+                self._tracker = _RTMLibBallAwareTracker(
+                    pose_tracker=default_tracker,
                     mode=self._mode,
                     det_frequency=det_frequency,
                     backend=self._backend,
                     device=self._device,
                     num_keypoints=self._num_keypoints,
                     ball_class_ids=ball_class_ids,
+                    ball_detection_threshold=ball_detection_threshold,
+                    ball_nms_score_threshold=ball_nms_score_threshold,
                 )
                 self._supports_ball_detection = True
             except Exception as e:
                 logging.warning(
-                    f'Ball detection requested but multiclass tracker init failed: {e}. '
+                    f'Ball detection requested but ball-aware tracker init failed: {e}. '
                     'Falling back to standard RTMLib tracker.'
                 )
                 self._tracker = _init_default_tracker()
@@ -563,6 +625,7 @@ class SynthPoseBackend(PoseBackend):
             'person_detection_threshold',
             pose_config.get('keypoint_likelihood_threshold', 0.3),
         )
+        ball_detection_threshold = pose_config.get('ball_detection_threshold', 0.1)
 
         # Initialize tracker
         self._tracker = SynthPosePoseTracker(
@@ -573,6 +636,7 @@ class SynthPoseBackend(PoseBackend):
             detector=pose_config.get('synthpose_detector', 'yolox'),
             detect_ball=bool(pose_config.get('detect_ball', False)),
             ball_class_ids=pose_config.get('ball_class_ids', [SPORTS_BALL_CLASS_ID]),
+            ball_detection_threshold=ball_detection_threshold,
             # Detector size is controlled by mode parameter.
             detector_size=detector_mode,
             ball_nms_score_threshold=pose_config.get('ball_nms_score_threshold', 0.2),

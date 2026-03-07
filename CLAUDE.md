@@ -176,6 +176,11 @@ keypoints, scores = backend(frame)
 | `mode` | Model quality (lightweight/balanced/performance) | VitPose selection: performance→huge, balanced→base, lightweight→base+warning |
 | `synthpose_detector` | **Ignored** | Person detector (yolox/rtdetr/rtdetrv4) |
 
+**Ball Detection (`detect_ball=true`)**:
+- Shared option: `ball_detection_threshold` controls confidence cutoff for sports-ball candidates (default `0.1`).
+- RTMLib backend keeps person pose detection unchanged and runs a separate COCO multiclass detector for ball metadata.
+- SynthPose backend applies separate thresholds for person vs ball filtering in YOLOX/RT-DETR/RT-DETRv4 paths.
+
 ## Key Implementation Details
 
 ### Person Tracking

@@ -212,14 +212,109 @@ def get_start_time_ffmpeg(video_path):
     return 0.0  # Default to 0 if not found
 
 
+def _normalize_video_codec(codec, default='mp4v'):
+    '''
+    Normalize user-facing codec aliases to internal values.
+    '''
+
+    normalized = str(default if codec is None else codec).strip().lower()
+    aliases = {
+        'h264': 'h264',
+        'h.264': 'h264',
+        'avc1': 'h264',
+        'mp4v': 'mp4v',
+        'mpeg4': 'mp4v',
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in ['h264', 'mp4v']:
+        raise ValueError(f"Unsupported video codec '{codec}'. Expected one of: h264, mp4v.")
+    return normalized
+
+
+def transcode_video_ffmpeg(input_video_path, output_video_path, codec='h264',
+                           source_fps=None, desired_framerate=None):
+    '''
+    Transcode a video with ffmpeg and optional framerate correction.
+
+    INPUTS:
+    - input_video_path: path-like
+    - output_video_path: path-like
+    - codec: 'h264' or 'mp4v'
+    - source_fps: source fps used to compute setpts when desired_framerate is provided
+    - desired_framerate: target fps. If None, fps is preserved.
+    '''
+
+    input_video_path = Path(input_video_path)
+    output_video_path = Path(output_video_path)
+    codec = _normalize_video_codec(codec)
+
+    try:
+        ffmpeg_path = ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        raise RuntimeError(f"No ffmpeg executable could be found: {e}")
+
+    cmd = [ffmpeg_path, '-i', str(input_video_path)]
+    if desired_framerate is not None:
+        try:
+            desired_framerate = float(desired_framerate)
+        except Exception:
+            raise ValueError(f"Invalid desired_framerate '{desired_framerate}'.")
+        if desired_framerate <= 0:
+            raise ValueError(f"desired_framerate must be > 0, got {desired_framerate}.")
+
+        if source_fps is not None:
+            try:
+                source_fps = float(source_fps)
+            except Exception:
+                source_fps = None
+            if source_fps is not None and source_fps > 0 and not np.isclose(source_fps, desired_framerate):
+                cmd.extend(['-filter:v', f'setpts={source_fps/desired_framerate}*PTS'])
+        cmd.extend(['-r', f'{desired_framerate:.6f}'])
+
+    if codec == 'h264':
+        cmd.extend([
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-y',
+            str(output_video_path),
+        ])
+    else:
+        cmd.extend(['-c:v', 'mpeg4', '-movflags', '+faststart', '-y', str(output_video_path)])
+
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr_tail = (e.stderr or '').strip().splitlines()[-10:]
+        stderr_msg = '\n'.join(stderr_tail) if stderr_tail else str(e)
+        raise RuntimeError(
+            f"ffmpeg transcode failed for '{input_video_path}' -> '{output_video_path}' "
+            f"with codec '{codec}':\n{stderr_msg}"
+        )
+
+
 def resample_video(vid_output_path, fps, desired_framerate):
     '''
     Resample video to the desired fps using ffmpeg.
     '''
-   
-    ffmpeg_path = ffmpeg.get_ffmpeg_exe()
+
     new_vid_path = vid_output_path.parent / Path(vid_output_path.stem+'_2'+vid_output_path.suffix)
-    subprocess.run([ffmpeg_path, '-i', vid_output_path, '-filter:v', f'setpts={fps/desired_framerate}*PTS', '-r', str(desired_framerate), new_vid_path])
+    transcode_video_ffmpeg(
+        vid_output_path,
+        new_vid_path,
+        codec='mp4v',
+        source_fps=fps,
+        desired_framerate=desired_framerate,
+    )
     vid_output_path.unlink()
     new_vid_path.rename(vid_output_path)
 

@@ -12,7 +12,7 @@
 
 
 [base]
-video_input = 'ball'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
+video_input = 'webcam'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
@@ -32,13 +32,14 @@ time_range = []   # [] for the whole video, or [start_time, end_time] (in second
 video_dir = ''    # If empty, video dir is current dir
 
 # Webcam parameters
-webcam_id = 0 # your webcam id (0 is default)
+webcam_id = 1 # your webcam id (0 is default)
 input_size = [1920, 1080] # [W, H]. Lower resolution will be faster but less precise.
 
 show_realtime_results = true
 realtime_ui_backend = 'qt' # 'opencv' or 'qt' (requires pip install sports2d[ui])
 realtime_window_title = 'UmFit realtime'
 save_vid = true
+video_codec = 'h264'  # 'mp4v' (default, faster/compatible) or 'h264' (better compression)
 save_img = false
 save_pose = true
 calculate_angles = true
@@ -72,7 +73,7 @@ slowmo_factor = 1       # 1 for normal speed. For a video recorded at 240 fps an
 ##   Note: SynthPose outputs 52 anatomical keypoints including HALPE_26 + additional markers.
 ##   Models are automatically downloaded from HuggingFace on first use (~2GB).
 ##
-pose_model = 'body_with_feet'
+pose_model = 'whole_body'
 
 ## ============================================================
 ## SynthPose Person Detector Selection
@@ -113,7 +114,7 @@ synthpose_model_size = 'huge'
 ##   - If pose_model='synthpose_base' is set explicitly and synthpose_model_size is empty,
 ##     mode still controls detector scale while VitPose stays base.
 ##
-mode = 'performance'
+mode = 'balanced'
 
 # A dictionary (WITHIN THREE DOUBLE QUOTES) allows you to manually select the person detection (if top_down approach) and/or pose estimation models (see https://github.com/Tau-J/rtmlib). 
 # Models can be local paths or URLs.
@@ -177,9 +178,17 @@ max_distance = 250  # in px or None # If a person is detected further than max_d
 detect_ball = false
 ball_trail_length = 20     # Number of recent frames shown in the trajectory
 ball_trail_alpha = 0.35     # Transparency in [0,1]
-ball_radius = 4             # Ball center marker radius (px)
+ball_radius = 6             # Ball center marker radius (px)
 ball_max_jump_px = 'none'      # Reject detections that jump too far between frames; use 'none' to disable
-ball_nms_score_threshold = 0.1  # Lower = higher recall (can add false positives)
+ball_detection_threshold = 0.3 # Ball detector confidence threshold
+ball_nms_score_threshold = 0.3  # Lower = higher recall (can add false positives)
+ball_tracking_mode = 'sports2d' # Ball ID association method. Currently sports2d is supported
+ball_ordering_method = 'highest_likelihood' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
+ball_selection_mode = 'auto'    # 'auto' to follow active track, 'id' to force a specific track ID
+ball_selected_id = -1           # Used only when ball_selection_mode='id'. Set >=0 for fixed selection
+ball_tracking_max_distance = 1000 # Max px distance for frame-to-frame ID association. 'none' disables gating
+ball_track_max_missing_frames = 60 # Keep missing tracks for N frames before removing
+ball_show_ids = true            # Draw 'ball {id}' labels on ball boxes
 ball_color = [0, 0, 0]      # BGR (OpenCV), default black
 
 
@@ -205,7 +214,7 @@ calib_file = ''      # Calibration file in the Pose2Sim toml format, or '' if no
 
 
 [angles]
-display_angle_values_on = ['body', 'list'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
+display_angle_values_on = 'body' # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
 fontSize = 0.8
 
 # Select joint angles among
