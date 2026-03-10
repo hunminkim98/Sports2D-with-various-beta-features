@@ -490,7 +490,7 @@ class SynthPoseBackend(PoseBackend):
     This backend provides:
     - PyTorch-based inference (GPU-accelerated)
     - 52 keypoints (17 COCO + 35 anatomical markers)
-    - Multiple detector options (yolox, rtdetr, rtdetrv4)
+    - Multiple detector options (yolox, rtdetr, rtdetrv4, sam3)
 
     Model Selection:
         SynthPose supports RTMLib-compatible 'mode' parameter for model selection:
@@ -548,7 +548,15 @@ class SynthPoseBackend(PoseBackend):
                 - device: Device selection ('auto', 'cuda', 'cpu', 'mps')
                 - det_frequency: Detection frequency (every N frames)
                 - keypoint_likelihood_threshold: Confidence threshold
-                - synthpose_detector: Detector type ('yolox', 'rtdetr', 'rtdetrv4')
+                - synthpose_detector: Detector type ('yolox', 'rtdetr', 'rtdetrv4', 'sam3')
+                - sam3_target: SAM3 prompt preset ('ball' or 'broad_jump')
+                - sam3_model_path: Local raw .pt checkpoint or HF id/directory for SAM3
+                - sam3_processor_path: Optional processor path for HF SAM3 bundles
+                - sam3_runtime: SAM3 runtime backend ('transformers', 'meta', or auto-switched)
+                - sam3_show_realtime_masks: Draw SAM3 masks in live preview
+                - sam3_realtime_mask_alpha: Live preview SAM3 mask opacity
+                - ball_detector_backend: 'same' or 'sam3' for hybrid ball detection
+                - save_vid/save_img + detect_ball: Persist SAM3 ball masks for export rendering
 
         Raises:
             ImportError: If torch/transformers not installed
@@ -626,6 +634,10 @@ class SynthPoseBackend(PoseBackend):
             pose_config.get('keypoint_likelihood_threshold', 0.3),
         )
         ball_detection_threshold = pose_config.get('ball_detection_threshold', 0.1)
+        export_sam3_ball_masks = bool(
+            (config_dict.get('base', {}).get('save_vid', False) or config_dict.get('base', {}).get('save_img', False))
+            and pose_config.get('detect_ball', False)
+        )
 
         # Initialize tracker
         self._tracker = SynthPosePoseTracker(
@@ -640,6 +652,14 @@ class SynthPoseBackend(PoseBackend):
             # Detector size is controlled by mode parameter.
             detector_size=detector_mode,
             ball_nms_score_threshold=pose_config.get('ball_nms_score_threshold', 0.2),
+            sam3_target=pose_config.get('sam3_target', 'ball'),
+            sam3_model_path=pose_config.get('sam3_model_path', ''),
+            sam3_processor_path=pose_config.get('sam3_processor_path', ''),
+            sam3_runtime=pose_config.get('sam3_runtime', 'transformers'),
+            sam3_store_masks=bool(pose_config.get('sam3_store_masks', False)),
+            sam3_show_realtime_masks=bool(pose_config.get('sam3_show_realtime_masks', False)),
+            sam3_save_ball_masks=export_sam3_ball_masks,
+            ball_detector_backend=pose_config.get('ball_detector_backend', 'same'),
         )
 
         # Store skeleton tree and keypoint names
@@ -739,8 +759,26 @@ def create_pose_backend(config_dict: dict) -> PoseBackend:
         try:
             return SynthPoseBackend(config_dict)
         except ImportError as e:
+            message = str(e)
+            if message.startswith('Raw SAM3 checkpoints (.pt/.pth) require'):
+                raise ImportError(
+                    f"SynthPose requires additional dependencies: {message}\n"
+                    "Raw SAM3 checkpoint mode is separate from sports2d[synthpose].\n"
+                    "Install the official Meta sam3 package in the same environment,\n"
+                    "or switch to sam3_runtime='transformers' with a Hugging Face SAM3 bundle.\n"
+                    "Official SAM3 install docs currently target Python 3.12+, "
+                    "PyTorch 2.7+, and CUDA 12.6 for the raw-checkpoint runtime."
+                ) from e
+            if message.startswith('Hugging Face SAM3 runtime requires'):
+                raise ImportError(
+                    f"SynthPose requires additional dependencies: {message}\n"
+                    "This means the current transformers install in this environment is too old for SAM3.\n"
+                    "Upgrade transformers to a build that exposes Sam3Model/Sam3Processor.\n"
+                    "If the latest stable release still does not expose SAM3, install transformers from source:\n"
+                    "pip install git+https://github.com/huggingface/transformers"
+                ) from e
             raise ImportError(
-                f"SynthPose requires additional dependencies: {e}\n"
+                f"SynthPose requires additional dependencies: {message}\n"
                 "Install with: pip install sports2d[synthpose]\n"
                 "Or: pip install torch transformers"
             ) from e

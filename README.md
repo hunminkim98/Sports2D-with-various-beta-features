@@ -458,6 +458,17 @@ sports2d --video_input demo.mp4 other_video.mp4 --time_range 1.2 2.7 0 3.5
                   'pose_model':'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7-halpe26_700e-256x192-4d3e73dd_20230605.zip', `
                   'pose_input_size':[192,256]}"""
   ```
+- Use SynthPose with YOLOX person detection plus SAM3 sports-ball detection
+  ``` cmd
+  sports2d --pose_model synthpose `
+           --synthpose_detector yolox `
+           --ball_detector_backend sam3 `
+           --detect_ball true `
+           --sam3_target ball `
+           --sam3_model_path facebook/sam3 `
+           --sam3_runtime transformers
+  ```
+  This keeps person detection on YOLOX and only adds SAM3 for the sports ball path. For the lower-risk `transformers` path, `--sam3_model_path` must be a Hugging Face repo ID or a local HF snapshot folder such as `facebook/sam3`. Raw `.pt` checkpoints cannot stay on `transformers`; they auto-switch to the official Meta `sam3` runtime and ignore `--sam3_processor_path`. With `--detect_ball true --save_pose true`, Sports2D also writes `pose_ball/` JSON files and appends a trailing `ball` marker to saved pixel/meter TRCs.
 
 <br>
 
@@ -499,7 +510,7 @@ sports2d --help
 'segment_angles': ["s", '"Right foot" "Left foot" "Right shank" "Left shank" "Right thigh" "Left thigh" "Pelvis" "Trunk" "Shoulders" "Head" "Right arm" "Left arm" "Right forearm" "Left forearm" if not specified'],
 'save_vid': ["V", "save processed video. true if not specified"],
 'save_img': ["I", "save processed images. true if not specified"],
-'save_pose': ["P", "save pose as trc files. true if not specified"],
+'save_pose': ["P", "save pose as trc files. When detect_ball=true, also append a trailing ball marker to saved TRCs and write per-frame ball JSON files in pose_ball/. true if not specified"],
 'calculate_angles': ["c", "calculate joint and segment angles. true if not specified"],
 'save_angles': ["A", "save angles as mot files. true if not specified"],
 'slowmo_factor': ["", "slow-motion factor. For a video recorded at 240 fps and exported to 30 fps, it would be 240/30 = 8. 1 if not specified"],

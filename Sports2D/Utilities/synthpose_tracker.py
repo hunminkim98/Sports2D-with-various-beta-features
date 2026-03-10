@@ -25,6 +25,12 @@ import numpy as np
 import logging
 from PIL import Image
 
+from Sports2D.Utilities.sam3_detector import (
+    BALL_ONLY_SAM3_PROMPTS,
+    Sam3Detector,
+    empty_sam3_detections,
+)
+
 PERSON_CLASS_ID = 0
 SPORTS_BALL_CLASS_ID = 32
 
@@ -95,7 +101,15 @@ class SynthPosePoseTracker:
                  ball_class_ids=None,
                  ball_detection_threshold=0.1,
                  detector_size='balanced',
-                 ball_nms_score_threshold=0.2):
+                 ball_nms_score_threshold=0.2,
+                 sam3_target='ball',
+                 sam3_model_path='',
+                 sam3_processor_path='',
+                 sam3_runtime='transformers',
+                 sam3_store_masks=False,
+                 sam3_show_realtime_masks=False,
+                 sam3_save_ball_masks=False,
+                 ball_detector_backend='same'):
         '''
         Initialize SynthPose tracker.
 
@@ -118,6 +132,7 @@ class SynthPosePoseTracker:
                     'yolox': rtmlib YOLOX (RECOMMENDED - fast, reliable)
                     'rtdetr': HuggingFace RT-DETR (good accuracy, no local setup)
                     'rtdetrv4': Local RT-DETRv4 (requires engine installation)
+                    'sam3': Promptable SAM3 detector (HF bundle or raw .pt checkpoint)
         '''
         
         # Load dependencies
@@ -136,7 +151,26 @@ class SynthPosePoseTracker:
             self.ball_class_ids = [int(c) for c in ball_class_ids]
         else:
             self.ball_class_ids = [int(ball_class_ids)]
-        self.last_detections = {}
+        self.sam3_target = str(sam3_target)
+        self.sam3_model_path = str(sam3_model_path or '').strip()
+        self.sam3_processor_path = str(sam3_processor_path or '').strip()
+        self.sam3_runtime = str(sam3_runtime or 'transformers').strip().lower()
+        self.sam3_store_masks = bool(sam3_store_masks)
+        self.sam3_show_realtime_masks = bool(sam3_show_realtime_masks)
+        self.sam3_save_ball_masks = bool(sam3_save_ball_masks)
+        self.ball_detector_backend = str(ball_detector_backend or 'same').strip().lower()
+        if self.ball_detector_backend not in {'same', 'sam3'}:
+            logging.warning(
+                "Unsupported ball_detector_backend '%s'. Falling back to 'same'.",
+                ball_detector_backend,
+            )
+            self.ball_detector_backend = 'same'
+        self.sam3_collect_masks = bool(
+            self.sam3_store_masks or self.sam3_show_realtime_masks or self.sam3_save_ball_masks
+        )
+        self.last_detections = self._empty_detections()
+        self.sam3_detector = None
+        self.sam3_ball_detector = None
         self.detector_size = self._resolve_detector_size(detector_size)
         self.ball_detection_threshold = float(np.clip(ball_detection_threshold, 0.01, 0.9))
         self.ball_nms_score_threshold = float(np.clip(ball_nms_score_threshold, 0.01, 0.9))
@@ -159,13 +193,15 @@ class SynthPosePoseTracker:
         logging.info(
             'SynthPose initializing: hf_model_size=%s (VitPose), '
             'detector_type=%s, detector_size=%s (mode-driven), device=%s, '
-            'person_thr=%.3f, ball_thr=%.3f',
+            'person_thr=%.3f, ball_thr=%.3f, sam3_target=%s, ball_detector_backend=%s',
             self.mode,
             self.detector_type,
             self.detector_size,
             self.device,
             self.person_threshold,
             self.ball_detection_threshold,
+            self.sam3_target,
+            self.ball_detector_backend,
         )
         
         # Load models
@@ -204,12 +240,30 @@ class SynthPosePoseTracker:
             "Using 'm' (balanced)."
         )
         return 'm'
+
+    def _empty_detections(self):
+        empty = empty_sam3_detections(store_masks=self.sam3_collect_masks)
+        empty['sam3_ball_meta'] = {}
+        return empty
+
+    def _uses_secondary_sam3_ball_detector(self):
+        return (
+            self.detect_ball
+            and self.ball_detector_backend == 'sam3'
+            and self.detector_type != 'sam3'
+        )
+
+    def _primary_detector_handles_ball(self):
+        return self.detect_ball and not self._uses_secondary_sam3_ball_detector()
     
     def _load_models(self):
-        '''Load person detector (YOLOX, RT-DETR, or RT-DETRv4) and VitPose model.'''
+        '''Load person detector (YOLOX, RT-DETR, RT-DETRv4, or SAM3) and VitPose model.'''
         
-        # Person detector: YOLOX (rtmlib) or RT-DETR (HuggingFace) or RT-DETRv4 (local)
-        if self.detector_type == 'rtdetrv4':
+        # Person detector: YOLOX (rtmlib), RT-DETR, RT-DETRv4, or SAM3
+        if self.detector_type == 'sam3':
+            logging.info('Loading SAM3 detector (HF bundle or raw .pt checkpoint)...')
+            self._load_sam3_detector()
+        elif self.detector_type == 'rtdetrv4':
             logging.info('Loading RT-DETRv4 person detector (local checkpoint)...')
             self._load_rtdetrv4_detector()
         elif self.detector_type == 'rtdetr':
@@ -218,6 +272,10 @@ class SynthPosePoseTracker:
         else:
             logging.info('Loading rtmlib YOLOX person detector...')
             self._load_rtmlib_detector()
+
+        if self._uses_secondary_sam3_ball_detector():
+            logging.info('Loading secondary SAM3 sports-ball detector...')
+            self._load_sam3_ball_detector()
         
         # Pose estimator: VitPose from HuggingFace
         if self.mode == 'huge':
@@ -233,13 +291,51 @@ class SynthPosePoseTracker:
         self.pose_model.eval()
         
         logging.info('SynthPose models loaded successfully.')
+
+    def _load_sam3_detector(self):
+        '''Load SAM3 detector from a raw checkpoint or HuggingFace-compatible repository.'''
+        self.sam3_detector = Sam3Detector(
+            model_path=self.sam3_model_path,
+            processor_path=self.sam3_processor_path,
+            runtime=self.sam3_runtime,
+            device=self.device,
+            target=self.sam3_target,
+            store_masks=self.sam3_collect_masks,
+            person_threshold=self.person_threshold,
+            ball_detection_threshold=self.ball_detection_threshold,
+        )
+        logging.info(
+            "SAM3 detector loaded (target=%s, runtime=%s, prompts=%s)",
+            self.sam3_detector.target,
+            self.sam3_detector.runtime,
+            self.sam3_detector.prompts,
+        )
+
+    def _load_sam3_ball_detector(self):
+        '''Load a SAM3 detector dedicated to sports-ball prompts for hybrid person/ball mode.'''
+        self.sam3_ball_detector = Sam3Detector(
+            model_path=self.sam3_model_path,
+            processor_path=self.sam3_processor_path,
+            runtime=self.sam3_runtime,
+            device=self.device,
+            target='ball',
+            prompts=BALL_ONLY_SAM3_PROMPTS,
+            store_masks=self.sam3_collect_masks,
+            person_threshold=self.person_threshold,
+            ball_detection_threshold=self.ball_detection_threshold,
+        )
+        logging.info(
+            "SAM3 sports-ball detector loaded (runtime=%s, prompts=%s)",
+            self.sam3_ball_detector.runtime,
+            self.sam3_ball_detector.prompts,
+        )
     
     def _load_rtmlib_detector(self):
         '''Load rtmlib YOLOX detector.'''
         from rtmlib import YOLOX
 
         # HumanArt detector is person-only. For detect_ball, use COCO YOLOX.
-        if self.detect_ball:
+        if self._primary_detector_handles_ball():
             coco_yolox_models = {
                 's': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx',
                 'm': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_m.onnx',
@@ -470,7 +566,7 @@ class SynthPosePoseTracker:
         
         self.frame_count += 1
         height, width = frame.shape[:2]
-        self.last_detections = {}
+        self.last_detections = self._empty_detections()
         
         # Stage 1: Person Detection using YOLOX or RT-DETR
         # Fix: det_frequency=1 means run every frame, det_frequency=2 means every 2nd frame, etc.
@@ -478,17 +574,12 @@ class SynthPosePoseTracker:
         
         if run_detection:
             person_boxes = self._detect_persons(frame, height, width)
+            if self._uses_secondary_sam3_ball_detector():
+                self._merge_secondary_ball_detections(self._detect_balls_sam3(frame))
             self.prev_boxes = person_boxes if len(person_boxes) > 0 else None
         else:
             person_boxes = self.prev_boxes if self.prev_boxes is not None else np.array([])
-            self.last_detections = {
-                'boxes': np.empty((0, 4), dtype=np.float32),
-                'classes': np.empty((0,), dtype=np.int32),
-                'scores': np.empty((0,), dtype=np.float32),
-                'person_boxes': np.empty((0, 4), dtype=np.float32),
-                'ball_boxes': np.empty((0, 4), dtype=np.float32),
-                'ball_scores': np.empty((0,), dtype=np.float32),
-            }
+            self.last_detections = self._empty_detections()
         
         # No persons detected
         if len(person_boxes) == 0:
@@ -520,7 +611,9 @@ class SynthPosePoseTracker:
         - person_boxes: np.array shape (N_persons, 4) in COCO format (x, y, w, h)
         '''
         
-        if self.detector_type == 'rtdetrv4':
+        if self.detector_type == 'sam3':
+            return self._detect_persons_sam3(frame)
+        elif self.detector_type == 'rtdetrv4':
             return self._detect_persons_rtdetrv4(frame)
         elif self.detector_type == 'rtdetr':
             return self._detect_persons_rtdetr(frame)
@@ -532,14 +625,7 @@ class SynthPosePoseTracker:
 
         detector_outputs = self.detector(frame)
         if detector_outputs is None:
-            self.last_detections = {
-                'boxes': np.empty((0, 4), dtype=np.float32),
-                'classes': np.empty((0,), dtype=np.int32),
-                'scores': np.empty((0,), dtype=np.float32),
-                'person_boxes': np.empty((0, 4), dtype=np.float32),
-                'ball_boxes': np.empty((0, 4), dtype=np.float32),
-                'ball_scores': np.empty((0,), dtype=np.float32),
-            }
+            self.last_detections = self._empty_detections()
             return np.array([])
 
         if isinstance(detector_outputs, tuple) and len(detector_outputs) >= 2:
@@ -560,27 +646,13 @@ class SynthPosePoseTracker:
                 detection_scores = np.full((len(bboxes),), np.nan, dtype=np.float32)
 
         if bboxes.size == 0:
-            self.last_detections = {
-                'boxes': np.empty((0, 4), dtype=np.float32),
-                'classes': np.empty((0,), dtype=np.int32),
-                'scores': np.empty((0,), dtype=np.float32),
-                'person_boxes': np.empty((0, 4), dtype=np.float32),
-                'ball_boxes': np.empty((0, 4), dtype=np.float32),
-                'ball_scores': np.empty((0,), dtype=np.float32),
-            }
+            self.last_detections = self._empty_detections()
             return np.array([])
 
         if bboxes.ndim == 1:
             bboxes = bboxes.reshape(1, -1)
         if bboxes.shape[1] < 4:
-            self.last_detections = {
-                'boxes': np.empty((0, 4), dtype=np.float32),
-                'classes': np.empty((0,), dtype=np.int32),
-                'scores': np.empty((0,), dtype=np.float32),
-                'person_boxes': np.empty((0, 4), dtype=np.float32),
-                'ball_boxes': np.empty((0, 4), dtype=np.float32),
-                'ball_scores': np.empty((0,), dtype=np.float32),
-            }
+            self.last_detections = self._empty_detections()
             return np.array([])
 
         if bboxes.shape[1] >= 5 and not (isinstance(detector_outputs, tuple) and len(detector_outputs) >= 2):
@@ -589,14 +661,7 @@ class SynthPosePoseTracker:
             classes = classes[score_mask]
             detection_scores = detection_scores[score_mask] if len(detection_scores) == len(score_mask) else np.full((len(bboxes),), np.nan, dtype=np.float32)
             if len(bboxes) == 0:
-                self.last_detections = {
-                    'boxes': np.empty((0, 4), dtype=np.float32),
-                    'classes': np.empty((0,), dtype=np.int32),
-                    'scores': np.empty((0,), dtype=np.float32),
-                    'person_boxes': np.empty((0, 4), dtype=np.float32),
-                    'ball_boxes': np.empty((0, 4), dtype=np.float32),
-                    'ball_scores': np.empty((0,), dtype=np.float32),
-                }
+                self.last_detections = self._empty_detections()
                 return np.array([])
 
         bboxes = bboxes[:, :4]
@@ -612,7 +677,7 @@ class SynthPosePoseTracker:
             unique_classes = np.unique(classes)
             if len(unique_classes) == 1:
                 person_boxes_xyxy = bboxes
-        if self.detect_ball:
+        if self._primary_detector_handles_ball():
             ball_mask = np.isin(classes, self.ball_class_ids)
             ball_boxes_xyxy = bboxes[ball_mask]
             ball_scores_xyxy = detection_scores[ball_mask]
@@ -635,9 +700,79 @@ class SynthPosePoseTracker:
             'person_boxes': person_boxes_xyxy,
             'ball_boxes': ball_boxes_xyxy,
             'ball_scores': ball_scores_xyxy,
+            'class_names': np.empty((0,), dtype=object),
+            'prompt_indices': np.empty((0,), dtype=np.int32),
+            'sam3_ball_meta': {},
         }
 
         return person_boxes_coco
+
+    def _detect_persons_sam3(self, frame):
+        '''Detect persons using SAM3 with prompt presets.'''
+        import cv2
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        person_boxes_coco, detection_meta = self.sam3_detector.detect_person_boxes(pil_image)
+        self.last_detections = detection_meta or self._empty_detections()
+        return person_boxes_coco
+
+    def _detect_balls_sam3(self, frame):
+        '''Detect sports balls using the secondary SAM3 detector in hybrid mode.'''
+        import cv2
+
+        if self.sam3_ball_detector is None:
+            return self._empty_detections()
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        return self.sam3_ball_detector.detect(pil_image) or self._empty_detections()
+
+    def _merge_secondary_ball_detections(self, ball_meta):
+        '''Merge SAM3 sports-ball detections into the current detector metadata.'''
+        base_meta = dict(self.last_detections or self._empty_detections())
+        ball_meta = ball_meta or self._empty_detections()
+
+        base_boxes = np.asarray(base_meta.get('boxes', np.empty((0, 4))), dtype=np.float32).reshape(-1, 4)
+        base_classes = np.asarray(base_meta.get('classes', np.empty((0,))), dtype=np.int32).reshape(-1)
+        base_scores = np.asarray(base_meta.get('scores', np.empty((0,))), dtype=np.float32).reshape(-1)
+        base_class_names = np.asarray(base_meta.get('class_names', np.empty((0,), dtype=object)), dtype=object).reshape(-1)
+        base_prompt_indices = np.asarray(base_meta.get('prompt_indices', np.empty((0,))), dtype=np.int32).reshape(-1)
+
+        ball_boxes = np.asarray(ball_meta.get('boxes', np.empty((0, 4))), dtype=np.float32).reshape(-1, 4)
+        ball_classes = np.asarray(ball_meta.get('classes', np.empty((0,))), dtype=np.int32).reshape(-1)
+        ball_scores = np.asarray(ball_meta.get('scores', np.empty((0,))), dtype=np.float32).reshape(-1)
+        ball_class_names = np.asarray(ball_meta.get('class_names', np.empty((0,), dtype=object)), dtype=object).reshape(-1)
+        ball_prompt_indices = np.asarray(ball_meta.get('prompt_indices', np.empty((0,))), dtype=np.int32).reshape(-1)
+
+        if len(base_class_names) != len(base_classes):
+            base_class_names = np.empty((len(base_classes),), dtype=object)
+        if len(base_prompt_indices) != len(base_classes):
+            base_prompt_indices = np.full((len(base_classes),), -1, dtype=np.int32)
+        if len(ball_class_names) != len(ball_classes):
+            ball_class_names = np.empty((len(ball_classes),), dtype=object)
+        if len(ball_prompt_indices) != len(ball_classes):
+            ball_prompt_indices = np.full((len(ball_classes),), -1, dtype=np.int32)
+
+        base_meta['boxes'] = (
+            np.concatenate([base_boxes, ball_boxes], axis=0)
+            if len(base_boxes) > 0 or len(ball_boxes) > 0
+            else np.empty((0, 4), dtype=np.float32)
+        )
+        base_meta['classes'] = np.concatenate([base_classes, ball_classes], axis=0)
+        base_meta['scores'] = np.concatenate([base_scores, ball_scores], axis=0)
+        base_meta['class_names'] = np.concatenate([base_class_names, ball_class_names], axis=0)
+        base_meta['prompt_indices'] = np.concatenate([base_prompt_indices, ball_prompt_indices], axis=0)
+        base_meta['ball_boxes'] = np.asarray(
+            ball_meta.get('ball_boxes', np.empty((0, 4))),
+            dtype=np.float32,
+        ).reshape(-1, 4)
+        base_meta['ball_scores'] = np.asarray(
+            ball_meta.get('ball_scores', np.empty((0,))),
+            dtype=np.float32,
+        ).reshape(-1)
+        base_meta['sam3_ball_meta'] = ball_meta
+        self.last_detections = base_meta
     
     def _detect_persons_rtdetr(self, frame):
         '''Detect persons using RT-DETR from HuggingFace Transformers (original SynthPose_PM).'''
@@ -668,7 +803,7 @@ class SynthPosePoseTracker:
         all_boxes_voc = result["boxes"].cpu().numpy()
         person_mask = (labels == PERSON_CLASS_ID) & (scores >= self.person_threshold)
         person_boxes_voc = all_boxes_voc[person_mask]
-        if self.detect_ball:
+        if self._primary_detector_handles_ball():
             ball_mask = np.isin(labels, self.ball_class_ids) & (scores >= self.ball_detection_threshold)
             ball_boxes_voc = all_boxes_voc[ball_mask]
             ball_scores_voc = scores[ball_mask].astype(np.float32, copy=False)
@@ -683,6 +818,9 @@ class SynthPosePoseTracker:
             'person_boxes': person_boxes_voc,
             'ball_boxes': ball_boxes_voc,
             'ball_scores': ball_scores_voc,
+            'class_names': np.empty((0,), dtype=object),
+            'prompt_indices': np.empty((0,), dtype=np.int32),
+            'sam3_ball_meta': {},
         }
         
         if len(person_boxes_voc) == 0:
@@ -720,7 +858,7 @@ class SynthPosePoseTracker:
         scores_0 = scores[0]
         person_mask = (labels_0 == PERSON_CLASS_ID) & (scores_0 >= self.person_threshold)
         person_boxes_voc = boxes_0[person_mask].cpu().numpy()
-        if self.detect_ball:
+        if self._primary_detector_handles_ball():
             ball_mask = _torch.zeros_like(person_mask, dtype=_torch.bool)
             for cls_id in self.ball_class_ids:
                 ball_mask = ball_mask | ((labels_0 == cls_id) & (scores_0 >= self.ball_detection_threshold))
@@ -738,6 +876,9 @@ class SynthPosePoseTracker:
             'person_boxes': person_boxes_voc,
             'ball_boxes': ball_boxes_voc,
             'ball_scores': ball_scores_voc,
+            'class_names': np.empty((0,), dtype=object),
+            'prompt_indices': np.empty((0,), dtype=np.int32),
+            'sam3_ball_meta': {},
         }
         
         if len(person_boxes_voc) == 0:

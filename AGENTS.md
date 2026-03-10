@@ -1,4 +1,4 @@
-<!-- Generated: 2026-02-13 | Updated: 2026-03-02 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-03-10 -->
 
 # AGENTS.md
 
@@ -30,7 +30,50 @@
 - Preserve manual sections across regeneration.
 - Use stable headings so future tooling can update safely.
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-03-02
+Last reviewed: 2026-03-10
+
+## Purpose
+Repository root for packaging metadata, user-facing documentation, CI entry points, and high-level agent guidance. Shipped runtime code lives in `Sports2D/`; the other top-level directories mainly support workflows, publication assets, or currently inactive scaffolding. Recent backend work added hybrid SAM3 ball detection, `pose_ball/` result artifacts, and expanded model/runtime guidance that is documented from here downward.
+
+## Key Files
+| File | Description |
+|------|-------------|
+| `pyproject.toml` | Packaging metadata, dependencies, package-data rules, and console entry points (`sports2d`, `tests_sports2d`). |
+| `README.md` | Primary installation, usage, and output-format documentation. |
+| `CLAUDE.md` | Repo-specific development commands and architecture notes for the backend system. |
+| `HANDOFF.md` | Handoff context for the unified pose-backend and SynthPose refactor. |
+| `refactory.md` | Korean refactoring notes, including recent angle-output behavior changes. |
+| `test_synthpose_integration.py` | Manual integration checks for SynthPose skeleton/tracker wiring. |
+| `CITATION.cff` | Citation metadata for releases and academic references. |
+
+## Subdirectories
+| Directory | Purpose |
+|-----------|---------|
+| `.github/` | GitHub Actions workflows and release automation (see `.github/AGENTS.md`). |
+| `Content/` | Paper sources and media assets used by docs/publication flows (see `Content/AGENTS.md`). |
+| `Sports2D/` | Published Python package, CLI, processing pipeline, demo assets, and model notes (see `Sports2D/AGENTS.md`). |
+| `src/` | Placeholder clean-architecture scaffold with no tracked runtime source files today (see `src/AGENTS.md`). |
+
+## For AI Agents
+
+### Working In This Directory
+- Treat `Sports2D/` as the source of truth for shipped behavior and public entry points.
+- Keep top-level docs aligned with CLI/config changes that alter installation, dependencies, or output expectations, especially when result bundle contents change.
+- Avoid committing generated logs, caches, or local result artifacts unless the task is explicitly about those outputs.
+
+### Testing Requirements
+- Use the baseline commands already recorded in the manual section and `CLAUDE.md`.
+- Prefer targeted verification for docs-only or workflow-only edits, but keep lint/syntax gates in mind for code-bearing changes.
+
+## Dependencies
+
+### Internal
+- `Sports2D/Utilities/` provides the backend abstraction and tests that most runtime changes eventually touch.
+- `.github/workflows/` mirrors the repository's supported install, lint, and test paths.
+
+### External
+- Packaging is driven by `setuptools`, `wheel`, and `setuptools-scm`.
+- Runtime behavior depends primarily on `Pose2Sim`, `imageio_ffmpeg`, and optional extras such as `torch`, `torchvision`, `transformers`, `PySide6`, and the official Meta `sam3` runtime when raw SAM3 checkpoints are used.
 
 Covered AGENTS files:
 - `AGENTS.md`
@@ -41,8 +84,14 @@ Covered AGENTS files:
 - `Sports2D/Demo/AGENTS.md`
 - `Sports2D/Utilities/AGENTS.md`
 - `Sports2D/models/AGENTS.md`
+- `Sports2D/models/sam3/AGENTS.md`
 - `Sports2D/models/rtdetrv4/AGENTS.md`
+- `src/AGENTS.md`
+
+Skipped generated or runtime-state directories:
+- `.omx/`, `.pytest_cache/`, `.sisyphus/`, `sports2d.egg-info/`, and `**/__pycache__/`
+- Empty placeholder model directory `Sports2D/models/RT-DETRv4/`
 
 Suggested upkeep:
-- Update this list if new AGENTS files are added or moved.
-- Refresh parent links whenever folders are reorganized.
+- Refresh the covered list whenever AGENTS files are added or removed.
+- Reassess `src/` coverage only if tracked source files are added there.

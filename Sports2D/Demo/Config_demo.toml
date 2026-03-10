@@ -12,7 +12,7 @@
 
 
 [base]
-video_input = 'webcam'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
+video_input = '메디신볼'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
@@ -35,8 +35,8 @@ video_dir = ''    # If empty, video dir is current dir
 webcam_id = 1 # your webcam id (0 is default)
 input_size = [1920, 1080] # [W, H]. Lower resolution will be faster but less precise.
 
-show_realtime_results = true
-realtime_ui_backend = 'qt' # 'opencv' or 'qt' (requires pip install sports2d[ui])
+show_realtime_results = false
+realtime_ui_backend = 'opencv' # 'opencv' or 'qt' (requires pip install sports2d[ui])
 realtime_window_title = 'UmFit realtime'
 save_vid = true
 video_codec = 'h264'  # 'mp4v' (default, faster/compatible) or 'h264' (better compression)
@@ -51,7 +51,7 @@ result_dir = '' # If empty, project dir is current dir
 # ADVANCED CONFIGURATION #
 ##########################
 [pose]
-# Slow motion factor
+# 	Slow motion factor
 slowmo_factor = 1       # 1 for normal speed. For a video recorded at 240 fps and exported to 30 fps, it would be 240/30 = 8
 
 ## ============================================================
@@ -73,7 +73,7 @@ slowmo_factor = 1       # 1 for normal speed. For a video recorded at 240 fps an
 ##   Note: SynthPose outputs 52 anatomical keypoints including HALPE_26 + additional markers.
 ##   Models are automatically downloaded from HuggingFace on first use (~2GB).
 ##
-pose_model = 'whole_body'
+pose_model = 'synthpose'
 
 ## ============================================================
 ## SynthPose Person Detector Selection
@@ -82,9 +82,13 @@ pose_model = 'whole_body'
 ##   - 'yolox': Fast YOLOX detector from rtmlib (RECOMMENDED - fast and reliable)
 ##   - 'rtdetr': RT-DETR from HuggingFace transformers (good accuracy, no local setup)
 ##   - 'rtdetrv4': RT-DETRv4 local model (requires model weights download)
+##   - 'sam3': Promptable SAM3 detector (HF bundle or raw .pt checkpoint)
 ##
 ## Note: For 'rtdetrv4', you need to download model weights and place them in:
 ##       Sports2D/models/rtdetrv4/
+## Note: For 'sam3', set sam3_model_path.
+##       - raw .pt checkpoint -> official Meta sam3 runtime, sam3_processor_path ignored
+##       - HF bundle/repo id  -> transformers runtime, sam3_processor_path optional
 ##
 synthpose_detector = 'yolox'
 ## Optional SynthPose HF model size override (independent from mode):
@@ -93,6 +97,24 @@ synthpose_detector = 'yolox'
 ##   - or explicit: 'huge', 'base'
 ## Leave empty to use pose_model + mode logic.
 synthpose_model_size = 'huge'
+
+## ============================================================
+## SAM3 Prompt Presets
+## ============================================================
+## Used when synthpose_detector='sam3' or ball_detector_backend='sam3':
+##   - 'ball': Primary SAM3 detector uses ['person', 'sports ball']
+##             Hybrid ball_detector_backend='sam3' uses ['sports ball'] only
+##   - 'broad_jump': Detect with prompt ['person']
+## For the safer transformers path, use an HF repo id or local HF snapshot folder.
+## Example below uses the official HF repo id.
+sam3_target = 'ball'
+sam3_model_path = 'facebook/sam3'
+sam3_processor_path = '' # Empty -> reuse sam3_model_path for the processor
+sam3_runtime = 'transformers'
+sam3_store_masks = false
+sam3_show_realtime_masks = true
+sam3_realtime_mask_alpha = 0.5
+ball_detector_backend = 'sam3'
 
 ## ============================================================
 ## Mode Selection (Works for both RTMLib and SynthPose)
@@ -114,7 +136,7 @@ synthpose_model_size = 'huge'
 ##   - If pose_model='synthpose_base' is set explicitly and synthpose_model_size is empty,
 ##     mode still controls detector scale while VitPose stays base.
 ##
-mode = 'balanced'
+mode = 'performance'
 
 # A dictionary (WITHIN THREE DOUBLE QUOTES) allows you to manually select the person detection (if top_down approach) and/or pose estimation models (see https://github.com/Tau-J/rtmlib). 
 # Models can be local paths or URLs.
@@ -170,13 +192,15 @@ tracking_mode = 'sports2d' # 'sports2d' or 'deepsort'. 'deepsort' is slower, har
 # Processing parameters
 keypoint_likelihood_threshold = 0.5 # Keypoints whose likelihood is lower will not be taken into account
 person_detection_threshold = 0.3    # Object detector threshold (person/ball)
-average_likelihood_threshold = 0.5  # Person will be ignored if average likelihood of good keypoints is lower than this value
+average_likelihood_threshold = 0.3  # Person will be ignored if average likelihood of good keypoints is lower than this value
 keypoint_number_threshold = 0.3     # Person will be ignored if the number of good keypoints (above keypoint_likelihood_threshold) is less than this fraction
 max_distance = 250  # in px or None # If a person is detected further than max_distance from its position on the previous frame, it will be considered as a new one
 
-# Optional multiclass sports ball overlay (RTMLib only)
-detect_ball = false
-ball_trail_length = 20     # Number of recent frames shown in the trajectory
+# Optional sports ball overlay
+# ball_detector_backend = 'same' reuses synthpose_detector
+# ball_detector_backend = 'sam3' keeps the person detector and adds SAM3 for sports-ball detection
+detect_ball = true
+ball_trail_length = 3000     # Number of recent frames shown in the trajectory
 ball_trail_alpha = 0.35     # Transparency in [0,1]
 ball_radius = 6             # Ball center marker radius (px)
 ball_max_jump_px = 'none'      # Reject detections that jump too far between frames; use 'none' to disable
@@ -189,7 +213,7 @@ ball_selected_id = -1           # Used only when ball_selection_mode='id'. Set >
 ball_tracking_max_distance = 1000 # Max px distance for frame-to-frame ID association. 'none' disables gating
 ball_track_max_missing_frames = 60 # Keep missing tracks for N frames before removing
 ball_show_ids = true            # Draw 'ball {id}' labels on ball boxes
-ball_color = [0, 0, 0]      # BGR (OpenCV), default black
+ball_color = [0, 0, 0]    # BGR (OpenCV), default black
 
 
 [px_to_meters_conversion]
@@ -214,7 +238,7 @@ calib_file = ''      # Calibration file in the Pose2Sim toml format, or '' if no
 
 
 [angles]
-display_angle_values_on = 'body' # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
+display_angle_values_on = ['body', 'list'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
 fontSize = 0.8
 
 # Select joint angles among
@@ -232,7 +256,7 @@ unwrap_angles = false # true keeps np.unwrap continuity correction; false disabl
 
 
 [post-processing]
-interpolate = true
+interpolate = false
 interp_gap_smaller_than = 10        # Do not interpolate larger gaps
 fill_large_gaps_with = 'last_value' # 'last_value', 'nan', or 'zeros' 
 sections_to_keep = 'all' # 'all', 'largest', 'first', 'last'

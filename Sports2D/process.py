@@ -99,6 +99,10 @@ except ImportError:
 # Unified pose backend abstraction
 from Sports2D.Utilities.pose_backend import create_pose_backend
 from Sports2D.Utilities.realtime_display import create_realtime_display
+from Sports2D.Utilities.sam3_detector import (
+    PERSON_CLASS_ID as SAM3_PERSON_CLASS_ID,
+    SPORTS_BALL_CLASS_ID as SAM3_BALL_CLASS_ID,
+)
 
 from Sports2D.Utilities.common import *
 from Pose2Sim.common import *
@@ -201,6 +205,402 @@ def _ensure_score_vector(scores, expected_len=None):
     padded = np.full((expected_len,), np.nan, dtype=np.float32)
     padded[:len(score_arr)] = score_arr
     return padded
+
+
+def _ensure_mask_list(masks, expected_len=None):
+    '''
+    Normalize instance masks to a list of 2D arrays.
+    '''
+    if masks is None:
+        return []
+
+    if isinstance(masks, np.ndarray):
+        if masks.size == 0:
+            return []
+        if masks.ndim == 2:
+            mask_values = [masks]
+        elif masks.ndim >= 3:
+            mask_values = [masks[i] for i in range(masks.shape[0])]
+        else:
+            return []
+    else:
+        try:
+            mask_values = list(masks)
+        except TypeError:
+            return []
+
+    normalized = []
+    for mask in mask_values:
+        mask_arr = np.asarray(mask)
+        if mask_arr.size == 0:
+            return []
+        mask_arr = np.squeeze(mask_arr)
+        if mask_arr.ndim != 2:
+            return []
+        normalized.append(mask_arr)
+
+    if expected_len is not None and len(normalized) != int(expected_len):
+        return []
+    return normalized
+
+
+def draw_sam3_mask_overlay(img, detection_meta, alpha=0.22,
+                           person_color=(70, 170, 110), ball_color=(0, 165, 255)):
+    '''
+    Draw semi-transparent SAM3 instance masks for person and ball detections.
+    '''
+    detection_meta = detection_meta or {}
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    if alpha <= 0.0:
+        return img
+
+    classes = np.asarray(detection_meta.get('classes', []), dtype=np.int32).reshape(-1)
+    if len(classes) == 0:
+        return img
+
+    raw_masks = detection_meta.get('masks')
+    masks = _ensure_mask_list(raw_masks, expected_len=len(classes))
+    if raw_masks is not None and len(masks) != len(classes):
+        logging.debug(
+            'Skipping SAM3 mask overlay due to mask/class mismatch: masks=%s classes=%s',
+            len(masks),
+            len(classes),
+        )
+        return img
+
+    if len(masks) == 0:
+        return img
+
+    img_height, img_width = img.shape[:2]
+    overlay = img.copy()
+    has_overlay = False
+
+    for class_id, mask in zip(classes, masks):
+        if int(class_id) == SAM3_PERSON_CLASS_ID:
+            color = person_color
+        elif int(class_id) == SAM3_BALL_CLASS_ID:
+            color = ball_color
+        else:
+            continue
+
+        mask_bool = np.asarray(mask) > 0
+        if mask_bool.shape != (img_height, img_width):
+            mask_bool = cv2.resize(
+                mask_bool.astype(np.uint8),
+                (img_width, img_height),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+        if not mask_bool.any():
+            continue
+
+        overlay[mask_bool] = color
+        has_overlay = True
+
+    if not has_overlay:
+        return img
+
+    return cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0)
+
+
+def filter_sam3_detection_meta_classes(detection_meta, allowed_class_ids):
+    '''
+    Keep only the requested SAM3 classes from detection metadata.
+    '''
+    detection_meta = detection_meta or {}
+    allowed = {int(class_id) for class_id in (allowed_class_ids or [])}
+    empty = {
+        'boxes': np.empty((0, 4), dtype=np.float32),
+        'classes': np.empty((0,), dtype=np.int32),
+        'scores': np.empty((0,), dtype=np.float32),
+        'person_boxes': np.empty((0, 4), dtype=np.float32),
+        'ball_boxes': np.empty((0, 4), dtype=np.float32),
+        'ball_scores': np.empty((0,), dtype=np.float32),
+        'class_names': np.empty((0,), dtype=object),
+        'prompt_indices': np.empty((0,), dtype=np.int32),
+        'masks': [],
+    }
+    if not allowed:
+        return empty
+
+    classes = np.asarray(detection_meta.get('classes', []), dtype=np.int32).reshape(-1)
+    if len(classes) == 0:
+        return empty
+
+    keep_mask = np.isin(classes, list(allowed))
+    if not np.any(keep_mask):
+        return empty
+
+    boxes = _ensure_xyxy_boxes(detection_meta.get('boxes'))
+    scores = _ensure_score_vector(detection_meta.get('scores'), expected_len=len(classes))
+    class_names = np.asarray(detection_meta.get('class_names', []), dtype=object).reshape(-1)
+    if len(class_names) != len(classes):
+        class_names = np.empty((len(classes),), dtype=object)
+    prompt_indices = np.asarray(detection_meta.get('prompt_indices', []), dtype=np.int32).reshape(-1)
+    if len(prompt_indices) != len(classes):
+        prompt_indices = np.full((len(classes),), -1, dtype=np.int32)
+
+    raw_masks = detection_meta.get('masks')
+    masks = _ensure_mask_list(raw_masks, expected_len=len(classes))
+    filtered_masks = [masks[i] for i, keep in enumerate(keep_mask) if keep] if len(masks) == len(classes) else []
+
+    filtered_classes = classes[keep_mask].astype(np.int32, copy=False)
+    filtered_boxes = boxes[keep_mask] if len(boxes) == len(classes) else np.empty((0, 4), dtype=np.float32)
+    filtered_scores = scores[keep_mask] if len(scores) == len(classes) else np.empty((0,), dtype=np.float32)
+    filtered_names = class_names[keep_mask]
+    filtered_prompt_indices = prompt_indices[keep_mask].astype(np.int32, copy=False)
+    ball_mask = filtered_classes == SAM3_BALL_CLASS_ID
+
+    return {
+        'boxes': filtered_boxes.astype(np.float32, copy=False),
+        'classes': filtered_classes,
+        'scores': filtered_scores.astype(np.float32, copy=False),
+        'person_boxes': np.empty((0, 4), dtype=np.float32),
+        'ball_boxes': filtered_boxes[ball_mask].astype(np.float32, copy=False),
+        'ball_scores': filtered_scores[ball_mask].astype(np.float32, copy=False),
+        'class_names': filtered_names,
+        'prompt_indices': filtered_prompt_indices,
+        'masks': filtered_masks,
+    }
+
+
+def _json_safe_float(value):
+    '''
+    Convert numeric values to JSON-safe floats, mapping NaN/inf to None.
+    '''
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def _json_safe_int(value):
+    '''
+    Convert numeric values to JSON-safe ints, mapping invalid values to None.
+    '''
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_ball_center(center):
+    '''
+    Normalize an `(x, y)` center to integer pixel coordinates.
+    '''
+    if center is None:
+        return None
+    center_arr = np.asarray(center, dtype=np.float32).reshape(-1)
+    if len(center_arr) < 2 or np.isnan(center_arr[:2]).any():
+        return None
+    return (
+        int(round(float(center_arr[0]))),
+        int(round(float(center_arr[1]))),
+    )
+
+
+def _serialize_box_xyxy(box):
+    '''
+    Convert a detector box to a JSON-safe `[x1, y1, x2, y2]` list.
+    '''
+    if box is None:
+        return None
+    box_arr = _ensure_xyxy_boxes([box])
+    if len(box_arr) == 0:
+        return None
+    return [
+        _json_safe_float(coord)
+        for coord in box_arr[0]
+    ]
+
+
+def build_ball_export_record(frame_ball_center, frame_ball_boxes, frame_ball_scores,
+                             frame_ball_tracks=None, frame_selected_ball_id=None,
+                             frame_sam3_ball_mask_meta=None, multi_id_tracking=False):
+    '''
+    Build a single-frame export record for the selected ball.
+    '''
+    frame_ball_tracks = frame_ball_tracks or []
+    ball_boxes = _ensure_xyxy_boxes(frame_ball_boxes)
+    ball_scores = _ensure_score_vector(frame_ball_scores, expected_len=len(ball_boxes))
+    center = _normalize_ball_center(frame_ball_center)
+    mask_available = len(_ensure_mask_list((frame_sam3_ball_mask_meta or {}).get('masks'))) > 0
+
+    record = {
+        'visible': False,
+        'track_id': _json_safe_int(frame_selected_ball_id),
+        'score': None,
+        'center_xy': None,
+        'box_xyxy': None,
+        'ball_keypoints_2d': [None, None, None],
+        'mask_available': bool(mask_available),
+    }
+
+    if multi_id_tracking:
+        selected_track_id = _json_safe_int(frame_selected_ball_id)
+        selected_track = None
+        if selected_track_id is not None:
+            for track in frame_ball_tracks:
+                track_id = _json_safe_int(track.get('id'))
+                if track_id == selected_track_id:
+                    selected_track = track
+                    break
+        if selected_track is not None:
+            center = _normalize_ball_center(selected_track.get('center'))
+            score = _json_safe_float(selected_track.get('score'))
+            record['track_id'] = _json_safe_int(selected_track.get('id'))
+            record['visible'] = bool(selected_track.get('visible', False) and center is not None)
+            record['center_xy'] = list(center) if center is not None else None
+            record['box_xyxy'] = _serialize_box_xyxy(selected_track.get('box'))
+            record['score'] = score
+            record['ball_keypoints_2d'] = [
+                _json_safe_float(center[0]) if center is not None else None,
+                _json_safe_float(center[1]) if center is not None else None,
+                score,
+            ]
+            return record
+
+    if center is None:
+        return record
+
+    record['visible'] = True
+    record['center_xy'] = [int(center[0]), int(center[1])]
+
+    if len(ball_boxes) > 0:
+        candidate_centers = np.asarray(
+            extract_ball_centers({'ball_boxes': ball_boxes}),
+            dtype=np.float32,
+        ).reshape(-1, 2)
+        if len(candidate_centers) > 0:
+            center_arr = np.asarray(center, dtype=np.float32)
+            nearest_idx = int(np.argmin(np.linalg.norm(candidate_centers - center_arr[None, :], axis=1)))
+            record['box_xyxy'] = _serialize_box_xyxy(ball_boxes[nearest_idx])
+            record['score'] = _json_safe_float(ball_scores[nearest_idx] if nearest_idx < len(ball_scores) else None)
+
+    record['ball_keypoints_2d'] = [
+        _json_safe_float(center[0]),
+        _json_safe_float(center[1]),
+        record['score'],
+    ]
+    return record
+
+
+def build_ball_export_series(all_frames_time, all_frames_ball_centers, all_frames_ball_boxes,
+                             all_frames_ball_scores, all_frames_ball_tracks,
+                             all_frames_selected_ball_ids, all_frames_sam3_ball_mask_meta,
+                             frame_offset=0, multi_id_tracking=False):
+    '''
+    Build frame-aligned export records for the selected ball.
+    '''
+    frame_offset = int(frame_offset)
+    entries = []
+    frame_count = len(all_frames_time)
+    for frame_idx in range(frame_count):
+        entries.append({
+            'frame_index': frame_offset + frame_idx,
+            'time': _json_safe_float(all_frames_time.iloc[frame_idx] if frame_idx < len(all_frames_time) else None),
+            'ball': build_ball_export_record(
+                all_frames_ball_centers[frame_idx] if frame_idx < len(all_frames_ball_centers) else None,
+                all_frames_ball_boxes[frame_idx] if frame_idx < len(all_frames_ball_boxes) else None,
+                all_frames_ball_scores[frame_idx] if frame_idx < len(all_frames_ball_scores) else None,
+                frame_ball_tracks=all_frames_ball_tracks[frame_idx] if frame_idx < len(all_frames_ball_tracks) else None,
+                frame_selected_ball_id=all_frames_selected_ball_ids[frame_idx] if frame_idx < len(all_frames_selected_ball_ids) else None,
+                frame_sam3_ball_mask_meta=all_frames_sam3_ball_mask_meta[frame_idx] if frame_idx < len(all_frames_sam3_ball_mask_meta) else None,
+                multi_id_tracking=multi_id_tracking,
+            ),
+        })
+    return entries
+
+
+def write_ball_pose_json(ball_export_series, pose_ball_output_dir, output_prefix):
+    '''
+    Write per-frame ball JSON files into the pose_ball directory.
+    '''
+    pose_ball_output_dir.mkdir(parents=True, exist_ok=True)
+    for entry in ball_export_series:
+        frame_index = int(entry.get('frame_index', 0))
+        json_path = pose_ball_output_dir / f'{output_prefix}_{frame_index:06d}.json'
+        payload = {
+            'version': 1.0,
+            'frame_index': frame_index,
+            'time': entry.get('time'),
+            'balls': [entry.get('ball', {})],
+        }
+        with open(json_path, 'w', encoding='utf-8') as json_o:
+            json.dump(payload, json_o, ensure_ascii=True, indent=2)
+
+
+def build_ball_trc_data(ball_export_series, index=None, marker_name='ball'):
+    '''
+    Build a 3-column TRC marker table `(X, Y, Z)` from ball export records.
+    '''
+    if index is None:
+        index = range(len(ball_export_series))
+    length = len(index)
+    x = np.full((length,), np.nan, dtype=np.float64)
+    y = np.full((length,), np.nan, dtype=np.float64)
+    z = np.full((length,), np.nan, dtype=np.float64)
+
+    for row_idx in range(min(length, len(ball_export_series))):
+        center = (ball_export_series[row_idx] or {}).get('ball', {}).get('center_xy')
+        if center is None or len(center) < 2:
+            continue
+        if center[0] is None or center[1] is None:
+            continue
+        x[row_idx] = float(center[0])
+        y[row_idx] = float(center[1])
+        z[row_idx] = 0.0
+
+    return pd.DataFrame(
+        np.column_stack([x, y, z]),
+        index=index,
+        columns=[marker_name, marker_name, marker_name],
+    )
+
+
+def append_ball_marker_to_trc_data(trc_data, ball_trc_data, marker_name='ball'):
+    '''
+    Return a copy of TRC data with an extra trailing ball marker triplet.
+    '''
+    if ball_trc_data is None or len(ball_trc_data) == 0:
+        return trc_data.copy()
+
+    ball_trc_data = pd.DataFrame(ball_trc_data).copy()
+    if ball_trc_data.shape[1] < 3:
+        return trc_data.copy()
+
+    aligned_ball = ball_trc_data.reindex(trc_data.index).iloc[:, :3].copy()
+    aligned_ball.columns = [marker_name, marker_name, marker_name]
+    return pd.concat([trc_data.copy(), aligned_ball], axis=1)
+
+
+def strip_auxiliary_trc_markers(Q_coords, keypoints_names, ignored_marker_names=None):
+    '''
+    Remove non-pose markers such as a trailing ball marker from loaded TRCs.
+    '''
+    ignored = {
+        str(marker_name).strip().lower()
+        for marker_name in (ignored_marker_names or [])
+        if str(marker_name).strip()
+    }
+    keypoints_names = list(keypoints_names or [])
+    if not ignored or len(keypoints_names) == 0:
+        return Q_coords, keypoints_names
+
+    filtered_names = [
+        marker_name for marker_name in keypoints_names
+        if str(marker_name).strip().lower() not in ignored
+    ]
+    if len(filtered_names) == len(keypoints_names):
+        return Q_coords, keypoints_names
+
+    return Q_coords.loc[:, filtered_names].copy(), filtered_names
 
 
 def extract_ball_centers(detection_meta):
@@ -2495,6 +2895,13 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         int(config_dict.get('pose').get('ball_track_max_missing_frames', 12)),
     )
     ball_show_ids = bool(config_dict.get('pose').get('ball_show_ids', True))
+    ball_detector_backend = str(config_dict.get('pose').get('ball_detector_backend', 'same')).strip().lower()
+    sam3_show_realtime_masks = bool(config_dict.get('pose').get('sam3_show_realtime_masks', False))
+    sam3_realtime_mask_alpha = float(np.clip(
+        config_dict.get('pose').get('sam3_realtime_mask_alpha', 0.22),
+        0.0,
+        1.0,
+    ))
 
     # Pixel to meters conversion
     to_meters = config_dict.get('px_to_meters_conversion').get('to_meters')
@@ -2567,6 +2974,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     output_dir = result_dir / output_dir_name
     plots_output_dir = output_dir / f'{output_dir_name}_graphs'
     img_output_dir = output_dir / f'{output_dir_name}_img'
+    pose_ball_output_dir = output_dir / 'pose_ball'
     vid_output_path = output_dir / f'{output_dir_name}.mp4'
     vid_output_tmp_path = output_dir / f'{output_dir_name}__tmp.mp4'
     pose_output_path = output_dir / f'{output_dir_name}_px.trc'
@@ -2712,6 +3120,11 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         backend_name = 'trc'
         # Load pose file in px
         Q_coords, _, time_col, keypoints_names, _ = read_trc(load_trc_px)
+        Q_coords, keypoints_names = strip_auxiliary_trc_markers(
+            Q_coords,
+            keypoints_names,
+            ignored_marker_names=('ball',),
+        )
         t0 = time_col[0]
         tf = time_col.iloc[-1]
         keypoints_ids = [i for i in range(len(keypoints_names))]
@@ -2772,6 +3185,24 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             "ball_selection_mode='id' requires ball_selected_id >= 0. Falling back to auto selection."
         )
         ball_selection_mode = 'auto'
+    uses_sam3_mask_source = (
+        use_synthpose
+        and (
+            str(synthpose_detector).strip().lower() == 'sam3'
+            or (detect_ball and ball_detector_backend == 'sam3')
+        )
+    )
+    sam3_realtime_overlay_enabled = (
+        bool(show_realtime_results)
+        and uses_sam3_mask_source
+        and sam3_show_realtime_masks
+    )
+    sam3_saved_ball_mask_overlay_enabled = (
+        bool(save_vid or save_img)
+        and detect_ball
+        and not load_trc_px
+        and uses_sam3_mask_source
+    )
 
     if flip_left_right:
         try:
@@ -2799,7 +3230,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     # logging.info(f"{'Video, ' if save_vid else ''}{'Images, ' if save_img else ''}{'Pose, ' if save_pose else ''}{'Angles ' if save_angles else ''}{'and ' if save_angles or save_img or save_pose or save_vid else ''}Logs will be saved in {result_dir}.")
     all_frames_X, all_frames_X_flipped, all_frames_Y, all_frames_scores, all_frames_angles = [], [], [], [], []
     all_frames_ball_centers, all_frames_ball_boxes = [], []
+    all_frames_ball_scores = []
     all_frames_ball_tracks, all_frames_selected_ball_ids = [], []
+    all_frames_sam3_ball_mask_meta = []
     ball_trail_points = []
     ball_trail_points_by_id = {}
     ball_previous_center = None
@@ -2855,6 +3288,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             frame_ball_scores = np.empty((0,), dtype=np.float32)
             frame_ball_tracks = []
             frame_selected_ball_id = ball_selected_track_id if ball_multi_id_tracking else None
+            frame_sam3_ball_mask_meta = {}
+            detection_meta = {}
 
             # If frame not grabbed
             if not success:
@@ -2880,8 +3315,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 all_frames_scores.append(nan_pose.copy())
                 all_frames_ball_centers.append(None)
                 all_frames_ball_boxes.append(np.empty((0, 4), dtype=np.float32))
+                all_frames_ball_scores.append(np.empty((0,), dtype=np.float32))
                 all_frames_ball_tracks.append([])
                 all_frames_selected_ball_ids.append(frame_selected_ball_id)
+                all_frames_sam3_ball_mask_meta.append({})
                 if save_angles and calculate_angles:
                     all_frames_angles.append(np.full((1, len(angle_names)), np.nan))
                 continue
@@ -2898,11 +3335,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 if video_file == "webcam":
                     out_vid.write(frame)
 
-                detection_meta = {}
                 try: # Frames with no detection cause errors on MacOS CoreMLExecutionProvider
                     # Detect poses
                     keypoints, scores = pose_tracker(frame)
-                    if ball_overlay_enabled:
+                    if ball_overlay_enabled or sam3_realtime_overlay_enabled or sam3_saved_ball_mask_overlay_enabled:
                         detection_meta = getattr(pose_tracker, 'last_detections', {}) or {}
 
                     # Non maximum suppression (at pose level, not detection, and only using likely keypoints)
@@ -3064,6 +3500,12 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                                 0.6 * float(ball_previous_velocity[0]),
                                 0.6 * float(ball_previous_velocity[1]),
                             )
+
+                if sam3_saved_ball_mask_overlay_enabled:
+                    frame_sam3_ball_mask_meta = filter_sam3_detection_meta_classes(
+                        detection_meta.get('sam3_ball_meta') or detection_meta,
+                        allowed_class_ids=[SAM3_BALL_CLASS_ID],
+                    )
             
             # Process coordinates and compute angles
             valid_X, valid_Y, valid_scores = [], [], []
@@ -3170,6 +3612,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 img = frame.copy()
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (255,255,255), thickness+1, cv2.LINE_AA)
                 cv2.putText(img, f"Press 'q' to stop", (cam_width-int(600*fontSize), cam_height-20), cv2.FONT_HERSHEY_SIMPLEX, fontSize+0.2, (0,0,255), thickness, cv2.LINE_AA)
+                if sam3_realtime_overlay_enabled:
+                    sam3_overlay_meta = detection_meta.get('sam3_ball_meta') or detection_meta
+                    img = draw_sam3_mask_overlay(
+                        img,
+                        sam3_overlay_meta,
+                        alpha=sam3_realtime_mask_alpha,
+                        ball_color=ball_color,
+                    )
                 img = draw_bounding_box(img, valid_X, valid_Y, colors=colors, fontSize=fontSize, thickness=thickness)
                 # Draw keypoints and skeleton using unified draw_pose function
                 if use_synthpose:
@@ -3253,6 +3703,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             all_frames_scores.append(np.array(valid_scores))
             all_frames_ball_centers.append(frame_ball_center)
             all_frames_ball_boxes.append(frame_ball_boxes.copy())
+            all_frames_ball_scores.append(frame_ball_scores.copy())
             frame_ball_tracks_snapshot = []
             for track in frame_ball_tracks:
                 frame_ball_tracks_snapshot.append({
@@ -3272,6 +3723,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 })
             all_frames_ball_tracks.append(frame_ball_tracks_snapshot)
             all_frames_selected_ball_ids.append(frame_selected_ball_id)
+            all_frames_sam3_ball_mask_meta.append(frame_sam3_ball_mask_meta)
             
             if save_angles and calculate_angles:
                 all_frames_angles.append(np.array(valid_angles))
@@ -3380,6 +3832,26 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     break
                 all_frames_ball_centers[frame_idx] = selected_center
     
+    ball_pose_export_enabled = bool(save_pose and ball_overlay_enabled)
+    ball_export_series = []
+    ball_trc_px = pd.DataFrame()
+    public_meter_trc_data_by_name = {}
+    if ball_pose_export_enabled:
+        ball_export_series = build_ball_export_series(
+            all_frames_time,
+            all_frames_ball_centers,
+            all_frames_ball_boxes,
+            all_frames_ball_scores,
+            all_frames_ball_tracks,
+            all_frames_selected_ball_ids,
+            all_frames_sam3_ball_mask_meta,
+            frame_offset=frame_range[0],
+            multi_id_tracking=ball_multi_id_tracking,
+        )
+        write_ball_pose_json(ball_export_series, pose_ball_output_dir, output_dir_name)
+        ball_trc_px = build_ball_trc_data(ball_export_series, index=all_frames_time.index, marker_name='ball')
+        logging.info(f'Ball pose JSON saved to {pose_ball_output_dir.resolve()}.')
+
 
     #%% ==================================================
     # Post-processing pose
@@ -3490,7 +3962,12 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             trc_data_i = trc_data_from_XYZtime(all_frames_X_person_filt, all_frames_Y_person_filt, all_frames_Z_homog, all_frames_time)
             trc_data.append(trc_data_i)
             if not load_trc_px:
-                make_trc_with_trc_data(trc_data_i, str(pose_path_person), fps=fps)
+                trc_data_to_write = append_ball_marker_to_trc_data(
+                    trc_data_i,
+                    ball_trc_px,
+                    marker_name='ball',
+                ) if ball_pose_export_enabled else trc_data_i
+                make_trc_with_trc_data(trc_data_to_write, str(pose_path_person), fps=fps)
                 logging.info(f'Pose in pixels saved to {pose_path_person.resolve()}.')
 
             # Plotting coordinates before and after interpolation and filtering
@@ -3686,6 +4163,24 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     # Write to trc file
                     trc_data_m.append(trc_data_m_i)
                     pose_path_person_m_i = (pose_output_path.parent / (pose_output_path_m.stem + f'_person{i:02d}.trc'))
+                    if ball_pose_export_enabled:
+                        ball_trc_m_i = convert_px_to_meters(
+                            ball_trc_px.reindex(trc_data_m_i.index),
+                            first_person_height,
+                            height_px,
+                            distance_m,
+                            cam_width,
+                            cam_height,
+                            cx,
+                            cy,
+                            -floor_angle_estim,
+                            visible_side=visible_side_i,
+                        )
+                        public_meter_trc_data_by_name[pose_path_person_m_i.name] = append_ball_marker_to_trc_data(
+                            trc_data_m_i,
+                            ball_trc_m_i,
+                            marker_name='ball',
+                        )
                     make_trc_with_trc_data(trc_data_m_i, pose_path_person_m_i, fps=fps)
                     if make_c3d:
                         c3d_path = convert_to_c3d(str(pose_path_person_m_i))
@@ -3890,6 +4385,13 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             if not success:
                 raise ValueError(f"Could not read frame {i}")
             img = frame.copy()
+            if sam3_saved_ball_mask_overlay_enabled and i < len(all_frames_sam3_ball_mask_meta):
+                img = draw_sam3_mask_overlay(
+                    img,
+                    all_frames_sam3_ball_mask_meta[i],
+                    alpha=sam3_realtime_mask_alpha,
+                    ball_color=ball_color,
+                )
             img = draw_bounding_box(img, all_frames_X_processed[i], all_frames_Y_processed[i], colors=colors, fontSize=fontSize, thickness=thickness)
             # Draw keypoints and skeleton using unified draw_pose function
             img = draw_pose(img, all_frames_X_processed[i], all_frames_Y_processed[i],
@@ -4070,3 +4572,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     shutil.move(file, output_dir)
             pose3d_dir.rmdir()
             kinematics_dir.rmdir()
+
+    if public_meter_trc_data_by_name:
+        for trc_name, trc_data_with_ball in public_meter_trc_data_by_name.items():
+            public_m_path = output_dir / trc_name
+            make_trc_with_trc_data(trc_data_with_ball, public_m_path, fps=fps)
+        logging.info('Pose in meters with ball marker saved to final TRC outputs.')
