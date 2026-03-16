@@ -42,6 +42,36 @@ __copyright__ = "Copyright 2024, Sports2D"
 __license__ = "BSD 3-Clause License"
 
 
+def _keypoint_names_in_output_order(skeleton_tree) -> List[str]:
+    """
+    Return keypoint names ordered by the pose-array index.
+
+    anytree traversal order is structural, but pose tensors are indexed by keypoint id.
+    UI layers that display names next to coordinates need this id-sorted order.
+    """
+
+    from anytree import PreOrderIter
+
+    indexed_names = [
+        (int(node.id), str(node.name))
+        for node in PreOrderIter(skeleton_tree)
+        if node.id is not None
+    ]
+    if len(indexed_names) == 0:
+        return []
+
+    indexed_names.sort(key=lambda item: item[0])
+    ordered_ids = [item[0] for item in indexed_names]
+    expected_ids = list(range(len(indexed_names)))
+    if ordered_ids != expected_ids:
+        logging.warning(
+            "Skeleton keypoint ids are not contiguous: %s. "
+            "Output-order keypoint names may be ambiguous.",
+            ordered_ids,
+        )
+    return [item[1] for item in indexed_names]
+
+
 class PoseBackend(ABC):
     """
     Abstract base class for pose estimation backends.
@@ -349,7 +379,6 @@ class RTMLibBackend(PoseBackend):
             ValueError: If pose_model or mode is invalid
         """
         from Pose2Sim.poseEstimation import setup_model_class_mode, setup_backend_device, setup_pose_tracker
-        from anytree import PreOrderIter
 
         pose_config = config_dict.get('pose', {})
 
@@ -388,7 +417,7 @@ class RTMLibBackend(PoseBackend):
                 ball_class_ids = [SPORTS_BALL_CLASS_ID]
 
         # Cache keypoint names and count
-        self._keypoint_names = [node.name for node in PreOrderIter(self._pose_model) if node.id is not None]
+        self._keypoint_names = _keypoint_names_in_output_order(self._pose_model)
         self._num_keypoints = len(self._keypoint_names)
         self._last_detections: Dict[str, np.ndarray] = {}
         self._supports_ball_detection = False

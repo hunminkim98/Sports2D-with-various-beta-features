@@ -76,6 +76,28 @@ __copyright__ = "Copyright 2024, Sports2D"
 __license__ = "BSD 3-Clause License"
 
 
+def _normalize_ball_detector_backend(ball_detector_backend, detector=None, default='same'):
+    '''
+    Normalize the optional dedicated ball detector backend.
+
+    - 'same' reuses the main detector
+    - 'sam3' enables the dedicated SAM3 sports-ball detector
+    - using the same detector name as the person detector is treated as 'same'
+    '''
+    normalized = str(default if ball_detector_backend is None else ball_detector_backend).strip().lower()
+    detector_name = str(detector or '').strip().lower()
+    if normalized in {'same', 'sam3'}:
+        return normalized
+    if detector_name and normalized == detector_name:
+        return 'same'
+    logging.warning(
+        "Unsupported ball_detector_backend '%s'. Falling back to '%s'.",
+        ball_detector_backend,
+        default,
+    )
+    return default
+
+
 class SynthPosePoseTracker:
     '''
     Pose tracker using rtmlib YOLOX + VitPose for 52-keypoint pose estimation.
@@ -158,13 +180,10 @@ class SynthPosePoseTracker:
         self.sam3_store_masks = bool(sam3_store_masks)
         self.sam3_show_realtime_masks = bool(sam3_show_realtime_masks)
         self.sam3_save_ball_masks = bool(sam3_save_ball_masks)
-        self.ball_detector_backend = str(ball_detector_backend or 'same').strip().lower()
-        if self.ball_detector_backend not in {'same', 'sam3'}:
-            logging.warning(
-                "Unsupported ball_detector_backend '%s'. Falling back to 'same'.",
-                ball_detector_backend,
-            )
-            self.ball_detector_backend = 'same'
+        self.ball_detector_backend = _normalize_ball_detector_backend(
+            ball_detector_backend,
+            detector=detector,
+        )
         self.sam3_collect_masks = bool(
             self.sam3_store_masks or self.sam3_show_realtime_masks or self.sam3_save_ball_masks
         )

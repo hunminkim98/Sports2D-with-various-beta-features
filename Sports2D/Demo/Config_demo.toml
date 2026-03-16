@@ -12,13 +12,13 @@
 
 
 [base]
-video_input = '메디신볼'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
+video_input = 'demo.mp4'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
 nb_persons_to_detect = 1   # int or 'all' # Limiting or not the number of persons to be analyzed
 person_ordering_method = 'highest_likelihood' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size',  'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
-first_person_height = 1.65  # Height of the reference person in meters (for pixels -> meters conversion: not used if a calibration file is provided)
+first_person_height = 1.8  # Height of the reference person in meters (for pixels -> meters conversion: not used if a calibration file is provided)
 visible_side = ['right']  # Choose visible side among ['right', 'left', 'front', 'back', 'auto', 'none']. String or list of strings.
                   # if 'auto', will be either 'left', 'right', or 'front' depending on the direction of the motion
                   # if 'none', coordinates will be left in 2D rather than 3D
@@ -44,6 +44,10 @@ save_img = false
 save_pose = true
 calculate_angles = true
 save_angles = true
+hybrid_mode = false        # true opens a post-pass manual review UI before final exports
+hybrid_review_pose = true  # when hybrid_mode=true, review selected person keypoints with missing/low-confidence diagnostics
+hybrid_review_ball = true  # when hybrid_mode=true and detect_ball=true, review the selected ball timeline
+hybrid_ui_backend = 'qt'   # 'matplotlib', 'qt', or 'auto'. Qt falls back to matplotlib when PySide6 is unavailable
 result_dir = '' # If empty, project dir is current dir
 
 
@@ -114,7 +118,7 @@ sam3_runtime = 'transformers'
 sam3_store_masks = false
 sam3_show_realtime_masks = true
 sam3_realtime_mask_alpha = 0.5
-ball_detector_backend = 'sam3'
+ball_detector_backend = 'yolox'
 
 ## ============================================================
 ## Mode Selection (Works for both RTMLib and SynthPose)
@@ -199,7 +203,7 @@ max_distance = 250  # in px or None # If a person is detected further than max_d
 # Optional sports ball overlay
 # ball_detector_backend = 'same' reuses synthpose_detector
 # ball_detector_backend = 'sam3' keeps the person detector and adds SAM3 for sports-ball detection
-detect_ball = true
+detect_ball = false
 ball_trail_length = 3000     # Number of recent frames shown in the trajectory
 ball_trail_alpha = 0.35     # Transparency in [0,1]
 ball_radius = 6             # Ball center marker radius (px)
@@ -207,11 +211,11 @@ ball_max_jump_px = 'none'      # Reject detections that jump too far between fra
 ball_detection_threshold = 0.3 # Ball detector confidence threshold
 ball_nms_score_threshold = 0.3  # Lower = higher recall (can add false positives)
 ball_tracking_mode = 'sports2d' # Ball ID association method. Currently sports2d is supported
-ball_ordering_method = 'highest_likelihood' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
+ball_ordering_method = 'on_click' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
 ball_selection_mode = 'auto'    # 'auto' to follow active track, 'id' to force a specific track ID
 ball_selected_id = -1           # Used only when ball_selection_mode='id'. Set >=0 for fixed selection
-ball_tracking_max_distance = 1000 # Max px distance for frame-to-frame ID association. 'none' disables gating
-ball_track_max_missing_frames = 60 # Keep missing tracks for N frames before removing
+ball_tracking_max_distance = 10000 # Max px distance for frame-to-frame ID association. 'none' disables gating
+ball_track_max_missing_frames = 120 # Keep missing tracks for N frames before removing
 ball_show_ids = true            # Draw 'ball {id}' labels on ball boxes
 ball_color = [0, 0, 0]    # BGR (OpenCV), default black
 
@@ -239,7 +243,7 @@ calib_file = ''      # Calibration file in the Pose2Sim toml format, or '' if no
 
 [angles]
 display_angle_values_on = ['body', 'list'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
-fontSize = 0.8
+fontSize = 0.4
 
 # Select joint angles among
 # ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']
@@ -256,7 +260,7 @@ unwrap_angles = false # true keeps np.unwrap continuity correction; false disabl
 
 
 [post-processing]
-interpolate = false
+interpolate = true
 interp_gap_smaller_than = 10        # Do not interpolate larger gaps
 fill_large_gaps_with = 'last_value' # 'last_value', 'nan', or 'zeros' 
 sections_to_keep = 'all' # 'all', 'largest', 'first', 'last'
@@ -266,7 +270,7 @@ reject_outliers = true  # Hampel filter for outlier rejection before other filte
 
 filter = true
 show_graphs = false         # Show plots of raw and processed results
-save_graphs = true         # Save position and angle plots of raw and processed results
+save_graphs = false         # Save position and angle plots of raw and processed results
 filter_type = 'butterworth'     # butterworth, kalman, gcv_spline, gaussian, loess, median, butterworth_on_speed
    
    # Most intuitive and standard filter in biomechanics

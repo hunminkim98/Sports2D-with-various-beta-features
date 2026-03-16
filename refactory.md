@@ -15,6 +15,17 @@
 - 2026-02-14: `angles.unwrap_angles` 설정이 추가되었습니다.
   - `true` (기본): 기존 `np.unwrap` 기반 연속성 보정을 수행합니다.
   - `false`: unwrap 단계를 건너뛰고 원시 각도 흐름을 후처리합니다.
+- 2026-03-16: `base.hybrid_mode`, `base.hybrid_review_pose`, `base.hybrid_review_ball` 설정이 추가되었습니다.
+  - `hybrid_mode=true`이면 자동 추정이 끝난 뒤 선택된 사람/ball timeline을 수동 검토하는 post-pass UI가 열립니다.
+  - pose review는 raw pixel keypoint를 직접 수정한 뒤 기존 interpolation/filtering/angle/TRC export를 다시 태웁니다.
+  - manual UI는 프레임별 `missing`, `low_confidence`, `manually_edited`, `derived` 상태를 리스트와 색상으로 구분해 보여줍니다.
+  - `detect_ball=true`일 때는 선택된 ball timeline에 대해서도 자동 + 수동 보정을 지원합니다.
+  - pose/ball review 모두 마우스 스크롤 기반 확대/축소를 지원해 세밀한 수동 편집이 쉬워졌습니다.
+- 2026-03-16: `base.hybrid_ui_backend` 설정이 추가되었습니다.
+  - `matplotlib`은 기존 editor를 유지합니다.
+  - `qt`는 PySide6 기반 hybrid editor를 사용해 보다 매끄러운 재생/탐색을 제공합니다.
+  - Qt editor는 기존 hybrid correction contract를 유지하며, 초기화 실패 시 Matplotlib editor로 fallback 합니다.
+  - Qt editor는 마우스 휠 확대/축소 외에도 가운데 버튼 드래그 평행이동과 우클릭 선택 해제를 지원합니다.
 
 ---
 

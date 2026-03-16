@@ -202,7 +202,14 @@ def get_start_time_ffmpeg(video_path):
         return 0.0
     
     cmd = [ffmpeg_path, "-i", video_path]
-    result = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
+    result = subprocess.run(
+        cmd,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+    )
     for line in result.stderr.splitlines():
         if "start:" in line:
             parts = line.split("start:")
@@ -291,6 +298,8 @@ def transcode_video_ffmpeg(input_video_path, output_video_path, codec='h264',
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             check=True,
         )
     except subprocess.CalledProcessError as e:

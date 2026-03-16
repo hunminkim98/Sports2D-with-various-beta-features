@@ -99,6 +99,13 @@ except ImportError:
 # Unified pose backend abstraction
 from Sports2D.Utilities.pose_backend import create_pose_backend
 from Sports2D.Utilities.realtime_display import create_realtime_display
+from Sports2D.Utilities.hybrid_editor import (
+    apply_ball_override_to_tracks,
+    augment_pose_arrays_with_derived_keypoints,
+    evaluate_pose_frame,
+    review_ball_sequence,
+    review_pose_sequence,
+)
 from Sports2D.Utilities.sam3_detector import (
     PERSON_CLASS_ID as SAM3_PERSON_CLASS_ID,
     SPORTS_BALL_CLASS_ID as SAM3_BALL_CLASS_ID,
@@ -603,6 +610,51 @@ def strip_auxiliary_trc_markers(Q_coords, keypoints_names, ignored_marker_names=
     return Q_coords.loc[:, filtered_names].copy(), filtered_names
 
 
+def _remap_pose_model_ids_by_keypoint_names(pose_model, keypoint_names):
+    '''
+    Return a pose-model copy whose node ids match the current keypoint tensor order.
+
+    anytree traversal order is not guaranteed to match the processed pose tensor
+    column order. Saved overlay rendering indexes keypoint arrays through node.id,
+    so ids must be reassigned by keypoint name rather than preorder position.
+    '''
+    from anytree import PreOrderIter
+
+    remapped_pose_model = copy.deepcopy(pose_model)
+    name_to_idx = {
+        str(name): idx for idx, name in enumerate(list(keypoint_names or []))
+    }
+
+    for node in PreOrderIter(remapped_pose_model):
+        node_name = str(getattr(node, 'name', ''))
+        node.id = name_to_idx.get(node_name)
+
+    return remapped_pose_model
+
+
+def _select_pose_keypoint_columns(frame_values, source_keypoint_names, target_keypoint_names):
+    '''
+    Return pose-array columns reordered to the requested keypoint-name schema.
+    '''
+
+    source_keypoint_names = list(source_keypoint_names or [])
+    target_keypoint_names = list(target_keypoint_names or [])
+    column_indices = []
+    missing_names = []
+    for keypoint_name in target_keypoint_names:
+        if keypoint_name not in source_keypoint_names:
+            missing_names.append(keypoint_name)
+            continue
+        column_indices.append(source_keypoint_names.index(keypoint_name))
+
+    if missing_names:
+        raise ValueError(
+            f"Pose review output is missing required keypoints: {missing_names}"
+        )
+
+    return np.take(np.asarray(frame_values), column_indices, axis=-1)
+
+
 def extract_ball_centers(detection_meta):
     '''
     Extract integer ball centers from xyxy detector boxes.
@@ -677,6 +729,31 @@ def _parse_ball_ordering_method(value, default='first_detected'):
         )
         method = default
     return method
+
+
+def _parse_ball_detector_backend(value, synthpose_detector=None, default='same'):
+    '''
+    Parse ball detector backend.
+
+    Supported modes:
+    - same: reuse the main synthpose detector
+    - sam3: add a dedicated SAM3 sports-ball detector
+
+    For convenience, specifying the same detector name as `synthpose_detector`
+    is treated as `same`.
+    '''
+    backend = str(default if value is None else value).strip().lower()
+    detector_name = str(synthpose_detector or '').strip().lower()
+    if backend in {'same', 'sam3'}:
+        return backend
+    if detector_name and backend == detector_name:
+        return 'same'
+    logging.warning(
+        "Unsupported ball_detector_backend '%s'. Falling back to '%s'.",
+        value,
+        default,
+    )
+    return default
 
 
 def _parse_ball_selected_id(value):
@@ -1591,6 +1668,191 @@ def compute_angle(ang_name, person_X_flipped, person_Y, angle_dict, keypoints_id
         ang = np.nan
     
     return ang
+
+
+def _upsert_derived_pose_keypoint(derived_name, person_X, person_Y, person_scores, keypoint_names):
+    '''
+    Recompute a derived keypoint from its source markers and upsert it into the frame arrays.
+    '''
+
+    source_map = {
+        'Hip': ('LHip', 'RHip'),
+        'Neck': ('LShoulder', 'RShoulder'),
+    }
+    source_names = source_map.get(derived_name)
+    if source_names is None:
+        return person_X, person_Y, person_scores, list(keypoint_names)
+
+    keypoint_names = list(keypoint_names)
+    if not all(source_name in keypoint_names for source_name in source_names):
+        x_value = np.nan
+        y_value = np.nan
+        score_value = np.nan
+    else:
+        idx_a = keypoint_names.index(source_names[0])
+        idx_b = keypoint_names.index(source_names[1])
+        x_candidates = np.asarray([person_X[idx_a], person_X[idx_b]], dtype=float)
+        y_candidates = np.asarray([person_Y[idx_a], person_Y[idx_b]], dtype=float)
+        score_candidates = np.asarray([person_scores[idx_a], person_scores[idx_b]], dtype=float)
+        x_value = float(np.nanmean(x_candidates)) if np.any(np.isfinite(x_candidates)) else np.nan
+        y_value = float(np.nanmean(y_candidates)) if np.any(np.isfinite(y_candidates)) else np.nan
+        score_value = float(np.nanmean(score_candidates)) if np.any(np.isfinite(score_candidates)) else np.nan
+
+    if derived_name in keypoint_names:
+        derived_idx = keypoint_names.index(derived_name)
+        person_X[derived_idx] = x_value
+        person_Y[derived_idx] = y_value
+        person_scores[derived_idx] = score_value
+    else:
+        person_X = np.append(person_X, x_value)
+        person_Y = np.append(person_Y, y_value)
+        person_scores = np.append(person_scores, score_value)
+        keypoint_names.append(derived_name)
+
+    return person_X, person_Y, person_scores, keypoint_names
+
+
+def _recompute_pose_frame_from_raw(
+    raw_person_X,
+    raw_person_Y,
+    raw_person_scores,
+    raw_keypoint_names,
+    keypoint_likelihood_threshold,
+    average_likelihood_threshold,
+    keypoint_number_threshold,
+    flip_left_right,
+    L_R_direction_idx,
+    angle_names,
+    calculate_angles,
+    visible_side_person='auto',
+):
+    '''
+    Recompute filtered coordinates, flipped coordinates, and angles from raw pose values.
+    '''
+
+    person_X, person_Y, person_scores, _ = evaluate_pose_frame(
+        raw_person_X,
+        raw_person_Y,
+        raw_person_scores,
+        keypoint_likelihood_threshold,
+        average_likelihood_threshold,
+        keypoint_number_threshold,
+    )
+
+    keypoint_names = list(raw_keypoint_names)
+    for derived_name in ['Hip', 'Neck']:
+        person_X, person_Y, person_scores, keypoint_names = _upsert_derived_pose_keypoint(
+            derived_name,
+            person_X,
+            person_Y,
+            person_scores,
+            keypoint_names,
+        )
+
+    keypoint_ids = list(range(len(keypoint_names)))
+    if flip_left_right and L_R_direction_idx is not None:
+        person_X_flipped = flip_left_right_direction(
+            person_X.copy(),
+            L_R_direction_idx,
+            keypoint_names,
+            keypoint_ids,
+        )
+    else:
+        person_X_flipped = person_X.copy()
+
+    if calculate_angles:
+        person_angles = []
+        for ang_name in angle_names:
+            ang_params = angle_dict.get(ang_name)
+            kpts = ang_params[0] if ang_params is not None else []
+            if not any(item not in keypoint_names for item in kpts):
+                ang = compute_angle(
+                    ang_name,
+                    person_X_flipped,
+                    person_Y,
+                    angle_dict,
+                    keypoint_ids,
+                    keypoint_names,
+                )
+            else:
+                ang = np.nan
+            person_angles.append(ang)
+        if visible_side_person == 'left' and not flip_left_right:
+            person_angles = list(-np.array(person_angles, dtype=float))
+    else:
+        person_angles = []
+
+    return (
+        np.asarray(person_X, dtype=float),
+        np.asarray(person_Y, dtype=float),
+        np.asarray(person_scores, dtype=float),
+        np.asarray(person_X_flipped, dtype=float),
+        np.asarray(person_angles, dtype=float),
+        keypoint_names,
+    )
+
+
+def _recompute_pose_timelines_from_raw(
+    raw_frames_X,
+    raw_frames_Y,
+    raw_frames_scores,
+    raw_keypoint_names,
+    keypoint_likelihood_threshold,
+    average_likelihood_threshold,
+    keypoint_number_threshold,
+    flip_left_right,
+    L_R_direction_idx,
+    angle_names,
+    calculate_angles,
+    visible_side_person='auto',
+):
+    '''
+    Recompute timeline arrays for one selected person after manual edits.
+    '''
+
+    frame_count = len(raw_frames_X)
+    expected_keypoint_names = list(raw_keypoint_names)
+    for derived_name in ['Hip', 'Neck']:
+        if derived_name not in expected_keypoint_names:
+            expected_keypoint_names.append(derived_name)
+
+    filtered_X = np.full((frame_count, len(expected_keypoint_names)), np.nan, dtype=float)
+    filtered_Y = np.full_like(filtered_X, np.nan)
+    filtered_scores = np.full_like(filtered_X, np.nan)
+    filtered_X_flipped = np.full_like(filtered_X, np.nan)
+    if calculate_angles:
+        filtered_angles = np.full((frame_count, len(angle_names)), np.nan, dtype=float)
+    else:
+        filtered_angles = np.empty((frame_count, 0), dtype=float)
+
+    for frame_idx in range(frame_count):
+        person_X, person_Y, person_scores, person_X_flipped, person_angles, keypoint_names = _recompute_pose_frame_from_raw(
+            raw_frames_X[frame_idx],
+            raw_frames_Y[frame_idx],
+            raw_frames_scores[frame_idx],
+            raw_keypoint_names,
+            keypoint_likelihood_threshold,
+            average_likelihood_threshold,
+            keypoint_number_threshold,
+            flip_left_right,
+            L_R_direction_idx,
+            angle_names,
+            calculate_angles,
+            visible_side_person=visible_side_person,
+        )
+        if keypoint_names != expected_keypoint_names:
+            raise ValueError(
+                f"Hybrid recompute produced an inconsistent keypoint schema: "
+                f"{keypoint_names} != {expected_keypoint_names}"
+            )
+        filtered_X[frame_idx] = person_X
+        filtered_Y[frame_idx] = person_Y
+        filtered_scores[frame_idx] = person_scores
+        filtered_X_flipped[frame_idx] = person_X_flipped
+        if calculate_angles:
+            filtered_angles[frame_idx] = person_angles
+
+    return filtered_X, filtered_Y, filtered_scores, filtered_X_flipped, filtered_angles, expected_keypoint_names
 
 
 def draw_dotted_line(img, start, direction, length, color=(0, 255, 0), gap=7, dot_length=3, thickness=thickness):
@@ -2846,6 +3108,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     save_pose = config_dict.get('base').get('save_pose')
     calculate_angles = config_dict.get('base').get('calculate_angles')
     save_angles = config_dict.get('base').get('save_angles')
+    hybrid_mode = bool(config_dict.get('base').get('hybrid_mode', False))
+    hybrid_review_pose = bool(config_dict.get('base').get('hybrid_review_pose', True))
+    hybrid_review_ball = bool(config_dict.get('base').get('hybrid_review_ball', True))
+    hybrid_ui_backend = config_dict.get('base').get('hybrid_ui_backend', 'matplotlib')
 
     # Pose_advanced settings
     slowmo_factor = config_dict.get('pose').get('slowmo_factor')
@@ -2876,6 +3142,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     ball_trail_length = max(1, int(config_dict.get('pose').get('ball_trail_length', 20)))
     ball_trail_alpha = float(np.clip(config_dict.get('pose').get('ball_trail_alpha', 0.35), 0.0, 1.0))
     ball_radius = max(1, int(config_dict.get('pose').get('ball_radius', 4)))
+    ball_detection_threshold = float(np.clip(config_dict.get('pose').get('ball_detection_threshold', 0.1), 0.01, 0.9))
     ball_max_jump_px = _parse_ball_max_jump_px(config_dict.get('pose').get('ball_max_jump_px', 120))
     ball_color = _parse_ball_color(config_dict.get('pose').get('ball_color', [0, 0, 0]))
     ball_tracking_mode = str(config_dict.get('pose').get('ball_tracking_mode', 'sports2d')).strip().lower()
@@ -2895,7 +3162,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         int(config_dict.get('pose').get('ball_track_max_missing_frames', 12)),
     )
     ball_show_ids = bool(config_dict.get('pose').get('ball_show_ids', True))
-    ball_detector_backend = str(config_dict.get('pose').get('ball_detector_backend', 'same')).strip().lower()
+    ball_detector_backend = _parse_ball_detector_backend(
+        config_dict.get('pose').get('ball_detector_backend', 'same'),
+        synthpose_detector=synthpose_detector,
+    )
     sam3_show_realtime_masks = bool(config_dict.get('pose').get('sam3_show_realtime_masks', False))
     sam3_realtime_mask_alpha = float(np.clip(
         config_dict.get('pose').get('sam3_realtime_mask_alpha', 0.22),
@@ -3140,12 +3410,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         frame_iterator = tqdm(range(*frame_range))
     
     else:
-        # Retrieve keypoint names from model
-        keypoints_ids = [node.id for _, _, node in RenderTree(pose_model) if node.id!=None]
-        keypoints_names = [node.name for _, _, node in RenderTree(pose_model) if node.id!=None]
         t0 = 0
         tf = (cap.get(cv2.CAP_PROP_FRAME_COUNT)-1) / fps if cap.get(cv2.CAP_PROP_FRAME_COUNT)>0 else float('inf')
-        kpt_id_max = max(keypoints_ids)+1
 
         # Set up pose tracker using unified backend
         try:
@@ -3157,6 +3423,21 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         except Exception as e:
             logging.error(f'Error: Pose estimation backend initialization failed: {e}')
             raise ValueError(f'Error: Pose estimation backend initialization failed: {e}')
+
+        keypoints_names = list(getattr(pose_tracker, 'keypoint_names', []) or [])
+        if len(keypoints_names) == 0:
+            indexed_names = sorted(
+                [
+                    (int(node.id), str(node.name))
+                    for _, _, node in RenderTree(pose_model)
+                    if node.id is not None
+                ],
+                key=lambda item: item[0],
+            )
+            keypoints_names = [name for _, name in indexed_names]
+        keypoints_ids = list(range(len(keypoints_names)))
+        kpt_id_max = len(keypoints_names)
+
         logging.info(f'Persons detection is run every {det_frequency} frames (pose estimation is run at every frame). Tracking is done with {tracking_mode}.')
         
         if tracking_mode == 'deepsort': 
@@ -3204,6 +3485,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         and uses_sam3_mask_source
     )
 
+    raw_keypoint_names = keypoints_names.copy()
+    L_R_direction_idx = None
     if flip_left_right:
         try:
             Ltoe_idx = keypoints_ids[keypoints_names.index('LBigToe')]
@@ -3229,6 +3512,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     logging.info(f"\nProcessing video stream...")
     # logging.info(f"{'Video, ' if save_vid else ''}{'Images, ' if save_img else ''}{'Pose, ' if save_pose else ''}{'Angles ' if save_angles else ''}{'and ' if save_angles or save_img or save_pose or save_vid else ''}Logs will be saved in {result_dir}.")
     all_frames_X, all_frames_X_flipped, all_frames_Y, all_frames_scores, all_frames_angles = [], [], [], [], []
+    all_frames_X_raw, all_frames_Y_raw, all_frames_scores_raw = [], [], []
     all_frames_ball_centers, all_frames_ball_boxes = [], []
     all_frames_ball_scores = []
     all_frames_ball_tracks, all_frames_selected_ball_ids = [], []
@@ -3309,10 +3593,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
                 kpt_count = len(new_keypoints_names)
                 nan_pose = np.full((1, kpt_count), np.nan)
+                raw_nan_pose = np.full((1, len(raw_keypoint_names)), np.nan)
                 all_frames_X.append(nan_pose.copy())
                 all_frames_X_flipped.append(nan_pose.copy())
                 all_frames_Y.append(nan_pose.copy())
                 all_frames_scores.append(nan_pose.copy())
+                all_frames_X_raw.append(raw_nan_pose.copy())
+                all_frames_Y_raw.append(raw_nan_pose.copy())
+                all_frames_scores_raw.append(raw_nan_pose.copy())
                 all_frames_ball_centers.append(None)
                 all_frames_ball_boxes.append(np.empty((0, 4), dtype=np.float32))
                 all_frames_ball_scores.append(np.empty((0,), dtype=np.float32))
@@ -3509,10 +3797,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             
             # Process coordinates and compute angles
             valid_X, valid_Y, valid_scores = [], [], []
+            raw_X, raw_Y, raw_scores = [], [], []
             render_X, render_Y, render_scores = [], [], []
             valid_X_flipped, valid_angles_flipped, valid_angles = [], [], []
             for person_idx in range(len(keypoints)):
                 if load_trc_px:
+                    person_X_raw = keypoints[person_idx][:,0]
+                    person_Y_raw = keypoints[person_idx][:,1]
+                    person_scores_raw = scores[person_idx]
                     person_X = keypoints[person_idx][:,0]
                     person_Y = keypoints[person_idx][:,1]
                     person_scores = scores[person_idx]
@@ -3522,31 +3814,15 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     person_X_raw = keypoints[person_idx][:,0]
                     person_Y_raw = keypoints[person_idx][:,1]
                     person_scores_raw = scores[person_idx]
-                    person_X, person_Y = np.where(scores[person_idx][:, np.newaxis] < keypoint_likelihood_threshold, np.nan, keypoints[person_idx]).T
-                    person_scores = np.where(scores[person_idx] < keypoint_likelihood_threshold, np.nan, scores[person_idx])
-
-                    # Skip person if the fraction of valid detected keypoints is too low
-                    enough_good_keypoints = len(person_scores[~np.isnan(person_scores)]) >= len(person_scores) * keypoint_number_threshold
-                    scores_of_good_keypoints = person_scores[~np.isnan(person_scores)]
-                    average_score_of_remaining_keypoints_is_enough = (np.nanmean(scores_of_good_keypoints) if len(scores_of_good_keypoints)>0 else 0) >= average_likelihood_threshold
-                    if not enough_good_keypoints or not average_score_of_remaining_keypoints_is_enough:
-                        person_X = np.full_like(person_X, np.nan)
-                        person_Y = np.full_like(person_Y, np.nan)
-                        person_scores = np.full_like(person_scores, np.nan)
+                    person_X, person_Y, person_scores, _ = evaluate_pose_frame(
+                        person_X_raw,
+                        person_Y_raw,
+                        person_scores_raw,
+                        keypoint_likelihood_threshold,
+                        average_likelihood_threshold,
+                        keypoint_number_threshold,
+                    )
                     person_render_X, person_render_Y, person_render_scores = person_X, person_Y, person_scores
-
-                    
-                    
-                    ## RECREATE KEYPOINTS, SCORES
-
-
-
-
-
-
-
-
-
                 # Check whether the person is looking to the left or right
                 if flip_left_right:
                     person_X_flipped = flip_left_right_direction(person_X, L_R_direction_idx, keypoints_names, keypoints_ids)
@@ -3585,6 +3861,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     valid_angles.append(person_angles)
                     valid_angles_flipped.append(person_angles_flipped)
                     valid_X_flipped.append(person_X_flipped)
+                raw_X.append(person_X_raw)
+                raw_Y.append(person_Y_raw)
+                raw_scores.append(person_scores_raw)
                 valid_X.append(person_X)
                 valid_Y.append(person_Y)
                 valid_scores.append(person_scores)
@@ -3595,9 +3874,13 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             # Keep frame arrays homogeneous when no person is detected in a frame.
             if len(valid_X) == 0:
                 kpt_count = len(new_keypoints_names)
+                raw_kpt_count = len(raw_keypoint_names)
                 valid_X = [np.full(kpt_count, np.nan)]
                 valid_Y = [np.full(kpt_count, np.nan)]
                 valid_scores = [np.full(kpt_count, np.nan)]
+                raw_X = [np.full(raw_kpt_count, np.nan)]
+                raw_Y = [np.full(raw_kpt_count, np.nan)]
+                raw_scores = [np.full(raw_kpt_count, np.nan)]
                 render_X = [np.full(kpt_count, np.nan)]
                 render_Y = [np.full(kpt_count, np.nan)]
                 render_scores = [np.full(kpt_count, np.nan)]
@@ -3701,6 +3984,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             all_frames_X_flipped.append(np.array(valid_X_flipped))
             all_frames_Y.append(np.array(valid_Y))
             all_frames_scores.append(np.array(valid_scores))
+            all_frames_X_raw.append(np.array(raw_X))
+            all_frames_Y_raw.append(np.array(raw_Y))
+            all_frames_scores_raw.append(np.array(raw_scores))
             all_frames_ball_centers.append(frame_ball_center)
             all_frames_ball_boxes.append(frame_ball_boxes.copy())
             all_frames_ball_scores.append(frame_ball_scores.copy())
@@ -3748,6 +4034,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     #%% ==================================================
     # Post-processing: Select persons, Interpolate, filter, and save pose and angles
     # ====================================================
+    all_frames_X_raw_homog = make_homogeneous(all_frames_X_raw)
+    all_frames_Y_raw_homog = make_homogeneous(all_frames_Y_raw)
+    all_frames_scores_raw_homog = make_homogeneous(all_frames_scores_raw)
     all_frames_X_homog = make_homogeneous(all_frames_X)
     all_frames_X_homog = all_frames_X_homog[...,new_keypoints_ids]
     if calculate_angles or save_angles:
@@ -3831,7 +4120,108 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     selected_center = tuple(center) if center is not None else None
                     break
                 all_frames_ball_centers[frame_idx] = selected_center
-    
+
+    if hybrid_mode and len(selected_persons) > 0:
+        if hybrid_review_pose:
+            logging.info('Hybrid pose review enabled. Opening manual pose editor for selected persons.')
+            for selected_person_slot, idx_person in enumerate(selected_persons):
+                visible_side_person = visible_side[selected_person_slot] if len(visible_side) > selected_person_slot else 'auto'
+                review_X_raw, review_Y_raw, review_scores_raw, review_keypoint_names = augment_pose_arrays_with_derived_keypoints(
+                    all_frames_X_raw_homog[:, idx_person, :],
+                    all_frames_Y_raw_homog[:, idx_person, :],
+                    all_frames_scores_raw_homog[:, idx_person, :],
+                    raw_keypoint_names,
+                )
+                corrected_X_review, corrected_Y_review, corrected_scores_review, _ = review_pose_sequence(
+                    video_file_path,
+                    frame_range,
+                    review_X_raw,
+                    review_Y_raw,
+                    review_scores_raw,
+                    keypoint_names=review_keypoint_names,
+                    keypoint_threshold=keypoint_likelihood_threshold,
+                    manual_mask=np.zeros_like(review_scores_raw, dtype=bool),
+                    window_title=f'Hybrid pose review - person {selected_person_slot}',
+                    ui_backend=hybrid_ui_backend,
+                )
+                corrected_X_raw = _select_pose_keypoint_columns(
+                    corrected_X_review,
+                    review_keypoint_names,
+                    raw_keypoint_names,
+                )
+                corrected_Y_raw = _select_pose_keypoint_columns(
+                    corrected_Y_review,
+                    review_keypoint_names,
+                    raw_keypoint_names,
+                )
+                corrected_scores_raw = _select_pose_keypoint_columns(
+                    corrected_scores_review,
+                    review_keypoint_names,
+                    raw_keypoint_names,
+                )
+                all_frames_X_raw_homog[:, idx_person, :] = corrected_X_raw
+                all_frames_Y_raw_homog[:, idx_person, :] = corrected_Y_raw
+                all_frames_scores_raw_homog[:, idx_person, :] = corrected_scores_raw
+
+                (
+                    corrected_X,
+                    corrected_Y,
+                    corrected_scores,
+                    corrected_X_flipped,
+                    corrected_angles,
+                    corrected_keypoint_names,
+                ) = _recompute_pose_timelines_from_raw(
+                    corrected_X_raw,
+                    corrected_Y_raw,
+                    corrected_scores_raw,
+                    raw_keypoint_names,
+                    keypoint_likelihood_threshold,
+                    average_likelihood_threshold,
+                    keypoint_number_threshold,
+                    flip_left_right,
+                    L_R_direction_idx,
+                    angle_names,
+                    calculate_angles,
+                    visible_side_person=visible_side_person,
+                )
+                if corrected_keypoint_names != new_keypoints_names:
+                    raise ValueError(
+                        f"Hybrid pose review changed the keypoint schema unexpectedly: "
+                        f"{corrected_keypoint_names} != {new_keypoints_names}"
+                    )
+                all_frames_X_homog[:, idx_person, :] = corrected_X
+                all_frames_Y_homog[:, idx_person, :] = corrected_Y
+                all_frames_scores_homog[:, idx_person, :] = corrected_scores
+                if calculate_angles or save_angles:
+                    all_frames_X_flipped_homog[:, idx_person, :] = corrected_X_flipped
+                    all_frames_angles_homog[:, idx_person, :] = corrected_angles
+
+        if hybrid_review_ball and ball_overlay_enabled:
+            logging.info('Hybrid ball review enabled. Opening manual ball editor.')
+            corrected_ball_centers, corrected_ball_visible, manual_ball_override_mask = review_ball_sequence(
+                video_file_path,
+                frame_range,
+                all_frames_ball_centers,
+                all_frames_ball_boxes,
+                all_frames_ball_scores,
+                all_frames_ball_tracks,
+                all_frames_selected_ball_ids,
+                score_threshold=ball_detection_threshold,
+                window_title='Hybrid ball review',
+                ui_backend=hybrid_ui_backend,
+            )
+            for frame_idx, center in enumerate(corrected_ball_centers):
+                if not manual_ball_override_mask[frame_idx]:
+                    continue
+                all_frames_ball_centers[frame_idx] = center if corrected_ball_visible[frame_idx] else None
+                if ball_multi_id_tracking:
+                    all_frames_ball_tracks[frame_idx] = apply_ball_override_to_tracks(
+                        all_frames_ball_tracks[frame_idx],
+                        all_frames_selected_ball_ids[frame_idx] if frame_idx < len(all_frames_selected_ball_ids) else None,
+                        all_frames_ball_centers[frame_idx],
+                        corrected_ball_visible[frame_idx],
+                    )
+
     ball_pose_export_enabled = bool(save_pose and ball_overlay_enabled)
     ball_export_series = []
     ball_trc_px = pd.DataFrame()
@@ -4358,19 +4748,12 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             all_frames_X_flipped_processed = all_frames_X_flipped_processed[:,selected_persons,:]
             all_frames_angles_processed = all_frames_angles_processed[:,selected_persons,:]
 
-        # Reorder keypoints ids
-        pose_model_with_new_ids = copy.deepcopy(pose_model)
-        new_id = 0
-        for node in PreOrderIter(pose_model_with_new_ids):
-            if node.id!=None:
-                node.id = new_id
-                new_id+=1
-        max_id = max(node.id for node in PreOrderIter(pose_model_with_new_ids) if node.id is not None)
-        for node in PreOrderIter(pose_model_with_new_ids):
-            if node.id==None:
-                node.id = max_id+1
-                max_id+=1
-        new_keypoints_ids = list(range(len(new_keypoints_ids)))
+        # Saved overlay arrays are ordered by keypoint name, not anytree traversal.
+        pose_model_with_new_ids = _remap_pose_model_ids_by_keypoint_names(
+            pose_model,
+            new_keypoints_names,
+        )
+        saved_overlay_keypoint_ids = list(range(len(new_keypoints_names)))
 
         # Draw pose and angles on the full processed frame range.
         first_frame = frame_range[0]
@@ -4378,12 +4761,26 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         last_trim = all_frames_X_processed.shape[0]
         ball_replay_trail = []
         ball_replay_trails_by_id = {}
+        replay_fallback_frame = None
+        replay_read_failures = []
         cap = cv2.VideoCapture(video_file_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame+first_trim)
         for i in range(first_trim, last_trim):
+            source_frame_idx = first_frame + i
             success, frame = cap.read()
             if not success:
-                raise ValueError(f"Could not read frame {i}")
+                replay_read_failures.append(source_frame_idx)
+                if replay_fallback_frame is not None:
+                    frame = replay_fallback_frame.copy()
+                else:
+                    frame = np.zeros((cam_height, cam_width, 3), dtype=np.uint8)
+                if len(replay_read_failures) <= 3:
+                    logging.warning(
+                        "Could not read source frame %s while saving overlays. Reusing the last readable frame.",
+                        source_frame_idx,
+                    )
+            else:
+                replay_fallback_frame = frame.copy()
             img = frame.copy()
             if sam3_saved_ball_mask_overlay_enabled and i < len(all_frames_sam3_ball_mask_meta):
                 img = draw_sam3_mask_overlay(
@@ -4399,7 +4796,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             keypoint_names=new_keypoints_names if use_synthpose else None,
                             backend_name=backend_name, thickness=thickness)
             if calculate_angles:
-                img = draw_angles(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_angles_processed[i], all_frames_X_flipped_processed[i], new_keypoints_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
+                img = draw_angles(img, all_frames_X_processed[i], all_frames_Y_processed[i], all_frames_angles_processed[i], all_frames_X_flipped_processed[i], saved_overlay_keypoint_ids, new_keypoints_names, angle_names, display_angle_values_on=display_angle_values_on, colors=colors, fontSize=fontSize, thickness=thickness)
             if ball_overlay_enabled and i < len(all_frames_ball_centers):
                 frame_ball_center = all_frames_ball_centers[i]
                 frame_ball_boxes = all_frames_ball_boxes[i] if i < len(all_frames_ball_boxes) else np.empty((0, 4), dtype=np.float32)
@@ -4412,6 +4809,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             if int(track.get('id')) == int(frame_selected_ball_id) and track.get('visible', False):
                                 selected_center = tuple(track.get('center')) if track.get('center') is not None else None
                                 break
+                    if selected_center is None and frame_ball_center is not None:
+                        selected_center = tuple(frame_ball_center)
                     frame_ball_center = selected_center
                     if frame_selected_ball_id is not None and selected_center is not None:
                         replay_trail = ball_replay_trails_by_id.get(frame_selected_ball_id, [])
@@ -4445,6 +4844,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             if save_img:
                 cv2.imwrite(str((img_output_dir / f'{output_dir_name}_{(i+frame_range[0]):06d}.png')), img)
         cap.release()
+        if replay_read_failures:
+            logging.warning(
+                "Reused the last readable frame while saving overlays for %d unreadable source frames "
+                "(first=%s, last=%s).",
+                len(replay_read_failures),
+                replay_read_failures[0],
+                replay_read_failures[-1],
+            )
 
         if save_vid:
             out_vid.release()

@@ -229,6 +229,32 @@ def test_parse_ball_ordering_method_falls_back_for_invalid_values():
     assert _parse_ball_ordering_method('not_a_mode', default='first_detected') == 'first_detected'
 
 
+def test_parse_ball_detector_backend_accepts_matching_detector_alias():
+    '''
+    Verify ball detector backend parser treats the same detector name as 'same'.
+    '''
+
+    from Sports2D.process import _parse_ball_detector_backend
+
+    assert _parse_ball_detector_backend('same', synthpose_detector='yolox') == 'same'
+    assert _parse_ball_detector_backend('sam3', synthpose_detector='yolox') == 'sam3'
+    assert _parse_ball_detector_backend('yolox', synthpose_detector='yolox') == 'same'
+    assert _parse_ball_detector_backend('not_a_backend', synthpose_detector='yolox') == 'same'
+
+
+def test_synthpose_tracker_normalizes_matching_ball_detector_alias():
+    '''
+    Verify SynthPose tracker backend normalization accepts the active detector name as an alias for 'same'.
+    '''
+
+    from Sports2D.Utilities.synthpose_tracker import _normalize_ball_detector_backend
+
+    assert _normalize_ball_detector_backend('same', detector='yolox') == 'same'
+    assert _normalize_ball_detector_backend('sam3', detector='yolox') == 'sam3'
+    assert _normalize_ball_detector_backend('yolox', detector='yolox') == 'same'
+    assert _normalize_ball_detector_backend('not_a_backend', detector='yolox') == 'same'
+
+
 def test_parse_video_codec_accepts_aliases_and_rejects_invalid_values():
     '''
     Verify video codec parser normalizes aliases and rejects unsupported codecs.
@@ -242,6 +268,44 @@ def test_parse_video_codec_accepts_aliases_and_rejects_invalid_values():
     assert _parse_video_codec('avc1') == 'h264'
     with pytest.raises(ValueError, match='Invalid video_codec'):
         _parse_video_codec('vp9')
+
+
+def test_remap_pose_model_ids_by_keypoint_names_uses_tensor_order():
+    '''
+    Verify saved-overlay pose-model remap follows keypoint tensor order, not tree order.
+    '''
+
+    from anytree import Node, PreOrderIter
+    from Sports2D.process import _remap_pose_model_ids_by_keypoint_names
+
+    root = Node('root', id=None)
+    hip = Node('Hip', parent=root, id=10)
+    Node('RKnee', parent=hip, id=4)
+    Node('RAnkle', parent=hip, id=6)
+    Node('LWrist', parent=root, id=2)
+    Node('UnknownMarker', parent=root, id=99)
+
+    remapped = _remap_pose_model_ids_by_keypoint_names(
+        root,
+        ['LWrist', 'RKnee', 'Hip'],
+    )
+    remapped_ids = {
+        node.name: node.id
+        for node in PreOrderIter(remapped)
+    }
+    original_ids = {
+        node.name: node.id
+        for node in PreOrderIter(root)
+    }
+
+    assert remapped_ids['Hip'] == 2
+    assert remapped_ids['RKnee'] == 1
+    assert remapped_ids['LWrist'] == 0
+    assert remapped_ids['RAnkle'] is None
+    assert remapped_ids['UnknownMarker'] is None
+    assert original_ids['Hip'] == 10
+    assert original_ids['RKnee'] == 4
+    assert original_ids['LWrist'] == 2
 
 
 def test_build_ball_click_pose_coords_tracks_first_appearance_order():
@@ -867,6 +931,641 @@ def test_default_config_exposes_sam3_settings():
     assert 'sam3_processor_path' in CONFIG_HELP
     assert 'sam3_show_realtime_masks' in CONFIG_HELP
     assert 'sam3_realtime_mask_alpha' in CONFIG_HELP
+
+
+def test_default_config_exposes_hybrid_review_settings():
+    '''
+    Verify hybrid manual-review settings are exposed in defaults and CLI help.
+    '''
+
+    from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
+
+    assert DEFAULT_CONFIG['base']['hybrid_mode'] is False
+    assert DEFAULT_CONFIG['base']['hybrid_review_pose'] is True
+    assert DEFAULT_CONFIG['base']['hybrid_review_ball'] is True
+    assert DEFAULT_CONFIG['base']['hybrid_ui_backend'] == 'matplotlib'
+    assert 'hybrid_mode' in CONFIG_HELP
+    assert 'hybrid_review_pose' in CONFIG_HELP
+    assert 'hybrid_review_ball' in CONFIG_HELP
+    assert 'hybrid_ui_backend' in CONFIG_HELP
+
+
+def test_normalize_hybrid_ui_backend_accepts_supported_values():
+    '''
+    Verify hybrid UI backend normalization preserves supported values and defaults unknown input.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import normalize_hybrid_ui_backend
+
+    assert normalize_hybrid_ui_backend(None) == 'auto'
+    assert normalize_hybrid_ui_backend('qt') == 'qt'
+    assert normalize_hybrid_ui_backend(' matplotlib ') == 'matplotlib'
+    assert normalize_hybrid_ui_backend('bogus') == 'auto'
+
+
+def test_review_pose_sequence_dispatches_to_qt_backend(monkeypatch):
+    '''
+    Verify pose review routes through the Qt backend when requested and available.
+    '''
+
+    from Sports2D.Utilities import hybrid_editor
+
+    expected = ('x', 'y', 'scores', 'mask')
+
+    class DummyQtModule:
+        @staticmethod
+        def review_pose_sequence_qt(**kwargs):
+            return kwargs['person_x_raw'], kwargs['person_y_raw'], kwargs['person_scores_raw'], kwargs['manual_mask']
+
+    monkeypatch.setattr(hybrid_editor, '_load_qt_hybrid_editor_module', lambda: DummyQtModule)
+
+    result = hybrid_editor.review_pose_sequence(
+        video_file_path='demo.mp4',
+        frame_range=(0, 1),
+        person_x_raw=expected[0],
+        person_y_raw=expected[1],
+        person_scores_raw=expected[2],
+        keypoint_names=['Nose'],
+        keypoint_threshold=0.3,
+        manual_mask=expected[3],
+        ui_backend='qt',
+    )
+
+    assert result == expected
+
+
+def test_review_ball_sequence_falls_back_to_matplotlib_backend_when_qt_fails(monkeypatch):
+    '''
+    Verify ball review falls back to the Matplotlib backend when Qt import/init fails.
+    '''
+
+    from Sports2D.Utilities import hybrid_editor
+
+    expected = (['center'], ['visible'], ['mask'])
+
+    def raise_qt_error():
+        raise ImportError('PySide6 missing')
+
+    def fake_matplotlib_backend(**kwargs):
+        return kwargs['ball_centers'], kwargs['ball_boxes'], kwargs['ball_scores']
+
+    monkeypatch.setattr(hybrid_editor, '_load_qt_hybrid_editor_module', raise_qt_error)
+    monkeypatch.setattr(hybrid_editor, '_review_ball_sequence_matplotlib', fake_matplotlib_backend)
+
+    result = hybrid_editor.review_ball_sequence(
+        video_file_path='demo.mp4',
+        frame_range=(0, 1),
+        ball_centers=expected[0],
+        ball_boxes=expected[1],
+        ball_scores=expected[2],
+        ball_tracks=[],
+        selected_ball_ids=[],
+        ui_backend='qt',
+    )
+
+    assert result == expected
+
+
+def test_review_pose_sequence_qt_returns_original_values_when_dialog_rejected(monkeypatch):
+    '''
+    Verify Qt pose review preserves the original arrays when the dialog is canceled.
+    '''
+
+    from Sports2D.Utilities import hybrid_editor_qt
+
+    class DummyQApplication:
+        @staticmethod
+        def instance():
+            return None
+
+        def __init__(self, _args):
+            pass
+
+        def processEvents(self, *_args):
+            return None
+
+    class DummyPoseDialog:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def show(self):
+            return None
+
+        def raise_(self):
+            return None
+
+        def activateWindow(self):
+            return None
+
+        def exec(self):
+            return 0
+
+        def get_result(self):
+            return ('changed_x', 'changed_y', 'changed_scores', 'changed_mask')
+
+    class DummyDialogCode:
+        Accepted = 1
+
+    class DummyQDialog:
+        DialogCode = DummyDialogCode
+
+    class DummyProcessEventsFlag:
+        AllEvents = object()
+
+    class DummyEventLoop:
+        ProcessEventsFlag = DummyProcessEventsFlag
+
+    monkeypatch.setattr(hybrid_editor_qt, '_require_qt', lambda: None)
+    monkeypatch.setattr(hybrid_editor_qt, 'QApplication', DummyQApplication)
+    monkeypatch.setattr(hybrid_editor_qt, 'PoseReviewDialog', DummyPoseDialog)
+    monkeypatch.setattr(hybrid_editor_qt, 'QDialog', DummyQDialog)
+    monkeypatch.setattr(hybrid_editor_qt, 'QEventLoop', DummyEventLoop)
+
+    expected_x = np.array([[10.0, 20.0]], dtype=float)
+    expected_y = np.array([[30.0, 40.0]], dtype=float)
+    expected_scores = np.array([[0.9, 0.8]], dtype=float)
+    expected_mask = np.array([[True, False]], dtype=bool)
+
+    result = hybrid_editor_qt.review_pose_sequence_qt(
+        video_file_path='demo.mp4',
+        frame_range=(0, 1),
+        person_x_raw=expected_x,
+        person_y_raw=expected_y,
+        person_scores_raw=expected_scores,
+        keypoint_names=['LHip', 'RHip'],
+        keypoint_threshold=0.3,
+        manual_mask=expected_mask,
+    )
+
+    assert np.array_equal(result[0], expected_x)
+    assert np.array_equal(result[1], expected_y)
+    assert np.array_equal(result[2], expected_scores)
+    assert np.array_equal(result[3], expected_mask)
+
+
+def test_review_ball_sequence_qt_returns_original_values_when_dialog_rejected(monkeypatch):
+    '''
+    Verify Qt ball review preserves the original timeline when the dialog is canceled.
+    '''
+
+    from Sports2D.Utilities import hybrid_editor_qt
+
+    class DummyQApplication:
+        @staticmethod
+        def instance():
+            return None
+
+        def __init__(self, _args):
+            pass
+
+        def processEvents(self, *_args):
+            return None
+
+    class DummyBallDialog:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def show(self):
+            return None
+
+        def raise_(self):
+            return None
+
+        def activateWindow(self):
+            return None
+
+        def exec(self):
+            return 0
+
+        def get_result(self):
+            return (['changed_center'], ['changed_visible'], ['changed_mask'])
+
+    class DummyDialogCode:
+        Accepted = 1
+
+    class DummyQDialog:
+        DialogCode = DummyDialogCode
+
+    class DummyProcessEventsFlag:
+        AllEvents = object()
+
+    class DummyEventLoop:
+        ProcessEventsFlag = DummyProcessEventsFlag
+
+    monkeypatch.setattr(hybrid_editor_qt, '_require_qt', lambda: None)
+    monkeypatch.setattr(hybrid_editor_qt, 'QApplication', DummyQApplication)
+    monkeypatch.setattr(hybrid_editor_qt, 'BallReviewDialog', DummyBallDialog)
+    monkeypatch.setattr(hybrid_editor_qt, 'QDialog', DummyQDialog)
+    monkeypatch.setattr(hybrid_editor_qt, 'QEventLoop', DummyEventLoop)
+
+    result = hybrid_editor_qt.review_ball_sequence_qt(
+        video_file_path='demo.mp4',
+        frame_range=(0, 1),
+        ball_centers=[(50, 60), None],
+        ball_boxes=[np.empty((0, 4), dtype=float), np.empty((0, 4), dtype=float)],
+        ball_scores=[np.empty((0,), dtype=float), np.empty((0,), dtype=float)],
+        ball_tracks=[[], []],
+        selected_ball_ids=[7, 7],
+    )
+
+    assert result == ([(50, 60), None], [True, False], [False, False])
+
+
+def test_keypoint_names_in_output_order_matches_synthpose_tensor_order():
+    '''
+    Verify output-order keypoint names match the actual SynthPose tensor index order.
+    '''
+
+    from Sports2D.Utilities.pose_backend import _keypoint_names_in_output_order
+    from Sports2D.Utilities.synthpose_skeleton import (
+        SYNTHPOSE_KEYPOINT_NAMES,
+        create_synthpose_skeleton,
+    )
+
+    assert _keypoint_names_in_output_order(create_synthpose_skeleton()) == SYNTHPOSE_KEYPOINT_NAMES
+
+
+class _FakeHybridCapture:
+    def __init__(self, frame_count):
+        self.frames = [
+            np.full((4, 4, 3), fill_value=frame_idx, dtype=np.uint8)
+            for frame_idx in range(frame_count)
+        ]
+        self.position = 0
+        self.set_calls = []
+        self.read_calls = 0
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def set(self, _prop_id, value):
+        self.position = int(value)
+        self.set_calls.append(int(value))
+        return True
+
+    def read(self):
+        self.read_calls += 1
+        if self.position < 0 or self.position >= len(self.frames):
+            return False, None
+        frame = self.frames[self.position].copy()
+        self.position += 1
+        return True, frame
+
+    def release(self):
+        self.released = True
+
+
+def test_video_frame_navigator_uses_sequential_reads_for_adjacent_frames():
+    '''
+    Verify adjacent forward frames avoid an extra seek after the first decode.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import VideoFrameNavigator
+
+    capture = _FakeHybridCapture(frame_count=12)
+    navigator = VideoFrameNavigator(capture, start_frame=0, cache_size=8, sequential_window=4)
+
+    frame0 = navigator.get_frame(0)
+    frame1 = navigator.get_frame(1)
+
+    assert int(frame0[0, 0, 0]) == 0
+    assert int(frame1[0, 0, 0]) == 1
+    assert capture.set_calls == [0]
+    assert capture.read_calls == 2
+
+
+def test_video_frame_navigator_reuses_cached_previous_frame_without_seek():
+    '''
+    Verify returning to a recently viewed frame reuses cache instead of seeking again.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import VideoFrameNavigator
+
+    capture = _FakeHybridCapture(frame_count=12)
+    navigator = VideoFrameNavigator(capture, start_frame=0, cache_size=8, sequential_window=4)
+
+    navigator.get_frame(0)
+    navigator.get_frame(1)
+    frame0_again = navigator.get_frame(0)
+
+    assert int(frame0_again[0, 0, 0]) == 0
+    assert capture.set_calls == [0]
+    assert capture.read_calls == 2
+
+
+def test_video_frame_navigator_seeks_once_for_far_jump():
+    '''
+    Verify large jumps still use a single direct seek/read path.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import VideoFrameNavigator
+
+    capture = _FakeHybridCapture(frame_count=20)
+    navigator = VideoFrameNavigator(capture, start_frame=0, cache_size=8, sequential_window=4)
+
+    navigator.get_frame(0)
+    frame10 = navigator.get_frame(10)
+
+    assert int(frame10[0, 0, 0]) == 10
+    assert capture.set_calls == [0, 10]
+    assert capture.read_calls == 2
+
+
+def test_frame_render_controller_coalesces_to_latest_pending_frame():
+    '''
+    Verify multiple frame requests collapse to the latest target before rendering.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import FrameRenderController
+
+    controller = FrameRenderController()
+    controller.request(1)
+    controller.request(4)
+    controller.request(7)
+
+    assert controller.consume() == 7
+
+    controller.request(7)
+    assert controller.consume() is None
+
+    controller.request(3)
+    assert controller.consume() == 3
+
+
+def test_compute_zoomed_limits_zooms_in_around_focus():
+    '''
+    Verify zoom-in keeps the cursor-side focus while shrinking the visible span.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import _compute_zoomed_limits
+
+    zoomed = _compute_zoomed_limits(
+        current_limits=(0.0, 100.0),
+        focus_value=75.0,
+        zoom_factor=0.5,
+        bounds_limits=(0.0, 100.0),
+        min_span=20.0,
+    )
+
+    assert np.allclose(zoomed, (37.5, 87.5))
+
+
+def test_compute_zoomed_limits_preserves_inverted_axis_and_bounds():
+    '''
+    Verify zoom logic respects image-style inverted axes and clamps to frame bounds.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import _compute_zoomed_limits
+
+    zoomed = _compute_zoomed_limits(
+        current_limits=(100.0, 0.0),
+        focus_value=100.0,
+        zoom_factor=0.5,
+        bounds_limits=(100.0, 0.0),
+        min_span=20.0,
+    )
+    zoomed_out = _compute_zoomed_limits(
+        current_limits=(75.0, 25.0),
+        focus_value=50.0,
+        zoom_factor=4.0,
+        bounds_limits=(100.0, 0.0),
+        min_span=20.0,
+    )
+
+    assert np.allclose(zoomed, (100.0, 50.0))
+    assert np.allclose(zoomed_out, (100.0, 0.0))
+
+
+def test_qt_clamp_view_box_keeps_view_inside_image_bounds():
+    '''
+    Verify Qt canvas view boxes are clamped to the available image area.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor_qt import _clamp_view_box
+
+    clamped = _clamp_view_box(
+        left=-15.0,
+        top=95.0,
+        width=40.0,
+        height=30.0,
+        image_width=100.0,
+        image_height=100.0,
+    )
+
+    assert clamped == (0.0, 70.0, 40.0, 30.0)
+
+
+def test_qt_translate_view_box_moves_with_middle_drag_and_clamps():
+    '''
+    Verify middle-drag pan translates the Qt canvas view and respects image bounds.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor_qt import _translate_view_box
+
+    translated = _translate_view_box(
+        left=10.0,
+        top=20.0,
+        width=50.0,
+        height=40.0,
+        widget_dx=40.0,
+        widget_dy=-20.0,
+        target_width=200.0,
+        target_height=100.0,
+        image_width=120.0,
+        image_height=100.0,
+    )
+    translated_clamped = _translate_view_box(
+        left=0.0,
+        top=0.0,
+        width=50.0,
+        height=40.0,
+        widget_dx=200.0,
+        widget_dy=200.0,
+        target_width=200.0,
+        target_height=100.0,
+        image_width=120.0,
+        image_height=100.0,
+    )
+
+    assert np.allclose(translated, (0.0, 28.0, 50.0, 40.0))
+    assert np.allclose(translated_clamped, (0.0, 0.0, 50.0, 40.0))
+
+
+def test_evaluate_pose_frame_rejects_person_when_too_few_keypoints_remain():
+    '''
+    Verify frame-level pose filtering rejects a person when too few keypoints survive.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import evaluate_pose_frame
+
+    filtered_x, filtered_y, filtered_scores, rejection_reason = evaluate_pose_frame(
+        raw_x=np.array([10.0, 20.0, 30.0], dtype=float),
+        raw_y=np.array([15.0, 25.0, 35.0], dtype=float),
+        raw_scores=np.array([0.9, 0.2, 0.1], dtype=float),
+        keypoint_threshold=0.3,
+        average_threshold=0.5,
+        keypoint_number_threshold=0.6,
+    )
+
+    assert rejection_reason == 'too_few_keypoints'
+    assert np.isnan(filtered_x).all()
+    assert np.isnan(filtered_y).all()
+    assert np.isnan(filtered_scores).all()
+
+
+def test_evaluate_pose_frame_keeps_keypoints_when_thresholds_pass():
+    '''
+    Verify frame-level pose filtering preserves coordinates when thresholds pass.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import evaluate_pose_frame
+
+    filtered_x, filtered_y, filtered_scores, rejection_reason = evaluate_pose_frame(
+        raw_x=np.array([10.0, 20.0, 30.0], dtype=float),
+        raw_y=np.array([15.0, 25.0, 35.0], dtype=float),
+        raw_scores=np.array([0.9, 0.4, 0.35], dtype=float),
+        keypoint_threshold=0.3,
+        average_threshold=0.5,
+        keypoint_number_threshold=0.6,
+    )
+
+    assert rejection_reason is None
+    assert filtered_x.tolist() == pytest.approx([10.0, 20.0, 30.0])
+    assert filtered_y.tolist() == pytest.approx([15.0, 25.0, 35.0])
+    assert filtered_scores.tolist() == pytest.approx([0.9, 0.4, 0.35])
+
+
+def test_build_pose_issue_list_reports_missing_low_confidence_and_manual_points():
+    '''
+    Verify pose diagnostics surface missing, low-confidence, and manual statuses.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import build_pose_issue_list
+
+    issues = build_pose_issue_list(
+        frame_x=np.array([100.0, np.nan, 220.0], dtype=float),
+        frame_y=np.array([120.0, np.nan, 260.0], dtype=float),
+        frame_scores=np.array([0.95, 0.85, 0.22], dtype=float),
+        keypoint_names=['Nose', 'RWrist', 'LWrist'],
+        keypoint_threshold=0.3,
+        manual_mask_frame=np.array([True, False, False], dtype=bool),
+        frame_index=1,
+        full_x_series=np.array([
+            [99.0, 140.0, 210.0],
+            [100.0, np.nan, 220.0],
+            [101.0, 142.0, 222.0],
+        ], dtype=float),
+        full_y_series=np.array([
+            [119.0, 160.0, 250.0],
+            [120.0, np.nan, 260.0],
+            [121.0, 162.0, 262.0],
+        ], dtype=float),
+    )
+
+    statuses = [issue['status'] for issue in issues]
+    assert statuses == ['missing', 'low_confidence', 'manually_edited']
+    assert issues[0]['keypoint'] == 'RWrist'
+    assert issues[0]['ghost_xy'] == pytest.approx((140.0, 160.0))
+    assert issues[1]['keypoint'] == 'LWrist'
+    assert issues[1]['score'] == pytest.approx(0.22)
+    assert issues[2]['keypoint'] == 'Nose'
+    assert issues[2]['manual'] is True
+
+
+def test_build_pose_issue_list_reports_derived_points_as_read_only():
+    '''
+    Verify derived keypoints are surfaced separately and marked read-only.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import build_pose_issue_list
+
+    issues = build_pose_issue_list(
+        frame_x=np.array([100.0, 140.0], dtype=float),
+        frame_y=np.array([120.0, 160.0], dtype=float),
+        frame_scores=np.array([0.95, 0.9], dtype=float),
+        keypoint_names=['Nose', 'Hip'],
+        keypoint_threshold=0.3,
+    )
+
+    assert len(issues) == 1
+    assert issues[0]['keypoint'] == 'Hip'
+    assert issues[0]['status'] == 'derived'
+    assert issues[0]['editable'] is False
+
+
+def test_augment_pose_arrays_with_derived_keypoints_appends_review_markers():
+    '''
+    Verify hybrid review augments raw pose arrays with derived Hip/Neck markers.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import augment_pose_arrays_with_derived_keypoints
+
+    augmented_x, augmented_y, augmented_scores, keypoint_names = augment_pose_arrays_with_derived_keypoints(
+        person_x_raw=np.array([[10.0, 30.0, 50.0, 70.0]], dtype=float),
+        person_y_raw=np.array([[100.0, 120.0, 140.0, 160.0]], dtype=float),
+        person_scores_raw=np.array([[0.8, 0.6, 0.9, 0.7]], dtype=float),
+        keypoint_names=['LHip', 'RHip', 'LShoulder', 'RShoulder'],
+    )
+
+    assert keypoint_names == ['LHip', 'RHip', 'LShoulder', 'RShoulder', 'Hip', 'Neck']
+    assert augmented_x[0, 4] == pytest.approx(20.0)
+    assert augmented_y[0, 4] == pytest.approx(110.0)
+    assert augmented_scores[0, 4] == pytest.approx(0.7)
+    assert augmented_x[0, 5] == pytest.approx(60.0)
+    assert augmented_y[0, 5] == pytest.approx(150.0)
+    assert augmented_scores[0, 5] == pytest.approx(0.8)
+
+
+def test_build_ball_issue_list_reports_missing_low_confidence_and_manual_override():
+    '''
+    Verify ball diagnostics capture missing, low-confidence, and manual statuses.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import build_ball_issue_list
+
+    issues = build_ball_issue_list(
+        center=None,
+        score=0.05,
+        score_threshold=0.1,
+        manual_override=True,
+        visible=False,
+        track_missing=True,
+    )
+
+    statuses = [issue['status'] for issue in issues]
+    assert statuses == ['missing_ball', 'track_gap', 'low_confidence_ball', 'manual_ball_override']
+
+
+def test_apply_ball_override_to_tracks_updates_selected_track_metadata():
+    '''
+    Verify manual ball overrides rewrite the selected track center and visibility.
+    '''
+
+    from Sports2D.Utilities.hybrid_editor import apply_ball_override_to_tracks
+
+    tracks = [
+        {
+            'id': 7,
+            'center': (20, 30),
+            'box': np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
+            'score': 0.88,
+            'visible': True,
+            'missing': 0,
+        }
+    ]
+
+    updated_tracks = apply_ball_override_to_tracks(
+        tracks,
+        selected_track_id=7,
+        center=(50, 60),
+        visible=True,
+    )
+
+    assert updated_tracks[0]['center'] == (50, 60)
+    assert updated_tracks[0]['visible'] is True
+    assert updated_tracks[0]['missing'] == 0
+    assert updated_tracks[0]['box'].tolist() == pytest.approx([40.0, 50.0, 60.0, 70.0])
 
 
 def test_create_pose_backend_surfaces_raw_sam3_guidance(monkeypatch):

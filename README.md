@@ -469,6 +469,15 @@ sports2d --video_input demo.mp4 other_video.mp4 --time_range 1.2 2.7 0 3.5
            --sam3_runtime transformers
   ```
   This keeps person detection on YOLOX and only adds SAM3 for the sports ball path. For the lower-risk `transformers` path, `--sam3_model_path` must be a Hugging Face repo ID or a local HF snapshot folder such as `facebook/sam3`. Raw `.pt` checkpoints cannot stay on `transformers`; they auto-switch to the official Meta `sam3` runtime and ignore `--sam3_processor_path`. With `--detect_ball true --save_pose true`, Sports2D also writes `pose_ball/` JSON files and appends a trailing `ball` marker to saved pixel/meter TRCs.
+- Review auto-estimated pose and ball tracks before exporting the final outputs
+  ``` cmd
+  sports2d --hybrid_mode true `
+           --hybrid_ui_backend qt `
+           --hybrid_review_pose true `
+           --hybrid_review_ball true `
+           --detect_ball true
+  ```
+  In the pose review UI, Sports2D lists flagged keypoints for the selected frame and separates them visually: missing keypoints are red crosses, low-confidence keypoints use amber outlines, manual overrides are blue, and derived markers such as `Hip` or `Neck` are gray and read-only. Use the mouse wheel to zoom around the cursor, middle-drag to pan, and right-click to clear the current keypoint selection. For smoother playback, set `--hybrid_ui_backend qt` to use the Qt editor; if PySide6 is unavailable, Sports2D falls back to the Matplotlib editor. When ball detection is enabled, the hybrid pass also lets you correct the selected ball timeline before TRC/JSON export, and the same zoom/pan interaction works there too.
 
 <br>
 
@@ -513,6 +522,10 @@ sports2d --help
 'save_pose': ["P", "save pose as trc files. When detect_ball=true, also append a trailing ball marker to saved TRCs and write per-frame ball JSON files in pose_ball/. true if not specified"],
 'calculate_angles': ["c", "calculate joint and segment angles. true if not specified"],
 'save_angles': ["A", "save angles as mot files. true if not specified"],
+'hybrid_mode': ["", "true or false. open a post-pass manual review UI before final exports so the user can correct pose and ball outputs. false if not specified"],
+'hybrid_review_pose': ["", "true or false. when hybrid_mode=true, open the pose correction UI for selected persons. true if not specified"],
+'hybrid_review_ball': ["", "true or false. when hybrid_mode=true and detect_ball=true, open the ball correction UI for the selected ball timeline. true if not specified"],
+'hybrid_ui_backend': ["", "hybrid review UI backend: 'matplotlib', 'qt', or 'auto'. matplotlib if not specified; qt falls back to matplotlib if PySide6 is unavailable"],
 'slowmo_factor': ["", "slow-motion factor. For a video recorded at 240 fps and exported to 30 fps, it would be 240/30 = 8. 1 if not specified"],
 'pose_model': ["p", "body_with_feet, whole_body_wrist, whole_body, or body. body_with_feet if not specified"],
 'mode': ["m", 'light, balanced, performance, or a """{dictionary within triple quote}""". balanced if not specified. Use a dictionary to specify your own detection and/or pose estimation models (more about in the documentation).'],
