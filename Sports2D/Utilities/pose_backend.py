@@ -519,7 +519,7 @@ class SynthPoseBackend(PoseBackend):
     This backend provides:
     - PyTorch-based inference (GPU-accelerated)
     - 52 keypoints (17 COCO + 35 anatomical markers)
-    - Multiple detector options (yolox, rtdetr, rtdetrv4, sam3)
+    - Multiple detector options (yolox, yolo26, rtdetr, rtdetrv4, sam3)
 
     Model Selection:
         SynthPose supports RTMLib-compatible 'mode' parameter for model selection:
@@ -577,7 +577,7 @@ class SynthPoseBackend(PoseBackend):
                 - device: Device selection ('auto', 'cuda', 'cpu', 'mps')
                 - det_frequency: Detection frequency (every N frames)
                 - keypoint_likelihood_threshold: Confidence threshold
-                - synthpose_detector: Detector type ('yolox', 'rtdetr', 'rtdetrv4', 'sam3')
+                - synthpose_detector: Detector type ('yolox', 'yolo26', 'rtdetr', 'rtdetrv4', 'sam3')
                 - sam3_target: SAM3 prompt preset ('ball' or 'broad_jump')
                 - sam3_model_path: Local raw .pt checkpoint or HF id/directory for SAM3
                 - sam3_processor_path: Optional processor path for HF SAM3 bundles
@@ -797,6 +797,12 @@ def create_pose_backend(config_dict: dict) -> PoseBackend:
                     "or switch to sam3_runtime='transformers' with a Hugging Face SAM3 bundle.\n"
                     "Official SAM3 install docs currently target Python 3.12+, "
                     "PyTorch 2.7+, and CUDA 12.6 for the raw-checkpoint runtime."
+                ) from e
+            if message.startswith("Ultralytics YOLO detectors require the 'ultralytics' package."):
+                raise ImportError(
+                    f"SynthPose requires additional dependencies: {message}\n"
+                    "Install with: pip install sports2d[synthpose,yolo26]\n"
+                    "Or: pip install torch transformers ultralytics"
                 ) from e
             if message.startswith('Hugging Face SAM3 runtime requires'):
                 raise ImportError(

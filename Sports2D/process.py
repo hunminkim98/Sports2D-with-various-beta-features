@@ -110,6 +110,15 @@ from Sports2D.Utilities.sam3_detector import (
     PERSON_CLASS_ID as SAM3_PERSON_CLASS_ID,
     SPORTS_BALL_CLASS_ID as SAM3_BALL_CLASS_ID,
 )
+from Sports2D.Utilities.motion import (
+    analyze_vertical_jump_trial,
+    draw_com_proxy_overlay,
+    draw_vgrf_arrow_overlay,
+    estimate_grf_arrow_anchor_px,
+    estimate_pelvis_trunk_com_xy_px,
+    write_grf_metrics_json,
+    write_grf_trc,
+)
 
 from Sports2D.Utilities.common import *
 from Pose2Sim.common import *
@@ -427,6 +436,36 @@ def _serialize_box_xyxy(box):
     ]
 
 
+def _find_ball_track_nearest_center(frame_ball_tracks, center, visible_only=True):
+    '''
+    Find the tracked-ball entry whose center is nearest to the requested center.
+    '''
+    center = _normalize_ball_center(center)
+    if center is None:
+        return None
+
+    candidate_tracks = []
+    for track in frame_ball_tracks or []:
+        track_center = _normalize_ball_center(track.get('center'))
+        if track_center is None:
+            continue
+        if visible_only and not track.get('visible', False):
+            continue
+        candidate_tracks.append((track, track_center))
+    if len(candidate_tracks) == 0:
+        return None
+
+    center_arr = np.asarray(center, dtype=np.float32)
+    best_track = None
+    best_distance = None
+    for track, track_center in candidate_tracks:
+        distance = float(np.linalg.norm(center_arr - np.asarray(track_center, dtype=np.float32)))
+        if best_distance is None or distance < best_distance:
+            best_track = track
+            best_distance = distance
+    return best_track
+
+
 def build_ball_export_record(frame_ball_center, frame_ball_boxes, frame_ball_scores,
                              frame_ball_tracks=None, frame_selected_ball_id=None,
                              frame_sam3_ball_mask_meta=None, multi_id_tracking=False):
@@ -442,6 +481,7 @@ def build_ball_export_record(frame_ball_center, frame_ball_boxes, frame_ball_sco
     record = {
         'visible': False,
         'track_id': _json_safe_int(frame_selected_ball_id),
+        'source_track_id': None,
         'score': None,
         'center_xy': None,
         'box_xyxy': None,
@@ -458,13 +498,34 @@ def build_ball_export_record(frame_ball_center, frame_ball_boxes, frame_ball_sco
                 if track_id == selected_track_id:
                     selected_track = track
                     break
-        if selected_track is not None:
-            center = _normalize_ball_center(selected_track.get('center'))
-            score = _json_safe_float(selected_track.get('score'))
-            record['track_id'] = _json_safe_int(selected_track.get('id'))
-            record['visible'] = bool(selected_track.get('visible', False) and center is not None)
+        source_track = None
+        if (
+            selected_track is not None
+            and selected_track.get('visible', False)
+            and _normalize_ball_center(selected_track.get('center')) is not None
+        ):
+            source_track = selected_track
+        if source_track is None and center is not None:
+            source_track = _find_ball_track_nearest_center(
+                frame_ball_tracks,
+                center,
+                visible_only=True,
+            )
+        if source_track is not None:
+            source_track_id = _json_safe_int(source_track.get('id'))
+            source_track_center = _normalize_ball_center(source_track.get('center'))
+            if source_track_center is None:
+                source_track_center = center
+            if source_track_center is None or not source_track.get('visible', False):
+                return record
+            center = source_track_center
+            score = _json_safe_float(source_track.get('score'))
+            if record['track_id'] is None:
+                record['track_id'] = source_track_id
+            record['source_track_id'] = source_track_id
+            record['visible'] = True
             record['center_xy'] = list(center) if center is not None else None
-            record['box_xyxy'] = _serialize_box_xyxy(selected_track.get('box'))
+            record['box_xyxy'] = _serialize_box_xyxy(source_track.get('box'))
             record['score'] = score
             record['ball_keypoints_2d'] = [
                 _json_safe_float(center[0]) if center is not None else None,
@@ -792,9 +853,162 @@ def _parse_video_codec(value, default='mp4v'):
     return codec
 
 
+def _predict_ball_track_keypoints(previous_keypoints, previous_track_ids,
+                                  previous_missing_counts, track_velocities_by_id):
+    '''
+    Predict the next center for each tracked ball from its last observed center and velocity.
+    '''
+    previous_keypoints = np.asarray(previous_keypoints, dtype=np.float32)
+    if len(previous_keypoints) == 0:
+        return np.empty((0, 1, 2), dtype=np.float32)
+
+    predicted_keypoints = np.array(previous_keypoints, dtype=np.float32, copy=True)
+    for row_idx in range(len(predicted_keypoints)):
+        if row_idx >= len(previous_track_ids):
+            continue
+        track_id = int(previous_track_ids[row_idx])
+        velocity = np.asarray(
+            (track_velocities_by_id or {}).get(track_id, (0.0, 0.0)),
+            dtype=np.float32,
+        ).reshape(-1)
+        if len(velocity) < 2 or not np.all(np.isfinite(velocity[:2])) or np.isnan(predicted_keypoints[row_idx]).any():
+            continue
+        missing_count = int(previous_missing_counts[row_idx]) if row_idx < len(previous_missing_counts) else 0
+        predicted_keypoints[row_idx, 0, 0] += velocity[0] * float(max(1, missing_count + 1))
+        predicted_keypoints[row_idx, 0, 1] += velocity[1] * float(max(1, missing_count + 1))
+    return predicted_keypoints
+
+
+def _update_ball_track_velocity(track_velocities_by_id, track_id, last_observed_kp,
+                                current_kp, previous_missing=0):
+    '''
+    Update a tracked ball's velocity estimate from its latest observation.
+    '''
+    track_velocities_by_id = track_velocities_by_id if isinstance(track_velocities_by_id, dict) else {}
+    track_id = int(track_id)
+    previous_velocity = np.asarray(
+        track_velocities_by_id.get(track_id, (0.0, 0.0)),
+        dtype=np.float32,
+    ).reshape(-1)
+    if len(previous_velocity) < 2 or not np.all(np.isfinite(previous_velocity[:2])):
+        previous_velocity = np.zeros((2,), dtype=np.float32)
+
+    last_observed_kp = np.asarray(last_observed_kp, dtype=np.float32).reshape(-1)
+    current_kp = np.asarray(current_kp, dtype=np.float32).reshape(-1)
+    if (
+        len(last_observed_kp) < 2
+        or len(current_kp) < 2
+        or not np.all(np.isfinite(last_observed_kp[:2]))
+        or not np.all(np.isfinite(current_kp[:2]))
+    ):
+        track_velocities_by_id[track_id] = (0.0, 0.0)
+        return track_velocities_by_id
+
+    steps = float(max(1, int(previous_missing) + 1))
+    observed_velocity = (current_kp[:2] - last_observed_kp[:2]) / steps
+    if not np.all(np.isfinite(observed_velocity[:2])):
+        track_velocities_by_id[track_id] = (0.0, 0.0)
+        return track_velocities_by_id
+    if np.linalg.norm(previous_velocity[:2]) < 1e-3:
+        blended_velocity = observed_velocity
+    else:
+        smoothing = 0.2 if int(previous_missing) > 0 else 0.45
+        blended_velocity = smoothing * previous_velocity[:2] + (1.0 - smoothing) * observed_velocity
+    if not np.all(np.isfinite(blended_velocity[:2])):
+        track_velocities_by_id[track_id] = (0.0, 0.0)
+        return track_velocities_by_id
+    track_velocities_by_id[track_id] = (
+        float(blended_velocity[0]),
+        float(blended_velocity[1]),
+    )
+    return track_velocities_by_id
+
+
+def _decay_ball_track_velocity(track_velocities_by_id, track_id, decay=0.95):
+    '''
+    Decay a tracked ball's velocity estimate while it is temporarily missing.
+    '''
+    if not isinstance(track_velocities_by_id, dict):
+        return {}
+    track_id = int(track_id)
+    previous_velocity = np.asarray(
+        track_velocities_by_id.get(track_id, (0.0, 0.0)),
+        dtype=np.float32,
+    ).reshape(-1)
+    if len(previous_velocity) < 2 or not np.all(np.isfinite(previous_velocity[:2])):
+        track_velocities_by_id[track_id] = (0.0, 0.0)
+        return track_velocities_by_id
+    track_velocities_by_id[track_id] = (
+        float(decay * previous_velocity[0]),
+        float(decay * previous_velocity[1]),
+    )
+    return track_velocities_by_id
+
+
+def dedupe_ball_detections(ball_boxes, ball_scores=None,
+                           iou_threshold=0.8, center_eps_px=6.0):
+    '''
+    Collapse same-frame near-duplicate ball boxes before tracking.
+    '''
+    ball_boxes = _ensure_xyxy_boxes(ball_boxes)
+    ball_scores = _ensure_score_vector(ball_scores, expected_len=len(ball_boxes))
+    if len(ball_boxes) <= 1:
+        return ball_boxes, ball_scores
+
+    widths = np.maximum(0.0, ball_boxes[:, 2] - ball_boxes[:, 0])
+    heights = np.maximum(0.0, ball_boxes[:, 3] - ball_boxes[:, 1])
+    areas = widths * heights
+    centers = np.column_stack((
+        (ball_boxes[:, 0] + ball_boxes[:, 2]) * 0.5,
+        (ball_boxes[:, 1] + ball_boxes[:, 3]) * 0.5,
+    )).astype(np.float32, copy=False)
+    sortable_scores = np.where(np.isfinite(ball_scores), ball_scores, -np.inf)
+    order = np.argsort(-sortable_scores, kind='stable')
+    suppressed = np.zeros((len(ball_boxes),), dtype=bool)
+    keep_indices = []
+
+    for order_idx, box_idx in enumerate(order):
+        if suppressed[box_idx]:
+            continue
+        keep_indices.append(int(box_idx))
+        x1, y1, x2, y2 = ball_boxes[box_idx]
+        area = max(0.0, float(areas[box_idx]))
+        center = centers[box_idx]
+        for other_idx in order[order_idx + 1:]:
+            if suppressed[other_idx]:
+                continue
+            ox1, oy1, ox2, oy2 = ball_boxes[other_idx]
+            inter_x1 = max(float(x1), float(ox1))
+            inter_y1 = max(float(y1), float(oy1))
+            inter_x2 = min(float(x2), float(ox2))
+            inter_y2 = min(float(y2), float(oy2))
+            inter_w = max(0.0, inter_x2 - inter_x1)
+            inter_h = max(0.0, inter_y2 - inter_y1)
+            inter_area = inter_w * inter_h
+            union_area = area + max(0.0, float(areas[other_idx])) - inter_area
+            iou = inter_area / union_area if union_area > 0.0 else 0.0
+            center_dist = float(np.linalg.norm(center - centers[other_idx]))
+            similar_area = (
+                area <= 0.0
+                or max(0.0, float(areas[other_idx])) <= 0.0
+                or min(area, float(areas[other_idx])) >= 0.55 * max(area, float(areas[other_idx]))
+            )
+            if iou >= float(iou_threshold) or (
+                center_dist <= float(center_eps_px) and similar_area
+            ):
+                suppressed[other_idx] = True
+
+    keep_indices = np.asarray(sorted(keep_indices), dtype=np.int64)
+    return (
+        ball_boxes[keep_indices].astype(np.float32, copy=False),
+        ball_scores[keep_indices].astype(np.float32, copy=False),
+    )
+
+
 def track_balls_sports2d(ball_boxes, previous_keypoints, previous_track_ids,
                          previous_missing_counts, next_track_id,
                          ball_scores=None,
+                         track_velocities_by_id=None,
                          max_dist=120.0, max_missing_frames=12):
     '''
     Associate ball detections across frames using Sports2D Hungarian tracker.
@@ -820,6 +1034,11 @@ def track_balls_sports2d(ball_boxes, previous_keypoints, previous_track_ids,
 
     previous_track_ids = list(previous_track_ids or [])
     previous_missing_counts = list(previous_missing_counts or [])
+    track_velocities_by_id = (
+        track_velocities_by_id
+        if isinstance(track_velocities_by_id, dict)
+        else {}
+    )
     if previous_keypoints is None:
         previous_keypoints = np.empty((0, 1, 2), dtype=np.float32)
     previous_keypoints = np.asarray(previous_keypoints, dtype=np.float32)
@@ -838,6 +1057,7 @@ def track_balls_sports2d(ball_boxes, previous_keypoints, previous_track_ids,
         for idx in range(len(current_keypoints)):
             track_id = int(next_track_id)
             next_track_id += 1
+            track_velocities_by_id[track_id] = (0.0, 0.0)
             center = (
                 int(round(float(current_keypoints[idx, 0, 0]))),
                 int(round(float(current_keypoints[idx, 0, 1]))),
@@ -854,8 +1074,15 @@ def track_balls_sports2d(ball_boxes, previous_keypoints, previous_track_ids,
             updated_missing_counts.append(0)
         return tracked_balls, current_keypoints, updated_track_ids, updated_missing_counts, int(next_track_id)
 
-    sorted_prev_keypoints, sorted_keypoints, sorted_ids = sort_people_sports2d(
+    predicted_previous_keypoints = _predict_ball_track_keypoints(
         previous_keypoints,
+        previous_track_ids,
+        previous_missing_counts,
+        track_velocities_by_id,
+    )
+
+    sorted_prev_keypoints, sorted_keypoints, sorted_ids = sort_people_sports2d(
+        predicted_previous_keypoints,
         current_keypoints,
         scores=None,
         max_dist=max_dist,
@@ -866,15 +1093,22 @@ def track_balls_sports2d(ball_boxes, previous_keypoints, previous_track_ids,
     updated_keypoints = []
     updated_track_ids = []
     updated_missing_counts = []
+    active_track_ids = set()
 
     for row_idx, curr_idx in enumerate(np.asarray(sorted_ids, dtype=np.int64)):
         if row_idx < n_prev:
             track_id = int(previous_track_ids[row_idx])
             prev_missing = int(previous_missing_counts[row_idx]) if row_idx < len(previous_missing_counts) else 0
+            previous_velocity = tuple(track_velocities_by_id.get(track_id, (0.0, 0.0)))
+            last_observed_kp = previous_keypoints[row_idx]
+            predicted_kp = sorted_prev_keypoints[row_idx]
         else:
             track_id = int(next_track_id)
             next_track_id += 1
             prev_missing = 0
+            previous_velocity = (0.0, 0.0)
+            last_observed_kp = np.full((1, 2), np.nan, dtype=np.float32)
+            predicted_kp = np.full((1, 2), np.nan, dtype=np.float32)
 
         is_visible = int(curr_idx) >= 0 and int(curr_idx) < len(ball_boxes)
         missing_count = 0 if is_visible else prev_missing + 1
@@ -890,17 +1124,22 @@ def track_balls_sports2d(ball_boxes, previous_keypoints, previous_track_ids,
             )
             box = ball_boxes[curr_idx].astype(np.float32, copy=False)
             score = float(ball_scores[curr_idx]) if curr_idx < len(ball_scores) else float('nan')
+            track_velocities_by_id = _update_ball_track_velocity(
+                track_velocities_by_id,
+                track_id,
+                last_observed_kp[0] if last_observed_kp.ndim == 2 else last_observed_kp,
+                kp[0] if kp.ndim == 2 else kp,
+                previous_missing=prev_missing,
+            )
         else:
-            kp = sorted_prev_keypoints[row_idx]
-            if np.isnan(kp).any():
-                center = None
-            else:
-                center = (
-                    int(round(float(kp[0, 0]))),
-                    int(round(float(kp[0, 1]))),
-                )
+            kp = last_observed_kp
+            center = None
             box = None
             score = float('nan')
+            track_velocities_by_id = _decay_ball_track_velocity(
+                track_velocities_by_id,
+                track_id,
+            )
 
         tracked_balls.append({
             'id': track_id,
@@ -909,15 +1148,24 @@ def track_balls_sports2d(ball_boxes, previous_keypoints, previous_track_ids,
             'score': score,
             'visible': bool(is_visible),
             'missing': int(missing_count),
+            'predicted_center': _normalize_ball_center(
+                predicted_kp[0] if predicted_kp.ndim == 2 else predicted_kp
+            ),
+            'velocity': previous_velocity if not is_visible else tuple(track_velocities_by_id.get(track_id, (0.0, 0.0))),
         })
         updated_keypoints.append(kp)
         updated_track_ids.append(track_id)
         updated_missing_counts.append(int(missing_count))
+        active_track_ids.add(track_id)
 
     if len(updated_keypoints) > 0:
         updated_keypoints = np.asarray(updated_keypoints, dtype=np.float32).reshape(-1, 1, 2)
     else:
         updated_keypoints = np.empty((0, 1, 2), dtype=np.float32)
+
+    for stale_track_id in list(track_velocities_by_id.keys()):
+        if int(stale_track_id) not in active_track_ids:
+            track_velocities_by_id.pop(int(stale_track_id), None)
 
     return (
         tracked_balls,
@@ -1043,9 +1291,43 @@ def _rank_ball_track_ids(track_ids, track_stats_by_id, ordering_method='first_de
     return sorted(candidate_ids, key=_metric)
 
 
+def _update_selected_ball_motion_state(previous_center, previous_velocity, current_center,
+                                       smoothing=0.6, decay=0.6):
+    '''
+    Update selected-ball center/velocity state without fabricating visibility.
+    '''
+    next_center = previous_center
+    next_velocity = previous_velocity
+    current_center = _normalize_ball_center(current_center)
+
+    if current_center is not None:
+        if previous_center is not None:
+            frame_velocity = (
+                float(current_center[0] - previous_center[0]),
+                float(current_center[1] - previous_center[1]),
+            )
+            if previous_velocity is None:
+                next_velocity = frame_velocity
+            else:
+                next_velocity = (
+                    float(smoothing * previous_velocity[0] + (1.0 - smoothing) * frame_velocity[0]),
+                    float(smoothing * previous_velocity[1] + (1.0 - smoothing) * frame_velocity[1]),
+                )
+        next_center = current_center
+    elif previous_velocity is not None:
+        next_velocity = (
+            float(decay * previous_velocity[0]),
+            float(decay * previous_velocity[1]),
+        )
+
+    return next_center, next_velocity
+
+
 def select_ball_track_id(tracked_balls, selection_mode='auto', requested_track_id=None,
                          previous_selected_id=None, previous_selected_center=None,
-                         ordering_method='first_detected', track_stats_by_id=None):
+                         previous_selected_velocity=None,
+                         ordering_method='first_detected', track_stats_by_id=None,
+                         max_recovery_dist=None):
     '''
     Select active ball track ID and its center for trajectory rendering.
 
@@ -1076,7 +1358,21 @@ def select_ball_track_id(tracked_balls, selection_mode='auto', requested_track_i
         if previous_track is not None:
             if previous_track.get('visible', False) and previous_track.get('center') is not None:
                 return int(previous_selected_id), tuple(previous_track.get('center'))
-            return int(previous_selected_id), None
+        if previous_selected_center is not None and len(visible_tracks) > 0:
+            recovered_center = select_ball_center(
+                [tuple(track.get('center')) for track in visible_tracks],
+                previous_center=previous_selected_center,
+                max_jump_px=max_recovery_dist,
+                previous_velocity=previous_selected_velocity,
+            )
+            recovered_track = _find_ball_track_nearest_center(
+                visible_tracks,
+                recovered_center,
+                visible_only=True,
+            )
+            if recovered_track is not None and recovered_track.get('center') is not None:
+                return int(previous_selected_id), tuple(recovered_track.get('center'))
+        return int(previous_selected_id), None
 
     active_track_ids = [int(track.get('id')) for track in tracked_balls if 'id' in track]
     visible_track_ids = [int(track.get('id')) for track in visible_tracks if 'id' in track]
@@ -2144,6 +2440,20 @@ def trc_data_from_XYZtime(X, Y, Z, time):
     return trc_data
 
 
+def reset_trc_frame_time_origin(trc_data):
+    '''
+    Reset TRC row numbering to start at frame 0 and, when present, time 0.
+
+    This is used for trimmed meter exports so the saved TRC starts from a
+    local origin even if the valid motion segment begins later in the source.
+    '''
+
+    trc_data = pd.DataFrame(trc_data).copy().reset_index(drop=True)
+    if not trc_data.empty and 'time' in trc_data.columns:
+        trc_data['time'] = trc_data['time'] - trc_data['time'].iloc[0]
+    return trc_data
+
+
 def make_trc_with_trc_data(trc_data, trc_path, fps=30):
     '''
     Write a TRC file from a DataFrame of time and coordinates
@@ -2516,6 +2826,106 @@ def get_ball_trackIDs_on_click(video_file_path, frame_range, all_frames_ball_tra
         for slot_idx in selected_slots
         if int(slot_idx) >= 0 and int(slot_idx) < len(ordered_track_ids)
     ]
+
+
+def stitch_selected_ball_timeline(all_frames_ball_tracks, selected_track_id,
+                                  max_jump_px=None):
+    '''
+    Rebuild a selected-ball timeline from one raw seed track ID across raw ID splits.
+    '''
+    frame_count = len(all_frames_ball_tracks or [])
+    if selected_track_id is None or frame_count == 0:
+        return [], []
+
+    selected_track_id = int(selected_track_id)
+    stitch_max_jump_px = 120.0 if max_jump_px is None else float(max_jump_px)
+    stitched_ids = [None for _ in range(frame_count)]
+    stitched_centers = [None for _ in range(frame_count)]
+
+    # Forward pass: start once the seed track becomes visible and keep continuity afterwards.
+    forward_center = None
+    forward_velocity = None
+    forward_active = False
+    for frame_idx, frame_tracks in enumerate(all_frames_ball_tracks or []):
+        seed_track = next(
+            (
+                track for track in frame_tracks or []
+                if int(track.get('id', -1)) == selected_track_id
+                and track.get('visible', False)
+                and track.get('center') is not None
+            ),
+            None,
+        )
+        if seed_track is not None:
+            forward_active = True
+        if not forward_active:
+            continue
+
+        selected_id, selected_center = select_ball_track_id(
+            frame_tracks,
+            selection_mode='auto',
+            previous_selected_id=selected_track_id,
+            previous_selected_center=forward_center,
+            previous_selected_velocity=forward_velocity,
+            ordering_method='first_detected',
+            max_recovery_dist=stitch_max_jump_px,
+            track_stats_by_id={},
+        )
+        stitched_ids[frame_idx] = selected_track_id if selected_id is None else int(selected_id)
+        stitched_centers[frame_idx] = _normalize_ball_center(selected_center)
+        forward_center, forward_velocity = _update_selected_ball_motion_state(
+            forward_center,
+            forward_velocity,
+            stitched_centers[frame_idx],
+        )
+
+    # Backward pass: recover compatible earlier fragments before the first seed appearance.
+    backward_center = None
+    backward_velocity = None
+    backward_active = False
+    for frame_idx in range(frame_count - 1, -1, -1):
+        frame_tracks = all_frames_ball_tracks[frame_idx]
+        seed_track = next(
+            (
+                track for track in frame_tracks or []
+                if int(track.get('id', -1)) == selected_track_id
+                and track.get('visible', False)
+                and track.get('center') is not None
+            ),
+            None,
+        )
+        if seed_track is not None:
+            backward_active = True
+        if not backward_active:
+            continue
+
+        reverse_velocity = None
+        if backward_velocity is not None:
+            reverse_velocity = (-float(backward_velocity[0]), -float(backward_velocity[1]))
+        selected_id, selected_center = select_ball_track_id(
+            frame_tracks,
+            selection_mode='auto',
+            previous_selected_id=selected_track_id,
+            previous_selected_center=backward_center,
+            previous_selected_velocity=reverse_velocity,
+            ordering_method='first_detected',
+            max_recovery_dist=stitch_max_jump_px,
+            track_stats_by_id={},
+        )
+        recovered_center = _normalize_ball_center(selected_center)
+        if seed_track is None and recovered_center is None:
+            continue
+        if stitched_ids[frame_idx] is None:
+            stitched_ids[frame_idx] = selected_track_id if selected_id is None else int(selected_id)
+        if stitched_centers[frame_idx] is None:
+            stitched_centers[frame_idx] = recovered_center
+        backward_center, backward_velocity = _update_selected_ball_motion_state(
+            backward_center,
+            backward_velocity,
+            recovered_center,
+        )
+
+    return stitched_ids, stitched_centers
 
 
 def select_persons_on_vid(video_file_path, frame_range, all_pose_coords,
@@ -3121,7 +3531,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     backend = config_dict.get('pose').get('backend')
     device = config_dict.get('pose').get('device')
     tracking_mode = config_dict.get('pose').get('tracking_mode')
-    synthpose_detector = config_dict.get('pose').get('synthpose_detector', 'yolox')  # 'yolox' or 'rtdetr'
+    synthpose_detector = config_dict.get('pose').get('synthpose_detector', 'yolox')  # 'yolox', 'yolo26', 'rtdetr', 'rtdetrv4', or 'sam3'
     if tracking_mode == 'deepsort':
         from deep_sort_realtime.deepsort_tracker import DeepSort
         deepsort_params = config_dict.get('pose').get('deepsort_params')
@@ -3172,6 +3582,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         0.0,
         1.0,
     ))
+    motion_cfg = config_dict.get('motion', {}) or {}
+    vertical_jump = bool(motion_cfg.get('vertical_jump', False))
 
     # Pixel to meters conversion
     to_meters = config_dict.get('px_to_meters_conversion').get('to_meters')
@@ -3267,6 +3679,23 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     trimmed_extrema_percent = config_dict.get('kinematics').get('trimmed_extrema_percent')
     close_to_zero_speed_px = config_dict.get('kinematics').get('close_to_zero_speed_px')
     close_to_zero_speed_m = config_dict.get('kinematics').get('close_to_zero_speed_m')
+    vertical_jump_enabled = bool(vertical_jump)
+    if vertical_jump_enabled and not to_meters:
+        logging.warning(
+            'motion.vertical_jump=true requires px_to_meters_conversion.to_meters=true. '
+            'Skipping vertical jump estimation and overlays.'
+        )
+        vertical_jump_enabled = False
+    write_meter_pose = bool(save_pose or do_ik or use_augmentation)
+    need_floor_corrected_angles = bool(
+        to_meters and save_angles and calculate_angles and correct_segment_angles_with_floor_angle
+    )
+    need_postprocess_pose = bool(
+        save_pose or vertical_jump_enabled or do_ik or use_augmentation or need_floor_corrected_angles
+    )
+    need_meter_pose = bool(
+        to_meters and (write_meter_pose or vertical_jump_enabled or need_floor_corrected_angles)
+    )
     # Create a Pose2Sim dictionary and fill in missing keys
     recursivedict = lambda: defaultdict(recursivedict)
     Pose2Sim_config_dict = recursivedict()
@@ -3321,6 +3750,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         start_time = get_start_time_ffmpeg(video_file_path)
         frame_range = [int((time_range[0]-start_time) * frame_rate), int((time_range[1]-start_time) * frame_rate)] if time_range else [0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT))]
         frame_iterator = tqdm(range(*frame_range)) # use a progress bar
+
+    motion_floor_angle_overlay = 0.0
+    motion_floor_origin_overlay = (cam_width / 2.0, cam_height / 2.0)
     # Select the appropriate model based on the model_type
     logging.info('\nEstimating pose...')
     pose_model_name = pose_model
@@ -3525,6 +3957,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     ball_prev_keypoints = np.empty((0, 1, 2), dtype=np.float32)
     ball_track_ids = []
     ball_track_missing_counts = []
+    ball_track_velocities_by_id = {}
     next_ball_track_id = 0
     ball_track_stats_by_id = {}
     ball_warned_missing_likelihood = False
@@ -3692,6 +4125,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         detection_meta.get('ball_scores'),
                         expected_len=len(frame_ball_boxes),
                     )
+                    frame_ball_boxes, frame_ball_scores = dedupe_ball_detections(
+                        frame_ball_boxes,
+                        frame_ball_scores,
+                    )
                     if ball_multi_id_tracking:
                         previous_selected_track_id = ball_selected_track_id
                         frame_ball_tracks, ball_prev_keypoints, ball_track_ids, ball_track_missing_counts, next_ball_track_id = track_balls_sports2d(
@@ -3701,6 +4138,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             ball_track_missing_counts,
                             next_ball_track_id,
                             ball_scores=frame_ball_scores,
+                            track_velocities_by_id=ball_track_velocities_by_id,
                             max_dist=ball_tracking_max_distance,
                             max_missing_frames=ball_track_max_missing_frames,
                         )
@@ -3728,8 +4166,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             requested_track_id=ball_selected_id,
                             previous_selected_id=ball_selected_track_id,
                             previous_selected_center=ball_previous_center,
+                            previous_selected_velocity=ball_previous_velocity,
                             ordering_method=ball_ordering_method,
                             track_stats_by_id=ball_track_stats_by_id,
+                            max_recovery_dist=ball_tracking_max_distance if ball_tracking_max_distance is not None else ball_max_jump_px,
                         )
 
                         frame_ball_center = selected_center
@@ -3745,16 +4185,26 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
                         if frame_selected_ball_id is None:
                             ball_previous_center = None
+                            ball_previous_velocity = None
                         elif frame_ball_center is not None:
-                            ball_previous_center = frame_ball_center
+                            ball_previous_center, ball_previous_velocity = _update_selected_ball_motion_state(
+                                ball_previous_center,
+                                ball_previous_velocity,
+                                frame_ball_center,
+                            )
                             selected_trail = ball_trail_points_by_id.get(frame_selected_ball_id, [])
                             selected_trail.append(tuple(frame_ball_center))
                             if len(selected_trail) > ball_trail_length:
                                 selected_trail = selected_trail[-ball_trail_length:]
                             ball_trail_points_by_id[frame_selected_ball_id] = selected_trail
+                        elif ball_previous_velocity is not None:
+                            ball_previous_center, ball_previous_velocity = _update_selected_ball_motion_state(
+                                ball_previous_center,
+                                ball_previous_velocity,
+                                None,
+                            )
 
                         ball_selected_track_id = frame_selected_ball_id
-                        ball_previous_velocity = None
                     else:
                         ball_candidates = extract_ball_centers({'ball_boxes': frame_ball_boxes})
                         frame_ball_center = select_ball_center(
@@ -4053,7 +4503,15 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     all_frames_scores_homog = all_frames_scores_homog[...,new_keypoints_ids]
 
     frame_range = [0,frame_count] if video_file == 'webcam' else frame_range
-    all_frames_time = pd.Series(np.linspace(frame_range[0]/fps, frame_range[1]/fps, frame_count-frame_range[0]), name='time')
+    sample_count = max(0, frame_count - frame_range[0])
+    if load_trc_px:
+        all_frames_time = pd.Series(
+            np.asarray(time_col.iloc[frame_range[0]:frame_range[0] + sample_count], dtype=float),
+            name='time',
+        ).reset_index(drop=True)
+    else:
+        frame_indices = frame_range[0] + np.arange(sample_count, dtype=float)
+        all_frames_time = pd.Series(frame_indices / fps, name='time')
     if load_trc_px:
         selected_persons = [0]
     else:
@@ -4108,18 +4566,16 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         else:
             selected_ball_track_id = int(selected_ball_ids[0])
             logging.info("Selected ball track on_click: ball %s", selected_ball_track_id)
-            for frame_idx, frame_tracks in enumerate(all_frames_ball_tracks):
-                all_frames_selected_ball_ids[frame_idx] = selected_ball_track_id
-                selected_center = None
-                for track in frame_tracks:
-                    if int(track.get('id', -1)) != selected_ball_track_id:
-                        continue
-                    if not track.get('visible', False):
-                        break
-                    center = track.get('center')
-                    selected_center = tuple(center) if center is not None else None
-                    break
-                all_frames_ball_centers[frame_idx] = selected_center
+            stitched_ids, stitched_centers = stitch_selected_ball_timeline(
+                all_frames_ball_tracks,
+                selected_ball_track_id,
+                max_jump_px=ball_tracking_max_distance if ball_tracking_max_distance is not None else ball_max_jump_px,
+            )
+            for frame_idx in range(len(all_frames_ball_tracks)):
+                if frame_idx < len(stitched_ids) and stitched_ids[frame_idx] is not None:
+                    all_frames_selected_ball_ids[frame_idx] = stitched_ids[frame_idx]
+                if frame_idx < len(stitched_centers):
+                    all_frames_ball_centers[frame_idx] = stitched_centers[frame_idx]
 
     if hybrid_mode and len(selected_persons) > 0:
         if hybrid_review_pose:
@@ -4226,6 +4682,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     ball_export_series = []
     ball_trc_px = pd.DataFrame()
     public_meter_trc_data_by_name = {}
+    trc_data, trc_data_unfiltered, score_data = [], [], []
+    first_run_starts_everyone, last_run_ends_everyone = [], []
+    vertical_jump_results = []
     if ball_pose_export_enabled:
         ball_export_series = build_ball_export_series(
             all_frames_time,
@@ -4247,11 +4706,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     # Post-processing pose
     # ====================================================
     all_frames_X_processed, all_frames_X_flipped_processed, all_frames_Y_processed, all_frames_scores_processed, all_frames_angles_processed = all_frames_X_homog.copy(), all_frames_X_flipped_homog.copy(), all_frames_Y_homog.copy(), all_frames_scores_homog.copy(), all_frames_angles_homog.copy()
-    if save_pose:
+    new_visible_side = visible_side.copy()
+    if need_postprocess_pose:
         logging.info('\nPost-processing pose:')
         # Process pose for each person
-        trc_data, trc_data_unfiltered, score_data = [], [], []
-        first_run_starts_everyone, last_run_ends_everyone = [], []
         for i, idx_person in enumerate(selected_persons):
             pose_path_person = pose_output_path.parent / (pose_output_path.stem + f'_person{i:02d}.trc')
             all_frames_X_person = pd.DataFrame(all_frames_X_processed[:,idx_person,:], columns=new_keypoints_names)
@@ -4351,7 +4809,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             # Build TRC file
             trc_data_i = trc_data_from_XYZtime(all_frames_X_person_filt, all_frames_Y_person_filt, all_frames_Z_homog, all_frames_time)
             trc_data.append(trc_data_i)
-            if not load_trc_px:
+            if save_pose and not load_trc_px:
                 trc_data_to_write = append_ball_marker_to_trc_data(
                     trc_data_i,
                     ball_trc_px,
@@ -4392,7 +4850,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
         #%% Convert px to meters
         trc_data_m = []
-        if to_meters and save_pose:
+        if need_meter_pose and len(trc_data) > 0:
             logging.info('\nConverting pose to meters:')
             
             # Compute height of the first person in pixels
@@ -4488,10 +4946,16 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 toml_write(calib_file_path, N, S, D, K, Rvec_cam, Tvec_cam)
                 logging.info(f'Calibration saved to {calib_file_path}.')
 
+            motion_floor_angle_overlay = float(floor_angle_estim)
+            motion_floor_origin_overlay = (float(cx), float(cy))
 
             # Coordinates in m
             new_visible_side = []
             for i in range(len(trc_data)):
+                jump_overlay_result = {
+                    'body_weight_n': None,
+                    'full_vgrf_n': np.full((len(all_frames_time),), np.nan, dtype=float),
+                }
                 if not np.array(trc_data[i].iloc[:,1:] ==0).all():
                     # Automatically determine visible side
                     visible_side_i = visible_side[i] if len(visible_side)>i else 'auto' # set to 'auto' if list too short
@@ -4550,8 +5014,41 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                                     plt.close(f)
                             logging.info(f'Pose plots (m) saved in {plots_output_dir}.')
 
+                    # Rebase trimmed meter exports so saved TRCs always start at frame/time 0.
+                    trc_data_m_export_i = reset_trc_frame_time_origin(trc_data_m_i)
+
+                    if vertical_jump_enabled:
+                        mass_i = participant_masses[i] if len(participant_masses) > i else DEFAULT_MASS
+                        if len(participant_masses) <= i:
+                            logging.warning(f'No mass provided for vertical jump. Using {DEFAULT_MASS} kg as default.')
+                        try:
+                            jump_result = analyze_vertical_jump_trial(
+                                trc_data_m_export_i,
+                                mass_kg=mass_i,
+                                fps=fps,
+                            )
+                        except ValueError as exc:
+                            logging.warning('Skipping vertical jump export for person %s: %s', i, exc)
+                        else:
+                            full_vgrf_n = np.full((len(all_frames_time),), np.nan, dtype=float)
+                            full_vgrf_n[int(trc_m_first_trim):int(trc_m_last_trim)+1] = jump_result['vgrf_n']
+                            jump_overlay_result = {
+                                'body_weight_n': float(jump_result['body_weight_n']),
+                                'full_vgrf_n': full_vgrf_n,
+                            }
+                            grf_stem = 'GRF' if len(selected_persons) == 1 else f'GRF_person{i:02d}'
+                            grf_trc_path = output_dir / f'{grf_stem}.trc'
+                            grf_metrics_path = output_dir / f'{grf_stem}_metrics.json'
+                            write_grf_trc(jump_result['time_s'], jump_result['vgrf_n'], grf_trc_path, fps=fps)
+                            write_grf_metrics_json(jump_result['metrics'], grf_metrics_path)
+                            logging.info(
+                                'Vertical GRF saved to %s and %s.',
+                                grf_trc_path.resolve(),
+                                grf_metrics_path.resolve(),
+                            )
+
                     # Write to trc file
-                    trc_data_m.append(trc_data_m_i)
+                    trc_data_m.append(trc_data_m_export_i)
                     pose_path_person_m_i = (pose_output_path.parent / (pose_output_path_m.stem + f'_person{i:02d}.trc'))
                     if ball_pose_export_enabled:
                         ball_trc_m_i = convert_px_to_meters(
@@ -4566,18 +5063,23 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             -floor_angle_estim,
                             visible_side=visible_side_i,
                         )
+                        ball_trc_m_i = reset_trc_frame_time_origin(ball_trc_m_i)
                         public_meter_trc_data_by_name[pose_path_person_m_i.name] = append_ball_marker_to_trc_data(
-                            trc_data_m_i,
+                            trc_data_m_export_i,
                             ball_trc_m_i,
                             marker_name='ball',
                         )
-                    make_trc_with_trc_data(trc_data_m_i, pose_path_person_m_i, fps=fps)
-                    if make_c3d:
+                    if write_meter_pose:
+                        make_trc_with_trc_data(trc_data_m_export_i, pose_path_person_m_i, fps=fps)
+                    if write_meter_pose and make_c3d:
                         c3d_path = convert_to_c3d(str(pose_path_person_m_i))
-                    logging.info(f'Pose in meters saved to {pose_path_person_m_i.resolve()}. {"Also saved in c3d format." if make_c3d else ""}')
+                    if write_meter_pose:
+                        logging.info(f'Pose in meters saved to {pose_path_person_m_i.resolve()}. {"Also saved in c3d format." if make_c3d else ""}')
                 else:
                     visible_side_i = 'none'
                 new_visible_side += [visible_side_i]
+                if vertical_jump_enabled:
+                    vertical_jump_results.append(jump_overlay_result)
         else:
             new_visible_side = visible_side.copy()
 
@@ -4754,6 +5256,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             new_keypoints_names,
         )
         saved_overlay_keypoint_ids = list(range(len(new_keypoints_names)))
+        motion_arrow_direction = np.array([0.0, -1.0], dtype=float)
 
         # Draw pose and angles on the full processed frame range.
         first_frame = frame_range[0]
@@ -4837,6 +5340,42 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     selected_track_id=frame_selected_ball_id if ball_multi_id_tracking else None,
                     show_ids=ball_show_ids and ball_multi_id_tracking,
                 )
+            if vertical_jump_enabled:
+                for person_slot, jump_result in enumerate(vertical_jump_results):
+                    if person_slot >= all_frames_X_processed.shape[1]:
+                        continue
+                    person_x = np.asarray(all_frames_X_processed[i, person_slot, :], dtype=float)
+                    person_y = np.asarray(all_frames_Y_processed[i, person_slot, :], dtype=float)
+                    overlay_color = colors[person_slot % len(colors)]
+                    com_point = estimate_pelvis_trunk_com_xy_px(
+                        person_x,
+                        person_y,
+                        new_keypoints_names,
+                    )
+                    img = draw_com_proxy_overlay(img, com_point, color=overlay_color)
+
+                    body_weight_n = jump_result.get('body_weight_n')
+                    full_vgrf_n = jump_result.get('full_vgrf_n')
+                    force_n = np.nan
+                    if full_vgrf_n is not None and i < len(full_vgrf_n):
+                        force_n = float(full_vgrf_n[i])
+                    anchor_point = estimate_grf_arrow_anchor_px(
+                        person_x,
+                        person_y,
+                        new_keypoints_names,
+                        floor_x_origin=motion_floor_origin_overlay[0],
+                        floor_y_origin=motion_floor_origin_overlay[1],
+                        floor_angle=motion_floor_angle_overlay,
+                    )
+                    img = draw_vgrf_arrow_overlay(
+                        img,
+                        anchor_point,
+                        force_n=force_n,
+                        body_weight_n=body_weight_n,
+                        direction=motion_arrow_direction,
+                        color=(0, 0, 255),
+                        thickness=max(2, thickness + 1),
+                    )
 
             # Save video or images
             if save_vid:

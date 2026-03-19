@@ -20,6 +20,7 @@ from Sports2D.Utilities.hybrid_editor import (
     _normalize_pose_manual_mask,
     _find_neighbor_keypoint_position,
     _open_video_capture,
+    _selected_track_review_state,
     _score_to_rgb,
     _status_color,
     augment_pose_arrays_with_derived_keypoints,
@@ -48,6 +49,27 @@ try:  # pragma: no cover - optional dependency
     QT_AVAILABLE = True
     QT_IMPORT_ERROR = None
 except Exception as exc:  # pragma: no cover - optional dependency
+    QEventLoop = None
+    QRectF = None
+    Qt = None
+    QTimer = None
+    Signal = None
+    QColor = None
+    QImage = None
+    QKeyEvent = None
+    QPainter = None
+    QPen = None
+    QApplication = None
+    QDialog = None
+    QFrame = None
+    QHBoxLayout = None
+    QLabel = None
+    QListWidget = None
+    QListWidgetItem = None
+    QPushButton = None
+    QSlider = None
+    QVBoxLayout = None
+    QWidget = None
     QT_AVAILABLE = False
     QT_IMPORT_ERROR = exc
 
@@ -121,6 +143,9 @@ QSlider::handle:horizontal {
     border-radius: 8px;
 }
 """
+
+PoseReviewDialog = None
+BallReviewDialog = None
 
 
 def _require_qt():
@@ -979,6 +1004,7 @@ if QT_AVAILABLE:  # pragma: no branch
             self.selected_ball_ids = list(selected_ball_ids)
             self.score_threshold = float(score_threshold)
             self.current_issues = []
+            self.current_source_track_id = None
 
             instructions = (
                 "Click in the video to place the ball center.\n"
@@ -1003,14 +1029,12 @@ if QT_AVAILABLE:  # pragma: no branch
             frame_center = self.ball_centers[frame_idx]
             selected_id = self.selected_ball_ids[frame_idx] if frame_idx < len(self.selected_ball_ids) else None
             frame_tracks = self.ball_tracks[frame_idx] if frame_idx < len(self.ball_tracks) else []
-            track_visible = False
-            track_score = None
-            for track in frame_tracks or []:
-                if int(track.get("id", -1)) != int(selected_id if selected_id is not None else -1):
-                    continue
-                track_visible = bool(track.get("visible", False))
-                track_score = track.get("score")
-                break
+            _, track_score, track_visible, source_track_id = _selected_track_review_state(
+                frame_tracks,
+                selected_id,
+                frame_center=frame_center,
+            )
+            self.current_source_track_id = source_track_id
             self.current_issues = build_ball_issue_list(
                 frame_center,
                 score=track_score,
@@ -1027,6 +1051,17 @@ if QT_AVAILABLE:  # pragma: no branch
             issue_text = ", ".join(issue["status"] for issue in self.current_issues) or "no issues"
             return [
                 f"Selected track: {selected_id}",
+                (
+                    f"Visible source track: {self.current_source_track_id}"
+                    if self.current_source_track_id is not None
+                    and selected_id is not None
+                    and int(self.current_source_track_id) != int(selected_id)
+                    else (
+                        "Visible source track: same as selected"
+                        if self.current_source_track_id is not None and selected_id is not None
+                        else "Visible source track: none"
+                    )
+                ),
                 f"Flagged: {issue_text}",
                 f"Local frame index: {frame_idx}",
             ]

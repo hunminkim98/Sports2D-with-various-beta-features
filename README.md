@@ -337,6 +337,10 @@ You can optionally use the LSTM marker augmentation to improve the quality of th
 You can also optionally give the participants proper masses. Mass has no influence on motion, only on forces (if you decide to further pursue kinetics analysis).\
 Optionally again, you can [visualize the overlaid results in Blender](#visualize-in-blender). The automatic calibration won't be accurate with such a small time range, so you need to use the provided calibration file (or one that has been generated from the full walk).
 
+If you want a Sports2D-only vertical jump estimate without OpenSim body kinematics, set `motion.vertical_jump = true` in your TOML file or pass `--vertical_jump true`.
+Sports2D will use a pelvis-trunk proxy CoM derived from `Hip` and `Neck`, export an estimated `GRF.trc` plus metrics JSON, draw the proxy CoM point on saved video/images, and draw an upward GRF arrow anchored at the support point.
+This is an estimated GRF from kinematics, not a force-plate measurement.
+
 ```cmd
 sports2d --time_range 1.2 2.7 `
          --do_ik true --first_person_height 1.65 --visible_side left front `
@@ -468,7 +472,16 @@ sports2d --video_input demo.mp4 other_video.mp4 --time_range 1.2 2.7 0 3.5
            --sam3_model_path facebook/sam3 `
            --sam3_runtime transformers
   ```
-  This keeps person detection on YOLOX and only adds SAM3 for the sports ball path. For the lower-risk `transformers` path, `--sam3_model_path` must be a Hugging Face repo ID or a local HF snapshot folder such as `facebook/sam3`. Raw `.pt` checkpoints cannot stay on `transformers`; they auto-switch to the official Meta `sam3` runtime and ignore `--sam3_processor_path`. With `--detect_ball true --save_pose true`, Sports2D also writes `pose_ball/` JSON files and appends a trailing `ball` marker to saved pixel/meter TRCs.
+  This keeps person detection on YOLOX and only adds SAM3 for the sports ball path. For the lower-risk `transformers` path, `--sam3_model_path` must be a Hugging Face repo ID or a local HF snapshot folder such as `facebook/sam3`. Raw `.pt` checkpoints cannot stay on `transformers`; they auto-switch to the official Meta `sam3` runtime and ignore `--sam3_processor_path`. With `--detect_ball true --save_pose true`, Sports2D also writes `pose_ball/` JSON files and appends a trailing `ball` marker to saved pixel/meter TRCs. Missing ball frames stay empty in export, while multi-ID ball JSON exposes both the selected timeline ID (`track_id`) and the raw visible source track (`source_track_id`) when a short raw-ID split is stitched back together.
+  Sports2D now keeps two ball notions in hybrid multi-ID mode: raw detector/track IDs for debugging, and one selected-ball timeline for export/review. The selected timeline can stay continuous across short raw-ID splits, while `ball_show_ids=true` still shows the raw IDs on boxes.
+- Use SynthPose with Ultralytics YOLO26 detection
+  ``` cmd
+  pip install sports2d[synthpose,yolo26]
+  sports2d --pose_model synthpose `
+           --synthpose_detector yolo26 `
+           --detect_ball true
+  ```
+  This uses an Ultralytics COCO detector for people and optional sports-ball metadata while keeping the existing SynthPose VitPose path for the 52-keypoint pose output.
 - Review auto-estimated pose and ball tracks before exporting the final outputs
   ``` cmd
   sports2d --hybrid_mode true `
@@ -477,7 +490,7 @@ sports2d --video_input demo.mp4 other_video.mp4 --time_range 1.2 2.7 0 3.5
            --hybrid_review_ball true `
            --detect_ball true
   ```
-  In the pose review UI, Sports2D lists flagged keypoints for the selected frame and separates them visually: missing keypoints are red crosses, low-confidence keypoints use amber outlines, manual overrides are blue, and derived markers such as `Hip` or `Neck` are gray and read-only. Use the mouse wheel to zoom around the cursor, middle-drag to pan, and right-click to clear the current keypoint selection. For smoother playback, set `--hybrid_ui_backend qt` to use the Qt editor; if PySide6 is unavailable, Sports2D falls back to the Matplotlib editor. When ball detection is enabled, the hybrid pass also lets you correct the selected ball timeline before TRC/JSON export, and the same zoom/pan interaction works there too.
+  In the pose review UI, Sports2D lists flagged keypoints for the selected frame and separates them visually: missing keypoints are red crosses, low-confidence keypoints use amber outlines, manual overrides are blue, and derived markers such as `Hip` or `Neck` are gray and read-only. Use the mouse wheel to zoom around the cursor, middle-drag to pan, and right-click to clear the current keypoint selection. For smoother playback, set `--hybrid_ui_backend qt` to use the Qt editor; if PySide6 is unavailable, Sports2D falls back to the Matplotlib editor. When ball detection is enabled, the hybrid pass also lets you correct the selected ball timeline before TRC/JSON export, and the same zoom/pan interaction works there too. `ball_ordering_method='on_click'` now picks a seed raw track after processing and reconstructs the selected-ball timeline from that seed instead of hard-forcing one raw ID on every frame.
 
 <br>
 
@@ -519,7 +532,7 @@ sports2d --help
 'segment_angles': ["s", '"Right foot" "Left foot" "Right shank" "Left shank" "Right thigh" "Left thigh" "Pelvis" "Trunk" "Shoulders" "Head" "Right arm" "Left arm" "Right forearm" "Left forearm" if not specified'],
 'save_vid': ["V", "save processed video. true if not specified"],
 'save_img': ["I", "save processed images. true if not specified"],
-'save_pose': ["P", "save pose as trc files. When detect_ball=true, also append a trailing ball marker to saved TRCs and write per-frame ball JSON files in pose_ball/. true if not specified"],
+'save_pose': ["P", "save pose as trc files. When detect_ball=true, also append a trailing ball marker to saved TRCs and write per-frame ball JSON files in pose_ball/. Missing ball frames stay empty in export, and multi-ID ball JSON can expose both the selected timeline ID and the raw source track ID. true if not specified"],
 'calculate_angles': ["c", "calculate joint and segment angles. true if not specified"],
 'save_angles': ["A", "save angles as mot files. true if not specified"],
 'hybrid_mode': ["", "true or false. open a post-pass manual review UI before final exports so the user can correct pose and ball outputs. false if not specified"],
@@ -610,7 +623,7 @@ Note that any detection and pose models can be used (first [deploy them with MMP
           'pose_model':'https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-t_simcc-body7_pt-body7_420e-256x192-026a1439_20230504.zip',
           'pose_input_size':[192,256]}"""
   ```
-- Use `--det_frequency 50`: Rtmlib is (by default) a top-down method: detects bounding boxes for every person in the frame, and then detects keypoints inside of each box. The person detection stage is much slower. You can choose to detect persons only every 50 frames (for example), and track bounding boxes inbetween, which is much faster.
+- Use `--det_frequency 50`: Rtmlib is (by default) a top-down method: detects bounding boxes for every person in the frame, and then detects keypoints inside of each box. The person detection stage is much slower. You can choose to detect persons only every 50 frames (for example), and track bounding boxes inbetween, which is much faster. If `detect_ball=true`, sparse cadence is safest with `ball_detector_backend sam3`; shared-detector ball metadata still follows the person-detection cadence.
 - Use `--load_trc_px <path_to_file_px.trc>`: Will use pose estimation results from a file. Useful if you want to use different parameters for pixel to meter conversion or angle calculation without running detection and pose estimation all over.
 - Make sure you use `--tracking_mode sports2d`: Will use the default Sports2D tracker. Unlike DeepSort, it is faster, does not require any parametrization, and is as good in non-crowded scenes. 
 

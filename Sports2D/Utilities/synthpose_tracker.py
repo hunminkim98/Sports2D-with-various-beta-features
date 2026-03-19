@@ -12,13 +12,13 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     ##################################################
     
     SynthPose pose tracker using:
-    - rtmlib YOLOX for person detection (same as Sports2D default)
+    - configurable person detection (YOLOX, YOLO26, RT-DETR, RT-DETRv4, or SAM3)
     - VitPose from HuggingFace Transformers for pose estimation (52 keypoints)
     
     This module provides:
     - SynthPosePoseTracker class with __call__(frame) interface
     - Full 52 SynthPose keypoints output (17 COCO + 35 anatomical markers)
-    - Uses rtmlib's YOLOX detector for consistency with Sports2D
+    - Keeps detector metadata compatible with the Sports2D processing pipeline
 '''
 
 import numpy as np
@@ -33,6 +33,13 @@ from Sports2D.Utilities.sam3_detector import (
 
 PERSON_CLASS_ID = 0
 SPORTS_BALL_CLASS_ID = 32
+SUPPORTED_SYNTHPOSE_DETECTORS = (
+    'yolox',
+    'yolo26',
+    'rtdetr',
+    'rtdetrv4',
+    'sam3',
+)
 
 # Lazy imports to avoid loading heavy dependencies at module load time
 _MODELS_LOADED = False
@@ -74,6 +81,21 @@ def _load_dependencies():
 __author__ = "Sports2D Contributors"
 __copyright__ = "Copyright 2024, Sports2D"
 __license__ = "BSD 3-Clause License"
+
+
+def _normalize_synthpose_detector(detector, default='yolox'):
+    '''
+    Normalize and validate the SynthPose detector selection.
+    '''
+    normalized = str(default if detector is None else detector).strip().lower()
+    if normalized in SUPPORTED_SYNTHPOSE_DETECTORS:
+        return normalized
+
+    supported = "', '".join(SUPPORTED_SYNTHPOSE_DETECTORS)
+    raise ValueError(
+        f"Unsupported synthpose_detector '{detector}'. "
+        f"Expected one of: '{supported}'."
+    )
 
 
 def _normalize_ball_detector_backend(ball_detector_backend, detector=None, default='same'):
@@ -149,9 +171,11 @@ class SynthPosePoseTracker:
         - person_threshold: Confidence threshold for person detection (default 0.3)
         - keypoint_threshold: Confidence threshold for keypoints (default 0.3)
         - backend: Backend for rtmlib YOLOX ('auto', 'onnxruntime', 'openvino', 'opencv')
-                   Only used when detector='yolox'. Ignored for 'rtdetr' and 'rtdetrv4'.
+                   Only used when detector='yolox'. Ignored for 'yolo26', 'rtdetr',
+                   'rtdetrv4', and 'sam3'.
         - detector: Person detector selection
                     'yolox': rtmlib YOLOX (RECOMMENDED - fast, reliable)
+                    'yolo26': Ultralytics YOLO26 detector
                     'rtdetr': HuggingFace RT-DETR (good accuracy, no local setup)
                     'rtdetrv4': Local RT-DETRv4 (requires engine installation)
                     'sam3': Promptable SAM3 detector (HF bundle or raw .pt checkpoint)
@@ -165,7 +189,7 @@ class SynthPosePoseTracker:
         self.person_threshold = person_threshold
         self.keypoint_threshold = keypoint_threshold
         self.backend = backend
-        self.detector_type = detector.lower()  # 'yolox' or 'rtdetr'
+        self.detector_type = _normalize_synthpose_detector(detector)
         self.detect_ball = bool(detect_ball)
         if ball_class_ids is None:
             self.ball_class_ids = [SPORTS_BALL_CLASS_ID]
@@ -190,13 +214,20 @@ class SynthPosePoseTracker:
         self.last_detections = self._empty_detections()
         self.sam3_detector = None
         self.sam3_ball_detector = None
-        self.detector_size = self._resolve_detector_size(detector_size)
+        self.detector = None
+        self.detector_size = self._resolve_detector_size(
+            detector_size,
+            detector=self.detector_type,
+        )
+        if self.detector_type == 'rtdetrv4':
+            self.rtdetrv4_size = self.detector_size if self.detector_size in {'s', 'm', 'l', 'x'} else 'x'
         self.ball_detection_threshold = float(np.clip(ball_detection_threshold, 0.01, 0.9))
         self.ball_nms_score_threshold = float(np.clip(ball_nms_score_threshold, 0.01, 0.9))
         
         # Frame tracking for detection frequency
         self.frame_count = 0
         self.prev_boxes = None
+        self._warned_ball_detection_cadence = False
         
         # Set device for VitPose (PyTorch)
         if device == 'auto':
@@ -222,6 +253,18 @@ class SynthPosePoseTracker:
             self.sam3_target,
             self.ball_detector_backend,
         )
+        if (
+            self.detect_ball
+            and self.det_frequency > 1
+            and not self._uses_secondary_sam3_ball_detector()
+        ):
+            logging.warning(
+                'detect_ball=true with det_frequency=%s reuses sparse detector metadata on shared-detector paths. '
+                'Ball continuity may degrade between detection frames. Use det_frequency=1 or ball_detector_backend=\'sam3\' '
+                'for stronger ball-ID stability.',
+                self.det_frequency,
+            )
+            self._warned_ball_detection_cadence = True
         
         # Load models
         self._load_models()
@@ -229,36 +272,216 @@ class SynthPosePoseTracker:
         logging.info(f'SynthPose ready. Output: 52 keypoints (17 COCO + 35 anatomical markers)')
 
     @staticmethod
-    def _resolve_detector_size(size_value):
+    def _resolve_detector_size(size_value, detector='yolox'):
         """
         Resolve detector size from explicit size or mode alias.
 
         Accepted values:
-        - mode aliases: performance -> x, balanced -> m, lightweight -> s
-        - explicit sizes: x, l, m, s
+        - YOLOX / RT-DETRv4: performance -> x, balanced -> m, lightweight -> s
+        - YOLO26: performance -> x, balanced -> m, lightweight -> n
         """
-        mode_to_size = {
-            'performance': 'x',
-            'balanced': 'm',
-            'lightweight': 's',
-        }
-        explicit_sizes = {'x', 'l', 'm', 's'}
+        detector_name = str(detector or 'yolox').strip().lower()
+        if detector_name == 'yolo26':
+            mode_to_size = {
+                'performance': 'x',
+                'balanced': 'm',
+                'lightweight': 'n',
+            }
+            explicit_sizes = {'x', 'l', 'm', 's', 'n'}
+            tiny_alias = 'n'
+            default_size = 'm'
+        else:
+            mode_to_size = {
+                'performance': 'x',
+                'balanced': 'm',
+                'lightweight': 's',
+            }
+            explicit_sizes = {'x', 'l', 'm', 's'}
+            tiny_alias = 's'
+            default_size = 'm'
+
         value = str(size_value).lower()
         if value in mode_to_size:
             return mode_to_size[value]
         if value == 'tiny':
             logging.warning(
-                "synthpose detector size 'tiny' is deprecated. Using 's'."
+                "synthpose detector size 'tiny' is deprecated. Using '%s'.",
+                tiny_alias,
             )
-            return 's'
+            return tiny_alias
         if value in explicit_sizes:
             return value
 
         logging.warning(
-            f"Unknown synthpose detector size '{size_value}'. "
-            "Using 'm' (balanced)."
+            "Unknown synthpose detector size '%s' for detector '%s'. Using '%s'.",
+            size_value,
+            detector_name,
+            default_size,
         )
-        return 'm'
+        return default_size
+
+    @staticmethod
+    def _tensor_like_to_numpy(value, dtype=None):
+        '''
+        Convert torch / ultralytics tensor-like objects to numpy arrays.
+        '''
+        if value is None:
+            return np.empty((0,), dtype=dtype if dtype is not None else np.float32)
+
+        if hasattr(value, 'detach'):
+            value = value.detach()
+        if hasattr(value, 'cpu'):
+            value = value.cpu()
+        if hasattr(value, 'numpy'):
+            try:
+                value = value.numpy()
+            except TypeError:
+                pass
+
+        array = np.asarray(value)
+        if dtype is not None:
+            array = array.astype(dtype, copy=False)
+        return array
+
+    @classmethod
+    def _ensure_xyxy_boxes(cls, boxes):
+        '''
+        Normalize detector boxes to Nx4 xyxy float32.
+        '''
+        box_array = cls._tensor_like_to_numpy(boxes, dtype=np.float32)
+        if box_array.size == 0:
+            return np.empty((0, 4), dtype=np.float32)
+        if box_array.ndim == 1:
+            box_array = box_array.reshape(1, -1)
+        if box_array.shape[1] < 4:
+            return np.empty((0, 4), dtype=np.float32)
+        return box_array[:, :4].astype(np.float32, copy=False)
+
+    @staticmethod
+    def _xyxy_to_coco_boxes(boxes_xyxy):
+        '''
+        Convert xyxy boxes to COCO xywh format for VitPose.
+        '''
+        boxes_xyxy = np.asarray(boxes_xyxy, dtype=np.float32).reshape(-1, 4)
+        if len(boxes_xyxy) == 0:
+            return np.empty((0, 4), dtype=np.float32)
+        boxes_coco = np.zeros((len(boxes_xyxy), 4), dtype=np.float32)
+        boxes_coco[:, 0] = boxes_xyxy[:, 0]
+        boxes_coco[:, 1] = boxes_xyxy[:, 1]
+        boxes_coco[:, 2] = boxes_xyxy[:, 2] - boxes_xyxy[:, 0]
+        boxes_coco[:, 3] = boxes_xyxy[:, 3] - boxes_xyxy[:, 1]
+        return boxes_coco
+
+    @staticmethod
+    def _resolve_class_names(classes, names):
+        '''
+        Resolve per-box class names from a detector label lookup.
+        '''
+        classes = np.asarray(classes, dtype=np.int32).reshape(-1)
+        if len(classes) == 0 or names is None:
+            return np.empty((0,), dtype=object)
+
+        resolved = []
+        if isinstance(names, dict):
+            for class_id in classes:
+                resolved.append(str(names.get(int(class_id), int(class_id))))
+        else:
+            try:
+                name_list = list(names)
+            except TypeError:
+                return np.empty((0,), dtype=object)
+            for class_id in classes:
+                idx = int(class_id)
+                if 0 <= idx < len(name_list):
+                    resolved.append(str(name_list[idx]))
+                else:
+                    resolved.append(str(idx))
+        return np.asarray(resolved, dtype=object)
+
+    def _set_last_detections(self, boxes, classes=None, scores=None,
+                             class_names=None, prompt_indices=None,
+                             metadata_score_threshold=None,
+                             person_score_threshold=None):
+        '''
+        Normalize detector outputs into the shared metadata contract.
+        '''
+        boxes = self._ensure_xyxy_boxes(boxes)
+        if len(boxes) == 0:
+            self.last_detections = self._empty_detections()
+            return np.empty((0, 4), dtype=np.float32)
+
+        classes = self._tensor_like_to_numpy(classes, dtype=np.int32).reshape(-1)
+        if len(classes) != len(boxes):
+            classes = np.full((len(boxes),), PERSON_CLASS_ID, dtype=np.int32)
+
+        scores = self._tensor_like_to_numpy(scores, dtype=np.float32).reshape(-1)
+        if len(scores) == 0:
+            scores = np.full((len(boxes),), np.nan, dtype=np.float32)
+        elif len(scores) != len(boxes):
+            padded_scores = np.full((len(boxes),), np.nan, dtype=np.float32)
+            limit = min(len(scores), len(boxes))
+            padded_scores[:limit] = scores[:limit]
+            scores = padded_scores
+
+        class_names = np.asarray(class_names, dtype=object).reshape(-1) if class_names is not None else np.empty((0,), dtype=object)
+        if len(class_names) not in {0, len(boxes)}:
+            class_names = np.empty((0,), dtype=object)
+
+        prompt_indices = (
+            self._tensor_like_to_numpy(prompt_indices, dtype=np.int32).reshape(-1)
+            if prompt_indices is not None else np.empty((0,), dtype=np.int32)
+        )
+        if len(prompt_indices) not in {0, len(boxes)}:
+            prompt_indices = np.empty((0,), dtype=np.int32)
+
+        if metadata_score_threshold is not None and len(scores) == len(boxes):
+            meta_mask = scores >= float(metadata_score_threshold)
+            boxes = boxes[meta_mask]
+            classes = classes[meta_mask]
+            scores = scores[meta_mask]
+            if len(class_names) == len(meta_mask):
+                class_names = class_names[meta_mask]
+            if len(prompt_indices) == len(meta_mask):
+                prompt_indices = prompt_indices[meta_mask]
+            if len(boxes) == 0:
+                self.last_detections = self._empty_detections()
+                return np.empty((0, 4), dtype=np.float32)
+
+        person_mask = classes == PERSON_CLASS_ID
+        if person_score_threshold is not None and len(scores) == len(boxes):
+            person_mask = person_mask & (scores >= float(person_score_threshold))
+        person_boxes_xyxy = boxes[person_mask]
+        if len(person_boxes_xyxy) == 0 and len(boxes) > 0:
+            unique_classes = np.unique(classes)
+            if len(unique_classes) == 1:
+                if person_score_threshold is None or np.any(scores >= float(person_score_threshold)):
+                    fallback_mask = np.ones((len(boxes),), dtype=bool)
+                    if person_score_threshold is not None:
+                        fallback_mask = scores >= float(person_score_threshold)
+                    person_boxes_xyxy = boxes[fallback_mask]
+
+        if self._primary_detector_handles_ball():
+            ball_mask = np.isin(classes, self.ball_class_ids)
+            if len(scores) == len(boxes):
+                ball_mask = ball_mask & (scores >= self.ball_detection_threshold)
+            ball_boxes_xyxy = boxes[ball_mask]
+            ball_scores_xyxy = scores[ball_mask]
+        else:
+            ball_boxes_xyxy = np.empty((0, 4), dtype=np.float32)
+            ball_scores_xyxy = np.empty((0,), dtype=np.float32)
+
+        self.last_detections = {
+            'boxes': boxes,
+            'classes': classes,
+            'scores': scores,
+            'person_boxes': person_boxes_xyxy,
+            'ball_boxes': ball_boxes_xyxy,
+            'ball_scores': ball_scores_xyxy,
+            'class_names': class_names,
+            'prompt_indices': prompt_indices,
+            'sam3_ball_meta': {},
+        }
+        return self._xyxy_to_coco_boxes(person_boxes_xyxy)
 
     def _empty_detections(self):
         empty = empty_sam3_detections(store_masks=self.sam3_collect_masks)
@@ -277,20 +500,37 @@ class SynthPosePoseTracker:
     
     def _load_models(self):
         '''Load person detector (YOLOX, RT-DETR, RT-DETRv4, or SAM3) and VitPose model.'''
-        
-        # Person detector: YOLOX (rtmlib), RT-DETR, RT-DETRv4, or SAM3
-        if self.detector_type == 'sam3':
-            logging.info('Loading SAM3 detector (HF bundle or raw .pt checkpoint)...')
-            self._load_sam3_detector()
-        elif self.detector_type == 'rtdetrv4':
-            logging.info('Loading RT-DETRv4 person detector (local checkpoint)...')
-            self._load_rtdetrv4_detector()
-        elif self.detector_type == 'rtdetr':
-            logging.info('Loading RT-DETR person detector (HuggingFace Transformers, original SynthPose_PM)...')
-            self._load_rtdetr_detector()
-        else:
-            logging.info('Loading rtmlib YOLOX person detector...')
-            self._load_rtmlib_detector()
+
+        loader_map = {
+            'sam3': (
+                'Loading SAM3 detector (HF bundle or raw .pt checkpoint)...',
+                self._load_sam3_detector,
+            ),
+            'rtdetrv4': (
+                'Loading RT-DETRv4 person detector (local checkpoint)...',
+                self._load_rtdetrv4_detector,
+            ),
+            'rtdetr': (
+                'Loading RT-DETR person detector (HuggingFace Transformers, original SynthPose_PM)...',
+                self._load_rtdetr_detector,
+            ),
+            'yolox': (
+                'Loading rtmlib YOLOX person detector...',
+                self._load_rtmlib_detector,
+            ),
+            'yolo26': (
+                'Loading Ultralytics YOLO26 person detector...',
+                self._load_ultralytics_detector,
+            ),
+        }
+        try:
+            message, loader = loader_map[self.detector_type]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported synthpose_detector '{self.detector_type}'."
+            ) from exc
+        logging.info(message)
+        loader()
 
         if self._uses_secondary_sam3_ball_detector():
             logging.info('Loading secondary SAM3 sports-ball detector...')
@@ -425,6 +665,32 @@ class SynthPosePoseTracker:
             nms_thr,
             score_thr,
             rtmlib_backend,
+        )
+
+    def _load_ultralytics_detector(self):
+        '''Load Ultralytics YOLO26 detector lazily.'''
+        try:
+            from ultralytics import YOLO
+        except ImportError as e:
+            raise ImportError(
+                "Ultralytics YOLO detectors require the 'ultralytics' package."
+            ) from e
+
+        model_name = f'yolo26{self.detector_size}.pt'
+        self.detector = YOLO(model_name)
+        if hasattr(self.detector, 'to'):
+            try:
+                self.detector.to(self.device)
+            except Exception as e:
+                logging.debug(
+                    'Could not move Ultralytics detector to device %s: %s',
+                    self.device,
+                    e,
+                )
+        logging.info(
+            'Ultralytics YOLO26 detector loaded (weights=%s, device=%s)',
+            model_name,
+            self.device,
         )
     
     def _load_rtdetr_detector(self):
@@ -599,7 +865,9 @@ class SynthPosePoseTracker:
         else:
             person_boxes = self.prev_boxes if self.prev_boxes is not None else np.array([])
             self.last_detections = self._empty_detections()
-        
+            if self._uses_secondary_sam3_ball_detector():
+                self._merge_secondary_ball_detections(self._detect_balls_sam3(frame))
+
         # No persons detected
         if len(person_boxes) == 0:
             return np.array([]).reshape(0, 52, 2), np.array([]).reshape(0, 52)
@@ -630,14 +898,20 @@ class SynthPosePoseTracker:
         - person_boxes: np.array shape (N_persons, 4) in COCO format (x, y, w, h)
         '''
         
-        if self.detector_type == 'sam3':
-            return self._detect_persons_sam3(frame)
-        elif self.detector_type == 'rtdetrv4':
-            return self._detect_persons_rtdetrv4(frame)
-        elif self.detector_type == 'rtdetr':
-            return self._detect_persons_rtdetr(frame)
-        else:
-            return self._detect_persons_yolox(frame)
+        detector_map = {
+            'sam3': self._detect_persons_sam3,
+            'rtdetrv4': self._detect_persons_rtdetrv4,
+            'rtdetr': self._detect_persons_rtdetr,
+            'yolox': self._detect_persons_yolox,
+            'yolo26': self._detect_persons_yolo26,
+        }
+        try:
+            detector_fn = detector_map[self.detector_type]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported synthpose_detector '{self.detector_type}'."
+            ) from exc
+        return detector_fn(frame)
     
     def _detect_persons_yolox(self, frame):
         '''Detect persons using rtmlib YOLOX.'''
@@ -683,48 +957,71 @@ class SynthPosePoseTracker:
                 self.last_detections = self._empty_detections()
                 return np.array([])
 
-        bboxes = bboxes[:, :4]
-        if len(classes) != len(bboxes):
-            classes = np.full((len(bboxes),), PERSON_CLASS_ID, dtype=np.int32)
-        if len(detection_scores) != len(bboxes):
-            detection_scores = np.full((len(bboxes),), np.nan, dtype=np.float32)
+        metadata_score_threshold = (
+            min(self.person_threshold, self.ball_detection_threshold)
+            if self._primary_detector_handles_ball() else self.person_threshold
+        )
+        return self._set_last_detections(
+            bboxes[:, :4],
+            classes=classes,
+            scores=detection_scores,
+            metadata_score_threshold=metadata_score_threshold,
+            person_score_threshold=self.person_threshold,
+        )
 
-        person_mask = classes == PERSON_CLASS_ID
-        person_boxes_xyxy = bboxes[person_mask]
-        if len(person_boxes_xyxy) == 0 and len(bboxes) > 0:
-            # Fallback for detectors whose single-class index is not 0.
-            unique_classes = np.unique(classes)
-            if len(unique_classes) == 1:
-                person_boxes_xyxy = bboxes
-        if self._primary_detector_handles_ball():
-            ball_mask = np.isin(classes, self.ball_class_ids)
-            ball_boxes_xyxy = bboxes[ball_mask]
-            ball_scores_xyxy = detection_scores[ball_mask]
+    def _detect_persons_yolo26(self, frame):
+        '''Detect persons using Ultralytics YOLO26.'''
+        metadata_threshold = (
+            min(self.person_threshold, self.ball_detection_threshold)
+            if self._primary_detector_handles_ball() else self.person_threshold
+        )
+        try:
+            results = self.detector(
+                frame,
+                verbose=False,
+                conf=float(metadata_threshold),
+            )
+        except TypeError:
+            results = self.detector(frame)
+
+        if results is None:
+            self.last_detections = self._empty_detections()
+            return np.array([])
+
+        if isinstance(results, (list, tuple)):
+            result = results[0] if len(results) > 0 else None
         else:
-            ball_boxes_xyxy = np.empty((0, 4), dtype=np.float32)
-            ball_scores_xyxy = np.empty((0,), dtype=np.float32)
+            result = results
+        if result is None:
+            self.last_detections = self._empty_detections()
+            return np.array([])
 
-        # Convert from (x1, y1, x2, y2) to COCO format (x, y, w, h) for VitPose
-        person_boxes_coco = np.zeros((len(person_boxes_xyxy), 4))
-        if len(person_boxes_xyxy) > 0:
-            person_boxes_coco[:, 0] = person_boxes_xyxy[:, 0]  # x
-            person_boxes_coco[:, 1] = person_boxes_xyxy[:, 1]  # y
-            person_boxes_coco[:, 2] = person_boxes_xyxy[:, 2] - person_boxes_xyxy[:, 0]  # width
-            person_boxes_coco[:, 3] = person_boxes_xyxy[:, 3] - person_boxes_xyxy[:, 1]  # height
+        result_boxes = getattr(result, 'boxes', None)
+        boxes = self._ensure_xyxy_boxes(
+            getattr(result_boxes, 'xyxy', result_boxes)
+        )
+        if len(boxes) == 0:
+            self.last_detections = self._empty_detections()
+            return np.array([])
 
-        self.last_detections = {
-            'boxes': bboxes,
-            'classes': classes,
-            'scores': detection_scores,
-            'person_boxes': person_boxes_xyxy,
-            'ball_boxes': ball_boxes_xyxy,
-            'ball_scores': ball_scores_xyxy,
-            'class_names': np.empty((0,), dtype=object),
-            'prompt_indices': np.empty((0,), dtype=np.int32),
-            'sam3_ball_meta': {},
-        }
+        classes = self._tensor_like_to_numpy(
+            getattr(result_boxes, 'cls', None),
+            dtype=np.int32,
+        ).reshape(-1)
+        scores = self._tensor_like_to_numpy(
+            getattr(result_boxes, 'conf', None),
+            dtype=np.float32,
+        ).reshape(-1)
+        class_names = self._resolve_class_names(classes, getattr(result, 'names', None))
 
-        return person_boxes_coco
+        return self._set_last_detections(
+            boxes,
+            classes=classes,
+            scores=scores,
+            class_names=class_names,
+            metadata_score_threshold=metadata_threshold,
+            person_score_threshold=self.person_threshold,
+        )
 
     def _detect_persons_sam3(self, frame):
         '''Detect persons using SAM3 with prompt presets.'''
@@ -809,50 +1106,29 @@ class SynthPosePoseTracker:
         with _torch.no_grad():
             outputs = self.rtdetr_model(**inputs)
         
+        metadata_threshold = (
+            min(self.person_threshold, self.ball_detection_threshold)
+            if self._primary_detector_handles_ball() else self.person_threshold
+        )
+
         # Post-process detection results
         results = self.rtdetr_processor.post_process_object_detection(
             outputs, 
             target_sizes=_torch.tensor([(height, width)]),
-            threshold=min(self.person_threshold, self.ball_detection_threshold)
+            threshold=metadata_threshold,
         )
         result = results[0]
 
         labels = result["labels"].cpu().numpy()
         scores = result["scores"].cpu().numpy()
         all_boxes_voc = result["boxes"].cpu().numpy()
-        person_mask = (labels == PERSON_CLASS_ID) & (scores >= self.person_threshold)
-        person_boxes_voc = all_boxes_voc[person_mask]
-        if self._primary_detector_handles_ball():
-            ball_mask = np.isin(labels, self.ball_class_ids) & (scores >= self.ball_detection_threshold)
-            ball_boxes_voc = all_boxes_voc[ball_mask]
-            ball_scores_voc = scores[ball_mask].astype(np.float32, copy=False)
-        else:
-            ball_boxes_voc = np.empty((0, 4), dtype=np.float32)
-            ball_scores_voc = np.empty((0,), dtype=np.float32)
-
-        self.last_detections = {
-            'boxes': all_boxes_voc,
-            'classes': labels.astype(np.int32, copy=False),
-            'scores': scores.astype(np.float32, copy=False),
-            'person_boxes': person_boxes_voc,
-            'ball_boxes': ball_boxes_voc,
-            'ball_scores': ball_scores_voc,
-            'class_names': np.empty((0,), dtype=object),
-            'prompt_indices': np.empty((0,), dtype=np.int32),
-            'sam3_ball_meta': {},
-        }
-        
-        if len(person_boxes_voc) == 0:
-            return np.array([])
-        
-        # Convert from VOC (x1, y1, x2, y2) to COCO format (x, y, w, h) for VitPose
-        person_boxes_coco = np.zeros((len(person_boxes_voc), 4))
-        person_boxes_coco[:, 0] = person_boxes_voc[:, 0]  # x
-        person_boxes_coco[:, 1] = person_boxes_voc[:, 1]  # y
-        person_boxes_coco[:, 2] = person_boxes_voc[:, 2] - person_boxes_voc[:, 0]  # width
-        person_boxes_coco[:, 3] = person_boxes_voc[:, 3] - person_boxes_voc[:, 1]  # height
-        
-        return person_boxes_coco
+        return self._set_last_detections(
+            all_boxes_voc,
+            classes=labels,
+            scores=scores,
+            metadata_score_threshold=metadata_threshold,
+            person_score_threshold=self.person_threshold,
+        )
     
     def _detect_persons_rtdetrv4(self, frame):
         '''Detect persons using RT-DETRv4 from local checkpoint.'''
@@ -875,42 +1151,17 @@ class SynthPosePoseTracker:
         labels_0 = labels[0]
         boxes_0 = boxes[0]
         scores_0 = scores[0]
-        person_mask = (labels_0 == PERSON_CLASS_ID) & (scores_0 >= self.person_threshold)
-        person_boxes_voc = boxes_0[person_mask].cpu().numpy()
-        if self._primary_detector_handles_ball():
-            ball_mask = _torch.zeros_like(person_mask, dtype=_torch.bool)
-            for cls_id in self.ball_class_ids:
-                ball_mask = ball_mask | ((labels_0 == cls_id) & (scores_0 >= self.ball_detection_threshold))
-            ball_boxes_voc = boxes_0[ball_mask].cpu().numpy()
-            ball_scores_voc = scores_0[ball_mask].cpu().numpy().astype(np.float32, copy=False)
-        else:
-            ball_boxes_voc = np.empty((0, 4), dtype=np.float32)
-            ball_scores_voc = np.empty((0,), dtype=np.float32)
-
-        valid_mask = scores_0 >= self.person_threshold
-        self.last_detections = {
-            'boxes': boxes_0[valid_mask].cpu().numpy(),
-            'classes': labels_0[valid_mask].cpu().numpy().astype(np.int32, copy=False),
-            'scores': scores_0[valid_mask].cpu().numpy().astype(np.float32, copy=False),
-            'person_boxes': person_boxes_voc,
-            'ball_boxes': ball_boxes_voc,
-            'ball_scores': ball_scores_voc,
-            'class_names': np.empty((0,), dtype=object),
-            'prompt_indices': np.empty((0,), dtype=np.int32),
-            'sam3_ball_meta': {},
-        }
-        
-        if len(person_boxes_voc) == 0:
-            return np.array([])
-        
-        # Convert from VOC (x1, y1, x2, y2) to COCO format (x, y, w, h) for VitPose
-        person_boxes_coco = np.zeros((len(person_boxes_voc), 4))
-        person_boxes_coco[:, 0] = person_boxes_voc[:, 0]  # x
-        person_boxes_coco[:, 1] = person_boxes_voc[:, 1]  # y
-        person_boxes_coco[:, 2] = person_boxes_voc[:, 2] - person_boxes_voc[:, 0]  # width
-        person_boxes_coco[:, 3] = person_boxes_voc[:, 3] - person_boxes_voc[:, 1]  # height
-        
-        return person_boxes_coco
+        metadata_threshold = (
+            min(self.person_threshold, self.ball_detection_threshold)
+            if self._primary_detector_handles_ball() else self.person_threshold
+        )
+        return self._set_last_detections(
+            boxes_0,
+            classes=labels_0,
+            scores=scores_0,
+            metadata_score_threshold=metadata_threshold,
+            person_score_threshold=self.person_threshold,
+        )
 
     def _estimate_poses(self, pil_image, person_boxes):
         '''
@@ -974,7 +1225,7 @@ def setup_synthpose_tracker(mode='huge', det_frequency=1, device='auto', backend
     - det_frequency: Detection frequency (run detection every N frames)
     - device: 'auto', 'cuda', 'cpu', 'mps'
     - backend: 'auto', 'onnxruntime', 'openvino', 'opencv'
-    - detector: 'yolox' (rtmlib, faster), 'rtdetr' (HuggingFace), or 'rtdetrv4' (local checkpoint, best accuracy)
+    - detector: 'yolox' (rtmlib, faster), 'yolo26' (Ultralytics), 'rtdetr' (HuggingFace), or 'rtdetrv4' (local checkpoint, best accuracy)
     
     OUTPUTS:
     - SynthPosePoseTracker instance

@@ -45,6 +45,9 @@ synthpose = [
     "torchvision", 
     "transformers",
 ]
+yolo26 = [
+    "ultralytics",
+]
 ui = [
     "PySide6>=6.6",
 ]

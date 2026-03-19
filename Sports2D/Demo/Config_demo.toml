@@ -12,7 +12,7 @@
 
 
 [base]
-video_input = 'demo.mp4'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
+video_input = '0319공사장'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
@@ -35,7 +35,7 @@ video_dir = ''    # If empty, video dir is current dir
 webcam_id = 1 # your webcam id (0 is default)
 input_size = [1920, 1080] # [W, H]. Lower resolution will be faster but less precise.
 
-show_realtime_results = false
+show_realtime_results = true
 realtime_ui_backend = 'opencv' # 'opencv' or 'qt' (requires pip install sports2d[ui])
 realtime_window_title = 'UmFit realtime'
 save_vid = true
@@ -84,6 +84,7 @@ pose_model = 'synthpose'
 ## ============================================================
 ## Only used when pose_model='synthpose' or 'synthpose_base':
 ##   - 'yolox': Fast YOLOX detector from rtmlib (RECOMMENDED - fast and reliable)
+##   - 'yolo26': Ultralytics YOLO26 detector (install `sports2d[synthpose,yolo26]`)
 ##   - 'rtdetr': RT-DETR from HuggingFace transformers (good accuracy, no local setup)
 ##   - 'rtdetrv4': RT-DETRv4 local model (requires model weights download)
 ##   - 'sam3': Promptable SAM3 detector (HF bundle or raw .pt checkpoint)
@@ -94,7 +95,7 @@ pose_model = 'synthpose'
 ##       - raw .pt checkpoint -> official Meta sam3 runtime, sam3_processor_path ignored
 ##       - HF bundle/repo id  -> transformers runtime, sam3_processor_path optional
 ##
-synthpose_detector = 'yolox'
+synthpose_detector = 'yolo26'
 ## Optional SynthPose HF model size override (independent from mode):
 ##   - 'performance' -> VitPose-huge
 ##   - 'balanced' or 'lightweight' -> VitPose-base
@@ -118,7 +119,7 @@ sam3_runtime = 'transformers'
 sam3_store_masks = false
 sam3_show_realtime_masks = true
 sam3_realtime_mask_alpha = 0.5
-ball_detector_backend = 'yolox'
+ball_detector_backend = 'sam3'
 
 ## ============================================================
 ## Mode Selection (Works for both RTMLib and SynthPose)
@@ -198,25 +199,27 @@ keypoint_likelihood_threshold = 0.5 # Keypoints whose likelihood is lower will n
 person_detection_threshold = 0.3    # Object detector threshold (person/ball)
 average_likelihood_threshold = 0.3  # Person will be ignored if average likelihood of good keypoints is lower than this value
 keypoint_number_threshold = 0.3     # Person will be ignored if the number of good keypoints (above keypoint_likelihood_threshold) is less than this fraction
-max_distance = 250  # in px or None # If a person is detected further than max_distance from its position on the previous frame, it will be considered as a new one
+max_distance = 300  # in px or None # If a person is detected further than max_distance from its position on the previous frame, it will be considered as a new one
 
 # Optional sports ball overlay
 # ball_detector_backend = 'same' reuses synthpose_detector
 # ball_detector_backend = 'sam3' keeps the person detector and adds SAM3 for sports-ball detection
-detect_ball = false
-ball_trail_length = 3000     # Number of recent frames shown in the trajectory
-ball_trail_alpha = 0.35     # Transparency in [0,1]
-ball_radius = 6             # Ball center marker radius (px)
+# In hybrid SAM3 mode, raw ball IDs can still fragment, but the selected ball timeline now tries to stay continuous across short raw-ID splits.
+# pose_ball/ export keeps missing frames empty and records both the stitched selected timeline ID and the raw source track ID when they differ.
+detect_ball = true
+ball_trail_length = 10000     # Number of recent frames shown in the trajectory
+ball_trail_alpha = 0.45     # Transparency in [0,1]
+ball_radius = 8             # Ball center marker radius (px)
 ball_max_jump_px = 'none'      # Reject detections that jump too far between frames; use 'none' to disable
 ball_detection_threshold = 0.3 # Ball detector confidence threshold
 ball_nms_score_threshold = 0.3  # Lower = higher recall (can add false positives)
 ball_tracking_mode = 'sports2d' # Ball ID association method. Currently sports2d is supported
-ball_ordering_method = 'on_click' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
+ball_ordering_method = 'on_click' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'. on_click now seeds a stitched selected-ball timeline instead of forcing one raw ID forever
 ball_selection_mode = 'auto'    # 'auto' to follow active track, 'id' to force a specific track ID
 ball_selected_id = -1           # Used only when ball_selection_mode='id'. Set >=0 for fixed selection
-ball_tracking_max_distance = 10000 # Max px distance for frame-to-frame ID association. 'none' disables gating
-ball_track_max_missing_frames = 120 # Keep missing tracks for N frames before removing
-ball_show_ids = true            # Draw 'ball {id}' labels on ball boxes
+ball_tracking_max_distance = 'none' # Max px distance for frame-to-frame raw ID association. 'none' disables gating
+ball_track_max_missing_frames = 180 # Keep missing raw tracks for N frames before removing. Larger values help selected-ball stitching survive brief detector gaps
+ball_show_ids = true            # Draw raw 'ball {id}' labels on ball boxes. These can still differ from the stitched selected-ball timeline
 ball_color = [0, 0, 0]    # BGR (OpenCV), default black
 
 
@@ -243,14 +246,14 @@ calib_file = ''      # Calibration file in the Pose2Sim toml format, or '' if no
 
 [angles]
 display_angle_values_on = ['body', 'list'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
-fontSize = 0.4
+fontSize = 0.5
 
 # Select joint angles among
 # ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']
-joint_angles = ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']
+joint_angles = ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Right elbow', 'Right wrist']
 # Select segment angles among
 # ['Right foot', 'Left foot', 'Right shank', 'Left shank', 'Right thigh', 'Left thigh', 'Pelvis', 'Trunk', 'Shoulders', 'Head', 'Right arm', 'Left arm', 'Right forearm', 'Left forearm']
-segment_angles = ['Right foot', 'Left foot', 'Right shank', 'Left shank', 'Right thigh', 'Left thigh', 'Pelvis', 'Trunk', 'Shoulders', 'Head', 'Right arm', 'Left arm', 'Right forearm', 'Left forearm']
+segment_angles = ['Right foot', 'Left foot', 'Right shank', 'Left shank', 'Right thigh', 'Left thigh', 'Trunk', 'Shoulders', 'Head', 'Right arm', 'Right forearm']
 
 # Processing parameters
 flip_left_right = false  # Same angles whether the participant faces left/right. Set it to false if you want timeseries to be continuous even when the participant switches their stance.
@@ -261,7 +264,7 @@ unwrap_angles = false # true keeps np.unwrap continuity correction; false disabl
 
 [post-processing]
 interpolate = true
-interp_gap_smaller_than = 10        # Do not interpolate larger gaps
+interp_gap_smaller_than = 5        # Do not interpolate larger gaps
 fill_large_gaps_with = 'last_value' # 'last_value', 'nan', or 'zeros' 
 sections_to_keep = 'all' # 'all', 'largest', 'first', 'last'
                         # Keep 'all' valid sections even when they are interspersed with undetected chunks, or the 'largest' valid section, or the 'first' one, or the 'last' one
@@ -305,7 +308,7 @@ do_ik = false # Do scaling and inverse kinematics?
 use_augmentation = false  # true or false (lowercase) # Set to true if you want to use the model with augmented markers
 feet_on_floor = false # true or false (lowercase) # Set to false if you want to use the model with feet not on the floor (e.g. running, jumping, etc.)
 use_simple_model = false # true or false # IK 10+ times faster, but no muscles or flexible spine, no patella
-participant_mass = [55.0, 67.0] # kg # defaults to 70 if not provided. No influence on kinematics (motion), only on kinetics (forces)
+participant_mass = 95 # kg # defaults to 70 if not provided. No influence on kinematics (motion), only on kinetics (forces)
 right_left_symmetry = true # true or false (lowercase) # Set to false only if you have good reasons to think the participant is not symmetrical (e.g. prosthetic limb)
 
 # Choosing best frames to scale the model
@@ -317,6 +320,10 @@ large_hip_knee_angles = 45 # Hip and knee angles below this value are considered
 trimmed_extrema_percent = 0.5 # Proportion of the most extreme segment values to remove before calculating their mean)
 remove_individual_scaling_setup = true # true or false (lowercase) # If true, the individual scaling setup files are removed to avoid cluttering
 remove_individual_ik_setup = true # true or false (lowercase) # If true, the individual IK setup files are removed to avoid cluttering
+
+
+[motion]
+vertical_jump = true # true estimates pelvis-trunk proxy CoM, exports vertical GRF outputs, and adds CoM/GRF overlays to saved video/images
 
 
 [logging]

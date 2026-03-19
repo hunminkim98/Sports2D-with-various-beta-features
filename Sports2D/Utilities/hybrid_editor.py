@@ -918,17 +918,48 @@ def _review_pose_sequence_matplotlib(
     return person_x_raw, person_y_raw, person_scores_raw, manual_mask
 
 
-def _center_from_selected_track(frame_tracks, selected_track_id):
+def _normalize_ball_center_value(center):
+    if center is None:
+        return None
+    center_arr = np.asarray(center, dtype=float).reshape(-1)
+    if len(center_arr) < 2:
+        return None
+    if not np.isfinite(center_arr[0]) or not np.isfinite(center_arr[1]):
+        return None
+    return (int(round(float(center_arr[0]))), int(round(float(center_arr[1]))))
+
+
+def _selected_track_review_state(frame_tracks, selected_track_id, frame_center=None):
     if selected_track_id is None:
-        return None, None, False
+        return None, None, False, None
+    selected_track_id = int(selected_track_id)
+    visible_tracks = []
+    selected_track = None
     for track in frame_tracks or []:
-        if int(track.get("id", -1)) != int(selected_track_id):
-            continue
-        center = track.get("center")
-        score = track.get("score")
-        visible = bool(track.get("visible", False))
-        return center, score, visible
-    return None, None, False
+        track_id = int(track.get("id", -1))
+        track_center = _normalize_ball_center_value(track.get("center"))
+        if track_id == selected_track_id:
+            selected_track = track
+        if bool(track.get("visible", False)) and track_center is not None:
+            visible_tracks.append((track, track_center))
+
+    if selected_track is not None:
+        selected_center = _normalize_ball_center_value(selected_track.get("center"))
+        if bool(selected_track.get("visible", False)) and selected_center is not None:
+            return selected_center, selected_track.get("score"), True, selected_track_id
+
+    review_center = _normalize_ball_center_value(frame_center)
+    if review_center is not None and len(visible_tracks) > 0:
+        source_track, source_center = min(
+            visible_tracks,
+            key=lambda item: float(np.linalg.norm(np.asarray(item[1], dtype=float) - np.asarray(review_center, dtype=float))),
+        )
+        return source_center, source_track.get("score"), True, int(source_track.get("id"))
+
+    if selected_track is not None:
+        return _normalize_ball_center_value(selected_track.get("center")), selected_track.get("score"), bool(selected_track.get("visible", False)), None
+
+    return None, None, False, None
 
 
 def _recenter_box(box, center):
@@ -1071,7 +1102,11 @@ def _review_ball_sequence_matplotlib(
         frame_center = ball_centers[frame_idx]
         selected_id = selected_ball_ids[frame_idx] if frame_idx < len(selected_ball_ids) else None
         frame_tracks = ball_tracks[frame_idx] if frame_idx < len(ball_tracks) else []
-        track_center, track_score, track_visible = _center_from_selected_track(frame_tracks, selected_id)
+        track_center, track_score, track_visible, source_track_id = _selected_track_review_state(
+            frame_tracks,
+            selected_id,
+            frame_center=frame_center,
+        )
         effective_score = track_score
         issues = build_ball_issue_list(
             frame_center,
@@ -1117,6 +1152,8 @@ def _review_ball_sequence_matplotlib(
             "Scroll to zoom around the cursor.",
             f"Selected track: {selected_id}",
         ]
+        if source_track_id is not None and selected_id is not None and int(source_track_id) != int(selected_id):
+            status_lines.append(f"Visible source track: {source_track_id}")
         for issue in issues:
             if issue["status"] == "low_confidence_ball":
                 status_lines.append(
