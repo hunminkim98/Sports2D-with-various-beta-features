@@ -113,7 +113,7 @@ python -c 'import onnxruntime as ort; print(ort.get_available_providers())'
 **SynthPose (optional, requires `[synthpose]` extras):**
 - VitPose-huge/base from Stanford MIMI
 - 52 keypoints (17 COCO + 35 anatomical markers)
-- Person detectors: `yolox` (recommended), `rtdetr`, `rtdetrv4`
+- Person detectors: `yolox` (recommended), `yolo26`, `rtdetr`, `rtdetrv4`
 - Files: `Utilities/pose_backend.py`, `Utilities/synthpose_tracker.py`, `Utilities/synthpose_skeleton.py`
 - RT-DETRv4 engine (inference-only): `Sports2D/models/RT-DETRv4/engine/`
 
@@ -137,7 +137,7 @@ The configuration uses TOML files (see `Demo/Config_demo.toml` for full referenc
 - `common.py`: Angle computation dictionaries (`angle_dict`), marker Z positions, helper functions
 - `tests.py`: Test workflow covering CLI and Python API
 - `pose_backend.py`: **Backend abstraction layer** - unified interface for pose estimation
-- `synthpose_tracker.py`: SynthPose person tracking with YOLOX/RT-DETR/RT-DETRv4 detectors
+- `synthpose_tracker.py`: SynthPose person tracking with YOLOX/YOLO26/RT-DETR/RT-DETRv4 detectors
 - `synthpose_skeleton.py`: 52-keypoint skeleton definition and HALPE_26 mapping
 
 ### Pose Backend System
@@ -174,12 +174,12 @@ keypoints, scores = backend(frame)
 | `device` | Affects ONNX provider | Affects PyTorch device (cuda/mps/cpu) |
 | `backend` | ONNX provider (onnxruntime/openvino/opencv) | **Ignored** (always PyTorch) |
 | `mode` | Model quality (lightweight/balanced/performance) | VitPose selection: performance→huge, balanced→base, lightweight→base+warning |
-| `synthpose_detector` | **Ignored** | Person detector (yolox/rtdetr/rtdetrv4) |
+| `synthpose_detector` | **Ignored** | Person detector (yolox/yolo26/rtdetr/rtdetrv4) |
 
 **Ball Detection (`detect_ball=true`)**:
 - Shared option: `ball_detection_threshold` controls confidence cutoff for sports-ball candidates (default `0.1`).
 - RTMLib backend keeps person pose detection unchanged and runs a separate COCO multiclass detector for ball metadata.
-- SynthPose backend applies separate thresholds for person vs ball filtering in YOLOX/RT-DETR/RT-DETRv4 paths.
+- SynthPose backend applies separate thresholds for person vs ball filtering in YOLOX/YOLO26/RT-DETR/RT-DETRv4 paths.
 
 ## Key Implementation Details
 

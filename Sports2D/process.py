@@ -89,12 +89,13 @@ SYNTHPOSE_AVAILABLE = False
 try:
     from Sports2D.Utilities.synthpose_skeleton import (
         create_synthpose_skeleton,
+        SYNTHPOSE_MARKER_ALIASES,
         SYNTHPOSE_KEYPOINT_NAMES,
         SYNTHPOSE_SKELETON_LINKS,
     )
     SYNTHPOSE_AVAILABLE = True
 except ImportError:
-    pass
+    SYNTHPOSE_MARKER_ALIASES = {}
 
 # Unified pose backend abstraction
 from Sports2D.Utilities.pose_backend import create_pose_backend
@@ -106,6 +107,7 @@ from Sports2D.Utilities.hybrid_editor import (
     review_ball_sequence,
     review_pose_sequence,
 )
+from Sports2D.Utilities.ball_blender import write_ball_blender_helper
 from Sports2D.Utilities.sam3_detector import (
     PERSON_CLASS_ID as SAM3_PERSON_CLASS_ID,
     SPORTS_BALL_CLASS_ID as SAM3_BALL_CLASS_ID,
@@ -646,6 +648,61 @@ def append_ball_marker_to_trc_data(trc_data, ball_trc_data, marker_name='ball'):
     aligned_ball = ball_trc_data.reindex(trc_data.index).iloc[:, :3].copy()
     aligned_ball.columns = [marker_name, marker_name, marker_name]
     return pd.concat([trc_data.copy(), aligned_ball], axis=1)
+
+
+def build_public_meter_trc_data(trc_data, marker_aliases=None, ball_trc_data=None, marker_name='ball'):
+    '''
+    Build the public meter-space TRC table without trimming its original row count.
+
+    Internal consumers such as jump analysis and IK may still use a trimmed/rebased
+    subset, but the final exported `_m.trc` should preserve the same sample count
+    and time axis as the source px-space TRC whenever meter export is enabled.
+    '''
+
+    public_trc_data = append_trc_marker_aliases(
+        trc_data,
+        marker_aliases=marker_aliases,
+    )
+    if ball_trc_data is not None and len(ball_trc_data) > 0:
+        public_trc_data = append_ball_marker_to_trc_data(
+            public_trc_data,
+            ball_trc_data,
+            marker_name=marker_name,
+        )
+    return public_trc_data
+
+
+def append_trc_marker_aliases(trc_data, marker_aliases=None):
+    '''
+    Return a copy of TRC data with aliased marker triplets appended.
+
+    This is used to expose SynthPose foot markers under the HALPE/OpenPose
+    names expected by Pose2Sim marker augmentation without changing the
+    underlying runtime keypoint schema.
+    '''
+    marker_aliases = dict(marker_aliases or {})
+    if len(marker_aliases) == 0:
+        return trc_data.copy()
+
+    trc_data = pd.DataFrame(trc_data).copy()
+    marker_names = list(trc_data.columns[1::3]) if len(trc_data.columns) > 1 else []
+    existing_markers = {str(name) for name in marker_names}
+    alias_triplets = []
+
+    for source_name, alias_name in marker_aliases.items():
+        if source_name not in existing_markers or alias_name in existing_markers:
+            continue
+        source_triplet = trc_data.loc[:, trc_data.columns == source_name]
+        if source_triplet.shape[1] < 3:
+            continue
+        alias_triplet = source_triplet.iloc[:, :3].copy()
+        alias_triplet.columns = [alias_name, alias_name, alias_name]
+        alias_triplets.append(alias_triplet)
+        existing_markers.add(alias_name)
+
+    if len(alias_triplets) == 0:
+        return trc_data
+    return pd.concat([trc_data] + alias_triplets, axis=1)
 
 
 def strip_auxiliary_trc_markers(Q_coords, keypoints_names, ignored_marker_names=None):
@@ -4698,8 +4755,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             multi_id_tracking=ball_multi_id_tracking,
         )
         write_ball_pose_json(ball_export_series, pose_ball_output_dir, output_dir_name)
+        ball_blender_helper_path = write_ball_blender_helper(
+            output_dir,
+            output_dir_name,
+            marker_name='ball',
+        )
         ball_trc_px = build_ball_trc_data(ball_export_series, index=all_frames_time.index, marker_name='ball')
         logging.info(f'Ball pose JSON saved to {pose_ball_output_dir.resolve()}.')
+        logging.info(f'Blender ball helper saved to {ball_blender_helper_path.resolve()}.')
 
 
     #%% ==================================================
@@ -4810,11 +4873,16 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             trc_data_i = trc_data_from_XYZtime(all_frames_X_person_filt, all_frames_Y_person_filt, all_frames_Z_homog, all_frames_time)
             trc_data.append(trc_data_i)
             if save_pose and not load_trc_px:
-                trc_data_to_write = append_ball_marker_to_trc_data(
+                trc_data_to_write = append_trc_marker_aliases(
                     trc_data_i,
-                    ball_trc_px,
-                    marker_name='ball',
-                ) if ball_pose_export_enabled else trc_data_i
+                    marker_aliases=SYNTHPOSE_MARKER_ALIASES,
+                )
+                if ball_pose_export_enabled:
+                    trc_data_to_write = append_ball_marker_to_trc_data(
+                        trc_data_to_write,
+                        ball_trc_px,
+                        marker_name='ball',
+                    )
                 make_trc_with_trc_data(trc_data_to_write, str(pose_path_person), fps=fps)
                 logging.info(f'Pose in pixels saved to {pose_path_person.resolve()}.')
 
@@ -4989,6 +5057,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         trc_data_m_i.iloc[:first_run_start,c+2] = np.nan
                         trc_data_m_i.iloc[last_run_end:,c+2] = np.nan
                         trc_data_m_i.iloc[first_run_start:last_run_end,c+2] = trc_data_m_i.iloc[first_run_start:last_run_end,c+2].ffill().bfill()
+                    trc_data_m_public_i = trc_data_m_i.copy()
                     trc_m_first_trim = trc_data_m_i.isnull().any(axis=1).idxmin()
                     trc_m_last_trim = trc_data_m_i[::-1].isnull().any(axis=1).idxmin()
                     trc_data_m_i = trc_data_m_i.iloc[trc_m_first_trim:trc_m_last_trim+1,:]
@@ -5016,6 +5085,14 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
                     # Rebase trimmed meter exports so saved TRCs always start at frame/time 0.
                     trc_data_m_export_i = reset_trc_frame_time_origin(trc_data_m_i)
+                    trc_data_m_file_i = append_trc_marker_aliases(
+                        trc_data_m_export_i,
+                        marker_aliases=SYNTHPOSE_MARKER_ALIASES,
+                    )
+                    public_trc_data_m_file_i = build_public_meter_trc_data(
+                        trc_data_m_public_i,
+                        marker_aliases=SYNTHPOSE_MARKER_ALIASES,
+                    )
 
                     if vertical_jump_enabled:
                         mass_i = participant_masses[i] if len(participant_masses) > i else DEFAULT_MASS
@@ -5052,7 +5129,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     pose_path_person_m_i = (pose_output_path.parent / (pose_output_path_m.stem + f'_person{i:02d}.trc'))
                     if ball_pose_export_enabled:
                         ball_trc_m_i = convert_px_to_meters(
-                            ball_trc_px.reindex(trc_data_m_i.index),
+                            ball_trc_px.reindex(trc_data_m_public_i.index),
                             first_person_height,
                             height_px,
                             distance_m,
@@ -5063,14 +5140,16 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             -floor_angle_estim,
                             visible_side=visible_side_i,
                         )
-                        ball_trc_m_i = reset_trc_frame_time_origin(ball_trc_m_i)
-                        public_meter_trc_data_by_name[pose_path_person_m_i.name] = append_ball_marker_to_trc_data(
-                            trc_data_m_export_i,
-                            ball_trc_m_i,
+                        public_trc_data_m_file_i = build_public_meter_trc_data(
+                            trc_data_m_public_i,
+                            marker_aliases=SYNTHPOSE_MARKER_ALIASES,
+                            ball_trc_data=ball_trc_m_i,
                             marker_name='ball',
                         )
                     if write_meter_pose:
-                        make_trc_with_trc_data(trc_data_m_export_i, pose_path_person_m_i, fps=fps)
+                        public_meter_trc_data_by_name[pose_path_person_m_i.name] = public_trc_data_m_file_i
+                    if write_meter_pose:
+                        make_trc_with_trc_data(trc_data_m_file_i, pose_path_person_m_i, fps=fps)
                     if write_meter_pose and make_c3d:
                         c3d_path = convert_to_c3d(str(pose_path_person_m_i))
                     if write_meter_pose:
@@ -5523,4 +5602,4 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         for trc_name, trc_data_with_ball in public_meter_trc_data_by_name.items():
             public_m_path = output_dir / trc_name
             make_trc_with_trc_data(trc_data_with_ball, public_m_path, fps=fps)
-        logging.info('Pose in meters with ball marker saved to final TRC outputs.')
+        logging.info('Pose in meters saved to final TRC outputs.')

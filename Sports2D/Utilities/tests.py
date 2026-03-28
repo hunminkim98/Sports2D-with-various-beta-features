@@ -1074,6 +1074,23 @@ def test_write_ball_pose_json_writes_frame_payloads(tmp_path):
     assert payload['balls'][0]['ball_keypoints_2d'] == [20.0, 30.0, 0.91]
 
 
+def test_write_ball_blender_helper_writes_follow_marker_script(tmp_path):
+    '''
+    Verify Blender helper export writes a marker-following sphere script.
+    '''
+
+    from Sports2D.Utilities.ball_blender import write_ball_blender_helper
+
+    script_path = write_ball_blender_helper(tmp_path, 'demo_output')
+
+    assert script_path.name == 'demo_output_ball_mesh_blender.py'
+    content = script_path.read_text(encoding='utf-8')
+    assert 'demo_output_m_person00.trc' in content
+    assert 'BALL_RADIUS_M' in content
+    assert 'COPY_LOCATION' in content
+    assert 'select the ball marker object' in content.lower()
+
+
 def test_append_ball_marker_to_trc_data_adds_trailing_triplet():
     '''
     Verify TRC exports can append a trailing ball marker without mutating prior markers.
@@ -1106,6 +1123,117 @@ def test_append_ball_marker_to_trc_data_adds_trailing_triplet():
     assert np.isnan(merged.iloc[1, -3])
     assert np.isnan(merged.iloc[1, -2])
     assert np.isnan(merged.iloc[1, -1])
+
+
+def test_append_trc_marker_aliases_adds_small_toe_triplets_for_synthpose():
+    '''
+    Verify SynthPose metatarsal markers are exported under small-toe aliases.
+    '''
+
+    from Sports2D.process import append_trc_marker_aliases
+    from Sports2D.Utilities.synthpose_skeleton import SYNTHPOSE_MARKER_ALIASES
+
+    trc_data = pd.DataFrame(
+        {
+            'time': [0.0, 0.5],
+            'R5Meta': [1.0, 2.0],
+            'R5Meta.1': [3.0, 4.0],
+            'R5Meta.2': [0.0, 0.0],
+            'L5Meta': [5.0, 6.0],
+            'L5Meta.1': [7.0, 8.0],
+            'L5Meta.2': [0.0, 0.0],
+        }
+    )
+    trc_data.columns = ['time', 'R5Meta', 'R5Meta', 'R5Meta', 'L5Meta', 'L5Meta', 'L5Meta']
+
+    aliased = append_trc_marker_aliases(trc_data, marker_aliases=SYNTHPOSE_MARKER_ALIASES)
+
+    assert aliased.columns.tolist() == [
+        'time',
+        'R5Meta', 'R5Meta', 'R5Meta',
+        'L5Meta', 'L5Meta', 'L5Meta',
+        'RSmallToe', 'RSmallToe', 'RSmallToe',
+        'LSmallToe', 'LSmallToe', 'LSmallToe',
+    ]
+    assert np.allclose(aliased.iloc[:, -6:-3].to_numpy(), aliased.iloc[:, 1:4].to_numpy())
+    assert np.allclose(aliased.iloc[:, -3:].to_numpy(), aliased.iloc[:, 4:7].to_numpy())
+
+
+def test_append_trc_marker_aliases_preserves_existing_small_toe_triplets():
+    '''
+    Verify alias export does not duplicate markers that already exist.
+    '''
+
+    from Sports2D.process import append_trc_marker_aliases
+    from Sports2D.Utilities.synthpose_skeleton import SYNTHPOSE_MARKER_ALIASES
+
+    trc_data = pd.DataFrame(
+        {
+            'time': [0.0],
+            'R5Meta': [1.0],
+            'R5Meta.1': [2.0],
+            'R5Meta.2': [0.0],
+            'RSmallToe': [3.0],
+            'RSmallToe.1': [4.0],
+            'RSmallToe.2': [0.0],
+        }
+    )
+    trc_data.columns = ['time', 'R5Meta', 'R5Meta', 'R5Meta', 'RSmallToe', 'RSmallToe', 'RSmallToe']
+
+    aliased = append_trc_marker_aliases(trc_data, marker_aliases=SYNTHPOSE_MARKER_ALIASES)
+
+    assert aliased.columns.tolist() == trc_data.columns.tolist()
+    assert aliased.equals(trc_data)
+
+
+def test_build_public_meter_trc_data_preserves_full_length_and_time_axis():
+    '''
+    Verify final public meter TRCs keep the original sample count and time axis.
+    '''
+
+    from Sports2D.process import build_public_meter_trc_data
+    from Sports2D.Utilities.synthpose_skeleton import SYNTHPOSE_MARKER_ALIASES
+
+    trc_data = pd.DataFrame(
+        {
+            'time': [0.10, 0.20, 0.30],
+            'R5Meta': [1.0, 2.0, 3.0],
+            'R5Meta.1': [4.0, 5.0, 6.0],
+            'R5Meta.2': [0.0, 0.0, 0.0],
+        },
+        index=[10, 11, 12],
+    )
+    trc_data.columns = ['time', 'R5Meta', 'R5Meta', 'R5Meta']
+
+    ball_trc_data = pd.DataFrame(
+        {
+            'ball': [10.0, np.nan, 30.0],
+            'ball.1': [20.0, np.nan, 40.0],
+            'ball.2': [0.0, np.nan, 0.0],
+        },
+        index=trc_data.index,
+    )
+    ball_trc_data.columns = ['ball', 'ball', 'ball']
+
+    public_trc = build_public_meter_trc_data(
+        trc_data,
+        marker_aliases=SYNTHPOSE_MARKER_ALIASES,
+        ball_trc_data=ball_trc_data,
+        marker_name='ball',
+    )
+
+    assert public_trc.index.tolist() == trc_data.index.tolist()
+    assert public_trc.iloc[:, 0].tolist() == pytest.approx(trc_data.iloc[:, 0].tolist())
+    assert len(public_trc) == len(trc_data)
+    assert public_trc.columns.tolist() == [
+        'time',
+        'R5Meta', 'R5Meta', 'R5Meta',
+        'RSmallToe', 'RSmallToe', 'RSmallToe',
+        'ball', 'ball', 'ball',
+    ]
+    assert np.isnan(public_trc.iloc[1, -3])
+    assert np.isnan(public_trc.iloc[1, -2])
+    assert np.isnan(public_trc.iloc[1, -1])
 
 
 def test_reset_trc_frame_time_origin_rebases_trimmed_meter_exports():
@@ -1608,6 +1736,8 @@ def test_config_help_mentions_ball_pose_exports():
 
     assert 'pose_ball/' in CONFIG_HELP['save_pose'][1]
     assert 'pose_ball/' in CONFIG_HELP['detect_ball'][1]
+    assert 'Blender helper script' in CONFIG_HELP['save_pose'][1]
+    assert 'Blender helper script' in CONFIG_HELP['detect_ball'][1]
 
 
 def test_default_config_exposes_sam3_settings():

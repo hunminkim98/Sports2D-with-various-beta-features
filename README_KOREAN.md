@@ -243,6 +243,7 @@ sports2d
 2. **포인트 좌표 열기.**\
    **OpenSim data -> Markers**: `result_dir` 폴더에서 trc 파일(예: `demo_Sports2D_m_person00.trc`)을 엽니다.\
    이렇게 하면 캡처된 사람의 동작을 기반으로 **애니메이션 리그**가 선택적으로 생성됩니다.
+   `detect_ball=true` 및 `save_pose=true`이면 같은 결과 폴더에 `demo_Sports2D_ball_mesh_blender.py` 같은 Blender helper script도 함께 생성됩니다. TRC를 불러온 뒤 imported `ball` marker object를 선택하고 Blender Text Editor에서 해당 스크립트를 실행하면, marker를 따라가는 UV sphere가 생성됩니다. 공 크기를 바꾸려면 스크립트 상단의 `BALL_RADIUS_M` 값을 수정하세요.
 3. **애니메이션 스켈레톤 열기:**\
    먼저 `--do_ik True`를 설정했는지 확인하세요 ([전체 설치](#전체-설치) 필요). 자세한 내용은 [역기구학](#역기구학-실행) 섹션을 참조하세요.
    - **OpenSim data -> Model**: 스케일된 모델(예: `demo_Sports2D_m_person00_LSTM.osim`)을 엽니다.

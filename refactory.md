@@ -8,6 +8,10 @@
 
 ## 최근 동작 변경 메모
 
+- 2026-03-19: `motion.vertical_jump` 설정이 추가되었습니다.
+  - `true`이면 Sports2D가 `Hip`-`Neck` pelvis-trunk proxy CoM으로 vertical GRF를 추정합니다.
+  - 결과로 `GRF.trc`와 metrics JSON이 저장되고, 저장 비디오/이미지에는 CoM 점과 vertical GRF 화살표가 오버레이됩니다.
+  - 이 출력은 force plate 측정값이 아니라 2D kinematics-derived estimate입니다.
 - 2026-02-14: `angles.angle_output_mode` 설정이 추가되었습니다.
   - `legacy_continuous` (기본): 기존과 동일하게 unwrap 연속성을 유지합니다.
   - `bounded_principal`: 관절각(`flexion`, `dorsiflexion`) 출력을 `[-180, 180]` 범위로 정규화합니다.

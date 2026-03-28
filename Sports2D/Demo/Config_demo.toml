@@ -12,13 +12,13 @@
 
 
 [base]
-video_input = '0319공사장'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
+video_input = '메디신볼'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
 nb_persons_to_detect = 1   # int or 'all' # Limiting or not the number of persons to be analyzed
-person_ordering_method = 'highest_likelihood' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size',  'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
-first_person_height = 1.8  # Height of the reference person in meters (for pixels -> meters conversion: not used if a calibration file is provided)
+person_ordering_method = 'on_click' # 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size',  'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'
+first_person_height = 1.75  # Height of the reference person in meters (for pixels -> meters conversion: not used if a calibration file is provided)
 visible_side = ['right']  # Choose visible side among ['right', 'left', 'front', 'back', 'auto', 'none']. String or list of strings.
                   # if 'auto', will be either 'left', 'right', or 'front' depending on the direction of the motion
                   # if 'none', coordinates will be left in 2D rather than 3D
@@ -35,7 +35,7 @@ video_dir = ''    # If empty, video dir is current dir
 webcam_id = 1 # your webcam id (0 is default)
 input_size = [1920, 1080] # [W, H]. Lower resolution will be faster but less precise.
 
-show_realtime_results = true
+show_realtime_results = false
 realtime_ui_backend = 'opencv' # 'opencv' or 'qt' (requires pip install sports2d[ui])
 realtime_window_title = 'UmFit realtime'
 save_vid = true
@@ -195,7 +195,7 @@ tracking_mode = 'sports2d' # 'sports2d' or 'deepsort'. 'deepsort' is slower, har
                   # Requires `pip install torch torchvision torchreid gdown tensorboard`
 
 # Processing parameters
-keypoint_likelihood_threshold = 0.5 # Keypoints whose likelihood is lower will not be taken into account
+keypoint_likelihood_threshold = 0.3 # Keypoints whose likelihood is lower will not be taken into account
 person_detection_threshold = 0.3    # Object detector threshold (person/ball)
 average_likelihood_threshold = 0.3  # Person will be ignored if average likelihood of good keypoints is lower than this value
 keypoint_number_threshold = 0.3     # Person will be ignored if the number of good keypoints (above keypoint_likelihood_threshold) is less than this fraction
@@ -206,6 +206,7 @@ max_distance = 300  # in px or None # If a person is detected further than max_d
 # ball_detector_backend = 'sam3' keeps the person detector and adds SAM3 for sports-ball detection
 # In hybrid SAM3 mode, raw ball IDs can still fragment, but the selected ball timeline now tries to stay continuous across short raw-ID splits.
 # pose_ball/ export keeps missing frames empty and records both the stitched selected timeline ID and the raw source track ID when they differ.
+# save_pose=true also writes a Blender helper script in the result folder for wrapping the imported ball marker with a sphere mesh.
 detect_ball = true
 ball_trail_length = 10000     # Number of recent frames shown in the trajectory
 ball_trail_alpha = 0.45     # Transparency in [0,1]
@@ -226,15 +227,15 @@ ball_color = [0, 0, 0]    # BGR (OpenCV), default black
 [px_to_meters_conversion]
 # Pixel to meters conversion
 to_meters = true
-make_c3d = true
+make_c3d = false
 save_calib = true
 
 # Compensate for camera horizon 
-floor_angle = 'auto' # float, 'from_kinematics', 'from_calib', or 'auto' # 'auto' is equivalent to 'from_kinematics', ie angle calculated from foot contacts. 'from_calib' calculates it from a toml calibration file. Use float to manually specify it in degrees
+floor_angle = 0 # float, 'from_kinematics', 'from_calib', or 'auto' # 'auto' is equivalent to 'from_kinematics', ie angle calculated from foot contacts. 'from_calib' calculates it from a toml calibration file. Use float to manually specify it in degrees
 xy_origin = ['auto'] # [px_x,px_y], or ['from kinematics'], ['from_calib'], or ['auto']. # BETWEEN BRACKETS! # ['auto'] is equivalent to ['from_kinematics'], ie origin estimated at first foot contact, direction is direction of motion. ['from_calib'] calculates it from a calibration file. Use [px_x,px_y] to manually specify it in pixels (px_y points downwards)
 
 # Compensate for perspective effects, which make the further limb look smaller. 1-2% coordinate error at 10 m, less if the camera is further away
-perspective_value = 5 # Either camera-to-person distance (m), or focal length (px), or field-of-view (degrees or radians), or '' if perspective_unit=='from_calib'
+perspective_value = 8 # Either camera-to-person distance (m), or focal length (px), or field-of-view (degrees or radians), or '' if perspective_unit=='from_calib'
 perspective_unit = 'distance_m' # 'distance_m', 'f_px', 'fov_deg', 'fov_rad', or 'from_calib'
 
 # Optional distortion coefficients
@@ -246,7 +247,7 @@ calib_file = ''      # Calibration file in the Pose2Sim toml format, or '' if no
 
 [angles]
 display_angle_values_on = ['body', 'list'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
-fontSize = 0.5
+fontSize = 0.8
 
 # Select joint angles among
 # ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']
@@ -257,13 +258,13 @@ segment_angles = ['Right foot', 'Left foot', 'Right shank', 'Left shank', 'Right
 
 # Processing parameters
 flip_left_right = false  # Same angles whether the participant faces left/right. Set it to false if you want timeseries to be continuous even when the participant switches their stance.
-correct_segment_angles_with_floor_angle = true # If the camera is tilted, corrects segment angles as regards to the floor angle. Set to false if it is the floor which is actually tilted
+correct_segment_angles_with_floor_angle = false # If the camera is tilted, corrects segment angles as regards to the floor angle. Set to false if it is the floor which is actually tilted
 angle_output_mode = 'legacy_continuous' # 'legacy_continuous' keeps unwrapped continuity, 'bounded_principal' wraps joint-angle outputs to [-180,180] for mot/video overlays.
 unwrap_angles = false # true keeps np.unwrap continuity correction; false disables unwrap in angle post-processing.
 
 
 [post-processing]
-interpolate = true
+interpolate = false
 interp_gap_smaller_than = 5        # Do not interpolate larger gaps
 fill_large_gaps_with = 'last_value' # 'last_value', 'nan', or 'zeros' 
 sections_to_keep = 'all' # 'all', 'largest', 'first', 'last'
@@ -323,7 +324,7 @@ remove_individual_ik_setup = true # true or false (lowercase) # If true, the ind
 
 
 [motion]
-vertical_jump = true # true estimates pelvis-trunk proxy CoM, exports vertical GRF outputs, and adds CoM/GRF overlays to saved video/images
+vertical_jump = false # true estimates pelvis-trunk proxy CoM, exports vertical GRF outputs, and adds CoM/GRF overlays to saved video/images
 
 
 [logging]

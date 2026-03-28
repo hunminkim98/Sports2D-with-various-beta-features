@@ -86,6 +86,15 @@ SYNTHPOSE_KEYPOINT_NAMES = [
 ]
 
 
+# Marker-name aliases needed by downstream HALPE/OpenPose-style tools.
+# SynthPose emits 5th metatarsal landmarks as R5Meta/L5Meta, while
+# Pose2Sim marker augmentation expects RSmallToe/LSmallToe marker names.
+SYNTHPOSE_MARKER_ALIASES = {
+    'R5Meta': 'RSmallToe',
+    'L5Meta': 'LSmallToe',
+}
+
+
 def create_synthpose_skeleton():
     '''
     Create a skeleton tree structure for SynthPose 52 keypoints.

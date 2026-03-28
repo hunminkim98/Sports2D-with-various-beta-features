@@ -202,6 +202,7 @@ The Demo video is voluntarily challenging to demonstrate the robustness of the p
 2. **Open your point coordinates.**\
    **OpenSim data -> Markers**: Open your trc file(e.g., `demo_Sports2D_m_person00.trc`) from your `result_dir` folder.\
    This will optionally create **an animated rig** based on the motion of the captured person.
+   If `detect_ball=true` and `save_pose=true`, Sports2D also writes a Blender helper script such as `demo_Sports2D_ball_mesh_blender.py` in the same result folder. After importing the TRC, select the imported `ball` marker object and run that script from Blender's Text Editor to create a UV sphere that follows it. Adjust `BALL_RADIUS_M` at the top of the script if the ball size should change.
 3. **Open your animated skeleton:**\
    Make sure you first set `--do_ik True` ([full install](#full-install) required). See [inverse kinematics](#run-inverse-kinematics) section for more details.
    - **OpenSim data -> Model**: Open your scaled model (e.g., `demo_Sports2D_m_person00_LSTM.osim`). 
@@ -472,7 +473,7 @@ sports2d --video_input demo.mp4 other_video.mp4 --time_range 1.2 2.7 0 3.5
            --sam3_model_path facebook/sam3 `
            --sam3_runtime transformers
   ```
-  This keeps person detection on YOLOX and only adds SAM3 for the sports ball path. For the lower-risk `transformers` path, `--sam3_model_path` must be a Hugging Face repo ID or a local HF snapshot folder such as `facebook/sam3`. Raw `.pt` checkpoints cannot stay on `transformers`; they auto-switch to the official Meta `sam3` runtime and ignore `--sam3_processor_path`. With `--detect_ball true --save_pose true`, Sports2D also writes `pose_ball/` JSON files and appends a trailing `ball` marker to saved pixel/meter TRCs. Missing ball frames stay empty in export, while multi-ID ball JSON exposes both the selected timeline ID (`track_id`) and the raw visible source track (`source_track_id`) when a short raw-ID split is stitched back together.
+  This keeps person detection on YOLOX and only adds SAM3 for the sports ball path. For the lower-risk `transformers` path, `--sam3_model_path` must be a Hugging Face repo ID or a local HF snapshot folder such as `facebook/sam3`. Raw `.pt` checkpoints cannot stay on `transformers`; they auto-switch to the official Meta `sam3` runtime and ignore `--sam3_processor_path`. With `--detect_ball true --save_pose true`, Sports2D also writes `pose_ball/` JSON files, appends a trailing `ball` marker to saved pixel/meter TRCs, and adds a Blender helper script that turns the imported `ball` marker into a sphere mesh. Missing ball frames stay empty in export, while multi-ID ball JSON exposes both the selected timeline ID (`track_id`) and the raw visible source track (`source_track_id`) when a short raw-ID split is stitched back together.
   Sports2D now keeps two ball notions in hybrid multi-ID mode: raw detector/track IDs for debugging, and one selected-ball timeline for export/review. The selected timeline can stay continuous across short raw-ID splits, while `ball_show_ids=true` still shows the raw IDs on boxes.
 - Use SynthPose with Ultralytics YOLO26 detection
   ``` cmd
@@ -532,7 +533,7 @@ sports2d --help
 'segment_angles': ["s", '"Right foot" "Left foot" "Right shank" "Left shank" "Right thigh" "Left thigh" "Pelvis" "Trunk" "Shoulders" "Head" "Right arm" "Left arm" "Right forearm" "Left forearm" if not specified'],
 'save_vid': ["V", "save processed video. true if not specified"],
 'save_img': ["I", "save processed images. true if not specified"],
-'save_pose': ["P", "save pose as trc files. When detect_ball=true, also append a trailing ball marker to saved TRCs and write per-frame ball JSON files in pose_ball/. Missing ball frames stay empty in export, and multi-ID ball JSON can expose both the selected timeline ID and the raw source track ID. true if not specified"],
+'save_pose': ["P", "save pose as trc files. When detect_ball=true, also append a trailing ball marker to saved TRCs, write per-frame ball JSON files in pose_ball/, and add a Blender helper script for turning the imported ball marker into a sphere mesh. Missing ball frames stay empty in export, and multi-ID ball JSON can expose both the selected timeline ID and the raw source track ID. true if not specified"],
 'calculate_angles': ["c", "calculate joint and segment angles. true if not specified"],
 'save_angles': ["A", "save angles as mot files. true if not specified"],
 'hybrid_mode': ["", "true or false. open a post-pass manual review UI before final exports so the user can correct pose and ball outputs. false if not specified"],
