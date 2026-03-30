@@ -27,6 +27,12 @@ from typing import Tuple, List, Dict, Optional, Sequence
 import numpy as np
 import logging
 
+from Sports2D.Utilities.manual_roi import (
+    crop_frame_to_roi,
+    offset_keypoints_to_full_frame,
+    offset_xyxy_boxes_to_full_frame,
+)
+
 
 # Retry delay for tracker initialization (multi-threading conflicts)
 TRACKER_INIT_RETRY_DELAY = 3  # seconds
@@ -163,6 +169,32 @@ class PoseBackend(ABC):
         return {}
 
 
+class _StaticPersonROITracker:
+    """Crop person inference to a static ROI and restore full-frame keypoints."""
+
+    def __init__(self, pose_tracker, person_roi: Sequence[int]):
+        self._pose_tracker = pose_tracker
+        self._person_roi = tuple(int(v) for v in person_roi)
+        self._roi_released = False
+
+    def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if self._roi_released:
+            return self._pose_tracker(frame)
+
+        keypoints, scores = self._pose_tracker(crop_frame_to_roi(frame, self._person_roi))
+        keypoints = offset_keypoints_to_full_frame(keypoints, self._person_roi)
+        if np.isfinite(np.asarray(keypoints, dtype=np.float32)).any():
+            self._roi_released = True
+            if hasattr(self._pose_tracker, 'reset'):
+                self._pose_tracker.reset()
+        return keypoints, scores
+
+    def reset(self) -> None:
+        self._roi_released = False
+        if hasattr(self._pose_tracker, 'reset'):
+            self._pose_tracker.reset()
+
+
 class _RTMLibBallAwareTracker:
     """
     Wrapper tracker that preserves standard RTMLib person pose behavior and
@@ -193,6 +225,7 @@ class _RTMLibBallAwareTracker:
         ball_class_ids: Optional[Sequence[int]] = None,
         ball_detection_threshold: float = 0.1,
         ball_nms_score_threshold: float = 0.2,
+        ball_roi: Optional[Sequence[int]] = None,
     ):
         from rtmlib import YOLOX
 
@@ -201,6 +234,8 @@ class _RTMLibBallAwareTracker:
         self._det_frequency = max(1, int(det_frequency))
         self._frame_count = 0
         self._ball_class_ids = set(ball_class_ids or [SPORTS_BALL_CLASS_ID])
+        self._ball_roi = tuple(int(v) for v in ball_roi) if ball_roi is not None else None
+        self._ball_roi_released = False
         self.last_detections: Dict[str, np.ndarray] = self._empty_detections()
 
         requested_size = self.MODE_TO_COCO_SIZE.get(str(mode).lower(), 'm')
@@ -281,7 +316,8 @@ class _RTMLibBallAwareTracker:
             )
 
         try:
-            detector_outputs = self._ball_detector(frame)
+            active_ball_roi = None if getattr(self, '_ball_roi_released', False) else self._ball_roi
+            detector_outputs = self._ball_detector(crop_frame_to_roi(frame, active_ball_roi))
         except Exception as e:
             logging.debug('RTMLib ball detector failed on frame %s: %s', self._frame_count, e)
             return (
@@ -315,6 +351,9 @@ class _RTMLibBallAwareTracker:
             scores = np.empty((0,), dtype=np.float32)
         if len(scores) != len(boxes):
             scores = np.full((len(boxes),), np.nan, dtype=np.float32)
+        if not getattr(self, '_ball_roi_released', False) and self._ball_roi is not None and len(boxes) > 0:
+            boxes = offset_xyxy_boxes_to_full_frame(boxes, self._ball_roi)
+            self._ball_roi_released = True
         return boxes, classes, scores
 
     def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -343,6 +382,7 @@ class _RTMLibBallAwareTracker:
 
     def reset(self) -> None:
         self._frame_count = 0
+        self._ball_roi_released = False
         if hasattr(self._pose_tracker, 'reset'):
             self._pose_tracker.reset()
         self.last_detections = self._empty_detections()
@@ -399,6 +439,8 @@ class RTMLibBackend(PoseBackend):
 
         det_frequency = pose_config.get('det_frequency', 4)
         detect_ball = bool(pose_config.get('detect_ball', False))
+        manual_person_roi = pose_config.get('_manual_person_roi')
+        manual_ball_roi = pose_config.get('_manual_ball_roi') or manual_person_roi
         ball_class_ids = pose_config.get('ball_class_ids', [SPORTS_BALL_CLASS_ID])
         ball_detection_threshold = pose_config.get(
             'ball_detection_threshold',
@@ -442,6 +484,11 @@ class RTMLibBackend(PoseBackend):
         if detect_ball:
             try:
                 default_tracker = _init_default_tracker()
+                if manual_person_roi is not None:
+                    default_tracker = _StaticPersonROITracker(
+                        pose_tracker=default_tracker,
+                        person_roi=manual_person_roi,
+                    )
                 self._tracker = _RTMLibBallAwareTracker(
                     pose_tracker=default_tracker,
                     mode=self._mode,
@@ -452,6 +499,7 @@ class RTMLibBackend(PoseBackend):
                     ball_class_ids=ball_class_ids,
                     ball_detection_threshold=ball_detection_threshold,
                     ball_nms_score_threshold=ball_nms_score_threshold,
+                    ball_roi=manual_ball_roi,
                 )
                 self._supports_ball_detection = True
             except Exception as e:
@@ -459,9 +507,21 @@ class RTMLibBackend(PoseBackend):
                     f'Ball detection requested but ball-aware tracker init failed: {e}. '
                     'Falling back to standard RTMLib tracker.'
                 )
-                self._tracker = _init_default_tracker()
+                default_tracker = _init_default_tracker()
+                if manual_person_roi is not None:
+                    default_tracker = _StaticPersonROITracker(
+                        pose_tracker=default_tracker,
+                        person_roi=manual_person_roi,
+                    )
+                self._tracker = default_tracker
         else:
-            self._tracker = _init_default_tracker()
+            default_tracker = _init_default_tracker()
+            if manual_person_roi is not None:
+                default_tracker = _StaticPersonROITracker(
+                    pose_tracker=default_tracker,
+                    person_roi=manual_person_roi,
+                )
+            self._tracker = default_tracker
 
         logging.info(f'RTMLibBackend initialized: model={pose_model_name}, mode={self._mode}, '
                      f'backend={self._backend}, device={self._device}, keypoints={self._num_keypoints}, '
@@ -663,9 +723,9 @@ class SynthPoseBackend(PoseBackend):
             pose_config.get('keypoint_likelihood_threshold', 0.3),
         )
         ball_detection_threshold = pose_config.get('ball_detection_threshold', 0.1)
-        export_sam3_ball_masks = bool(
-            (config_dict.get('base', {}).get('save_vid', False) or config_dict.get('base', {}).get('save_img', False))
-            and pose_config.get('detect_ball', False)
+        show_realtime_sam3_masks = bool(
+            config_dict.get('base', {}).get('show_realtime_results', False)
+            and pose_config.get('sam3_show_realtime_masks', False)
         )
 
         # Initialize tracker
@@ -674,6 +734,7 @@ class SynthPoseBackend(PoseBackend):
             device=device,
             det_frequency=pose_config.get('det_frequency', 4),
             person_threshold=detector_threshold,
+            backend=pose_config.get('backend', 'auto'),
             detector=pose_config.get('synthpose_detector', 'yolox'),
             detect_ball=bool(pose_config.get('detect_ball', False)),
             ball_class_ids=pose_config.get('ball_class_ids', [SPORTS_BALL_CLASS_ID]),
@@ -686,9 +747,11 @@ class SynthPoseBackend(PoseBackend):
             sam3_processor_path=pose_config.get('sam3_processor_path', ''),
             sam3_runtime=pose_config.get('sam3_runtime', 'transformers'),
             sam3_store_masks=bool(pose_config.get('sam3_store_masks', False)),
-            sam3_show_realtime_masks=bool(pose_config.get('sam3_show_realtime_masks', False)),
-            sam3_save_ball_masks=export_sam3_ball_masks,
+            sam3_show_realtime_masks=show_realtime_sam3_masks,
+            sam3_save_ball_masks=False,
             ball_detector_backend=pose_config.get('ball_detector_backend', 'same'),
+            manual_person_roi=pose_config.get('_manual_person_roi'),
+            manual_ball_roi=pose_config.get('_manual_ball_roi'),
         )
 
         # Store skeleton tree and keypoint names

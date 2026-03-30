@@ -267,7 +267,7 @@ sports2d --nb_persons_to_detect 2 --person_ordering_method highest_likelihood
 
 We recommend using the `on_click` method if you can afford a manual input. This lets the user handle both the person number and their order in the same stage. When prompted, select the persons you are interested in in the desired order. In our case, lets slide to a frame where both people are visible, and select the woman first, then the man.
 
-Otherwise, if you want to run Sports2D automatically for example, you can choose other ordering methods such as 'highest_likelihood', 'largest_size', 'smallest_size',  'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'.
+Otherwise, if you want to run Sports2D automatically for example, you can choose other ordering methods such as 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', 'last_detected', or 'medicine_ball'. The `medicine_ball` mode keeps only people present in at least 95% of frames and ranks them by distance to the selected ball during the first 10 frames.
 
 ``` cmd
 sports2d --person_ordering_method on_click
@@ -469,11 +469,12 @@ sports2d --video_input demo.mp4 other_video.mp4 --time_range 1.2 2.7 0 3.5
            --synthpose_detector yolox `
            --ball_detector_backend sam3 `
            --detect_ball true `
+           --manual_roi true `
            --sam3_target ball `
            --sam3_model_path facebook/sam3 `
            --sam3_runtime transformers
   ```
-  This keeps person detection on YOLOX and only adds SAM3 for the sports ball path. For the lower-risk `transformers` path, `--sam3_model_path` must be a Hugging Face repo ID or a local HF snapshot folder such as `facebook/sam3`. Raw `.pt` checkpoints cannot stay on `transformers`; they auto-switch to the official Meta `sam3` runtime and ignore `--sam3_processor_path`. With `--detect_ball true --save_pose true`, Sports2D also writes `pose_ball/` JSON files, appends a trailing `ball` marker to saved pixel/meter TRCs, and adds a Blender helper script that turns the imported `ball` marker into a sphere mesh. Missing ball frames stay empty in export, while multi-ID ball JSON exposes both the selected timeline ID (`track_id`) and the raw visible source track (`source_track_id`) when a short raw-ID split is stitched back together.
+  `manual_roi=true` asks you to draw a static person ROI before inference starts; when `detect_ball=true`, Sports2D also asks for a ball ROI. Person detection, pose estimation, and ball detection then run inside those regions instead of scanning the full frame first. With `ball_detector_backend='sam3'`, the person ROI and ball ROI stay separate. With shared detectors, Sports2D falls back to the union of the selected regions so both people and ball can still be found. For the lower-risk `transformers` path, `--sam3_model_path` must be a Hugging Face repo ID or a local HF snapshot folder such as `facebook/sam3`. Raw `.pt` checkpoints cannot stay on `transformers`; they auto-switch to the official Meta `sam3` runtime and ignore `--sam3_processor_path`. With `--detect_ball true --save_pose true`, Sports2D also writes `pose_ball/` JSON files, appends a trailing `ball` marker to saved pixel/meter TRCs, and adds a Blender helper script that turns the imported `ball` marker into a sphere mesh. SAM3 mask fills are available in the live preview when enabled, but saved videos/images keep the lighter ball overlays without replaying the mask pixels. Missing ball frames stay empty in export, while multi-ID ball JSON exposes both the selected timeline ID (`track_id`) and the raw visible source track (`source_track_id`) when a short raw-ID split is stitched back together.
   Sports2D now keeps two ball notions in hybrid multi-ID mode: raw detector/track IDs for debugging, and one selected-ball timeline for export/review. The selected timeline can stay continuous across short raw-ID splits, while `ball_show_ids=true` still shows the raw IDs on boxes.
 - Use SynthPose with Ultralytics YOLO26 detection
   ``` cmd
@@ -510,7 +511,7 @@ sports2d --help
 'video_input': ["i", "webcam, or video_path.mp4, or video1_path.avi video2_path.mp4 ... Beware that images won't be saved if paths contain non ASCII characters"],
 'time_range': ["t", "start_time end_time. In seconds. Whole video if not specified. start_time1 end_time1 start_time2 end_time2 ... if multiple videos with different time ranges"],
 'nb_persons_to_detect': ["n", "number of persons to detect. int or 'all'. 'all' if not specified"],
-'person_ordering_method': ["", "'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'. 'on_click' if not specified"],
+'person_ordering_method': ["", "'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', 'last_detected', or 'medicine_ball'. 'medicine_ball' keeps only the people present in at least 95% of frames and ranks them by distance to the selected ball during the first 10 frames. 'on_click' if not specified"],
 'first_person_height': ["H", "height of the reference person in meters. 1.65 if not specified. Not used if a calibration file is provided"],
 'visible_side': ["", "front, back, left, right, auto, or none. 'auto front none' if not specified. If 'auto', will be either left or right depending on the direction of the motion. If 'none', no IK for this person"],
 'participant_mass': ["", "mass of the participant in kg or none. Defaults to 70 if not provided. No influence on kinematics (motion), only on kinetics (forces)"],
@@ -540,6 +541,8 @@ sports2d --help
 'hybrid_review_pose': ["", "true or false. when hybrid_mode=true, open the pose correction UI for selected persons. true if not specified"],
 'hybrid_review_ball': ["", "true or false. when hybrid_mode=true and detect_ball=true, open the ball correction UI for the selected ball timeline. true if not specified"],
 'hybrid_ui_backend': ["", "hybrid review UI backend: 'matplotlib', 'qt', or 'auto'. matplotlib if not specified; qt falls back to matplotlib if PySide6 is unavailable"],
+'manual_roi': ["", "true or false. draw a static person ROI before inference starts; when detect_ball=true, draw a ball ROI too. Sports2D then runs detection and tracking inside the selected region(s) instead of scanning the full frame first. false if not specified"],
+'manual_roi_padding_px': ["", "extra padding applied to the selected ROI in pixels before crop and tracking. Use a small value such as 16 to keep the subject inside the box. 16 if not specified"],
 'slowmo_factor': ["", "slow-motion factor. For a video recorded at 240 fps and exported to 30 fps, it would be 240/30 = 8. 1 if not specified"],
 'pose_model': ["p", "body_with_feet, whole_body_wrist, whole_body, or body. body_with_feet if not specified"],
 'mode': ["m", 'light, balanced, performance, or a """{dictionary within triple quote}""". balanced if not specified. Use a dictionary to specify your own detection and/or pose estimation models (more about in the documentation).'],
@@ -563,6 +566,8 @@ sports2d --help
                     More information there: https://github.com/levan92/deep_sort_realtime/blob/master/deep_sort_realtime/deepsort_tracker.py#L51'],
 'input_size': ["", "width, height. 1280, 720 if not specified. Lower resolution will be faster but less precise"],
 'keypoint_likelihood_threshold': ["", "detected keypoints are not retained if likelihood is below this threshold. 0.3 if not specified"],
+'draw_keypoint_likelihood_threshold': ["", "display-only threshold for keypoint markers after pose filtering. Higher values hide uncertain markers without changing saved pose/angle data. Falls back to keypoint_likelihood_threshold if not specified"],
+'draw_skeleton_likelihood_threshold': ["", "display-only threshold for skeleton lines after pose filtering. A line is drawn only when both endpoint keypoints meet this threshold. Falls back to draw_keypoint_likelihood_threshold if not specified"],
 'average_likelihood_threshold': ["", "detected persons are not retained if average keypoint likelihood is below this threshold. 0.5 if not specified"],
 'keypoint_number_threshold': ["", "detected persons are not retained if number of detected keypoints is below this threshold. 0.3 if not specified, i.e., i.e., 30 percent"],
 'max_distance': ["", "If a person is detected further than max_distance from its position on the previous frame, it will be considered as a new one. in px or None, 100 by default."],
@@ -625,6 +630,7 @@ Note that any detection and pose models can be used (first [deploy them with MMP
           'pose_input_size':[192,256]}"""
   ```
 - Use `--det_frequency 50`: Rtmlib is (by default) a top-down method: detects bounding boxes for every person in the frame, and then detects keypoints inside of each box. The person detection stage is much slower. You can choose to detect persons only every 50 frames (for example), and track bounding boxes inbetween, which is much faster. If `detect_ball=true`, sparse cadence is safest with `ball_detector_backend sam3`; shared-detector ball metadata still follows the person-detection cadence.
+- Use `--manual_roi true`: draw a person ROI before inference starts, and a ball ROI as well when `detect_ball=true`. This reduces the search area before the detector runs. If `ball_detector_backend='sam3'`, the ball can be tracked inside its own ROI; if the detector is shared, Sports2D uses the union of the selected ROIs so both person and ball remain visible to inference.
 - Use `--load_trc_px <path_to_file_px.trc>`: Will use pose estimation results from a file. Useful if you want to use different parameters for pixel to meter conversion or angle calculation without running detection and pose estimation all over.
 - Make sure you use `--tracking_mode sports2d`: Will use the default Sports2D tracker. Unlike DeepSort, it is faster, does not require any parametrization, and is as good in non-crowded scenes. 
 
@@ -697,7 +703,7 @@ Sports2D:
 
 3. **Tracks people** so that their IDs are consistent across frames. A person is associated to another in the next frame when they are at a small distance. IDs remain consistent even if the person disappears from a few frames, thanks to the 'sports2D' tracker. [See Release notes of v0.8.22 for more information](https://github.com/davidpagnon/Sports2D/releases/tag/v0.8.22). 
 
-4. **Chooses which persons to analyze.** In single-person mode, only keeps the person with the highest average scores over the sequence. In multi-person mode, you can choose the number of persons to analyze (`nb_persons_to_detect`), and how to order them (`person_ordering_method`). The ordering method can be 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', or 'last_detected'. `on_click` is default and lets the user click on the persons they are interested in, in the desired order.
+4. **Chooses which persons to analyze.** In single-person mode, only keeps the person with the highest average scores over the sequence. In multi-person mode, you can choose the number of persons to analyze (`nb_persons_to_detect`), and how to order them (`person_ordering_method`). The ordering method can be 'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', 'greatest_displacement', 'least_displacement', 'first_detected', 'last_detected', or 'medicine_ball'. `medicine_ball` keeps only the people present in at least 95% of frames and ranks them by distance to the selected ball during the first 10 frames. `on_click` is default and lets the user click on the persons they are interested in, in the desired order.
 
 4. **Converts the pixel coordinates to meters.** The user can provide the size of a specified person to scale results accordingly. The camera horizon angle and the floor level can either be detected automatically from the gait sequence, be manually specified, or obtained frmm a calibration file. The depth perspective effects are compensated thanks with the distance from the camera to the subject, the focal length, the field of view, or from a calibration file. [See Release notes of v0.8.25 for more information](https://github.com/davidpagnon/Sports2D/releases/tag/v0.8.25). 
 

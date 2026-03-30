@@ -25,6 +25,17 @@ import numpy as np
 import logging
 from PIL import Image
 
+from Sports2D.Utilities.manual_roi import (
+    boxes_center_inside_roi,
+    crop_frame_to_roi,
+    expand_roi_with_context,
+    normalize_roi_xyxy,
+    offset_detection_meta_to_full_frame,
+    offset_keypoints_to_full_frame,
+    offset_xyxy_boxes_to_full_frame,
+    translate_roi_to_local,
+    union_rois,
+)
 from Sports2D.Utilities.sam3_detector import (
     BALL_ONLY_SAM3_PROMPTS,
     Sam3Detector,
@@ -153,7 +164,9 @@ class SynthPosePoseTracker:
                  sam3_store_masks=False,
                  sam3_show_realtime_masks=False,
                  sam3_save_ball_masks=False,
-                 ball_detector_backend='same'):
+                 ball_detector_backend='same',
+                 manual_person_roi=None,
+                 manual_ball_roi=None):
         '''
         Initialize SynthPose tracker.
 
@@ -208,6 +221,10 @@ class SynthPosePoseTracker:
             ball_detector_backend,
             detector=detector,
         )
+        self.manual_person_roi = self._normalize_runtime_roi(manual_person_roi)
+        self.manual_ball_roi = self._normalize_runtime_roi(manual_ball_roi)
+        self._manual_person_roi_released = False
+        self._manual_ball_roi_released = False
         self.sam3_collect_masks = bool(
             self.sam3_store_masks or self.sam3_show_realtime_masks or self.sam3_save_ball_masks
         )
@@ -228,6 +245,7 @@ class SynthPosePoseTracker:
         self.frame_count = 0
         self.prev_boxes = None
         self._warned_ball_detection_cadence = False
+        self._warned_shared_union_roi = False
         
         # Set device for VitPose (PyTorch)
         if device == 'auto':
@@ -319,6 +337,115 @@ class SynthPosePoseTracker:
             default_size,
         )
         return default_size
+
+    @staticmethod
+    def _normalize_runtime_roi(roi):
+        """Normalize a runtime ROI payload to an xyxy integer tuple."""
+        if roi is None:
+            return None
+        arr = np.asarray(roi, dtype=np.float32).reshape(-1)
+        if arr.size != 4 or not np.all(np.isfinite(arr)):
+            return None
+        return tuple(int(round(v)) for v in arr.tolist())
+
+    @staticmethod
+    def _coco_to_xyxy_boxes(boxes_coco):
+        """Convert COCO xywh boxes to xyxy boxes."""
+        boxes_coco = np.asarray(boxes_coco, dtype=np.float32).reshape(-1, 4)
+        if len(boxes_coco) == 0:
+            return np.empty((0, 4), dtype=np.float32)
+        boxes_xyxy = np.zeros((len(boxes_coco), 4), dtype=np.float32)
+        boxes_xyxy[:, 0] = boxes_coco[:, 0]
+        boxes_xyxy[:, 1] = boxes_coco[:, 1]
+        boxes_xyxy[:, 2] = boxes_coco[:, 0] + boxes_coco[:, 2]
+        boxes_xyxy[:, 3] = boxes_coco[:, 1] + boxes_coco[:, 3]
+        return boxes_xyxy
+
+    def _resolve_manual_rois(self, frame_shape):
+        """Resolve configured static ROIs against the current frame shape."""
+        if (
+            not self._uses_secondary_sam3_ball_detector()
+            and (
+                getattr(self, '_manual_person_roi_released', False)
+                or getattr(self, '_manual_ball_roi_released', False)
+            )
+        ):
+            return None, None
+
+        person_roi = None
+        if not getattr(self, '_manual_person_roi_released', False):
+            person_roi = normalize_roi_xyxy(getattr(self, 'manual_person_roi', None), frame_shape)
+
+        ball_roi = None
+        if not getattr(self, '_manual_ball_roi_released', False):
+            ball_roi = normalize_roi_xyxy(getattr(self, 'manual_ball_roi', None), frame_shape)
+
+        if self.detect_ball and ball_roi is None and not getattr(self, '_manual_ball_roi_released', False):
+            ball_roi = person_roi
+        return person_roi, ball_roi
+
+    def _offset_coco_boxes_to_full_frame(self, boxes_coco, roi):
+        """Translate COCO xywh boxes from ROI-local to full-frame coordinates."""
+        boxes_xyxy = self._coco_to_xyxy_boxes(boxes_coco)
+        return self._xyxy_to_coco_boxes(offset_xyxy_boxes_to_full_frame(boxes_xyxy, roi))
+
+    def _filter_primary_detections_to_rois(self, person_boxes, person_roi=None, ball_roi=None):
+        """Restrict primary detector outputs to the manually selected ROI subsets."""
+        meta = dict(self.last_detections or self._empty_detections())
+
+        if person_roi is not None:
+            person_boxes_xyxy = self._coco_to_xyxy_boxes(person_boxes)
+            person_mask = boxes_center_inside_roi(person_boxes_xyxy, person_roi)
+            person_boxes_xyxy = person_boxes_xyxy[person_mask]
+            person_boxes = self._xyxy_to_coco_boxes(person_boxes_xyxy)
+            meta['person_boxes'] = person_boxes_xyxy
+
+        if ball_roi is not None:
+            ball_boxes = self._ensure_xyxy_boxes(meta.get('ball_boxes'))
+            ball_mask = boxes_center_inside_roi(ball_boxes, ball_roi)
+            meta['ball_boxes'] = ball_boxes[ball_mask]
+            ball_scores = self._tensor_like_to_numpy(meta.get('ball_scores'), dtype=np.float32).reshape(-1)
+            if len(ball_scores) == len(ball_boxes):
+                meta['ball_scores'] = ball_scores[ball_mask]
+            else:
+                meta['ball_scores'] = np.full((np.count_nonzero(ball_mask),), np.nan, dtype=np.float32)
+
+        self.last_detections = meta
+        return person_boxes
+
+    def _filter_ball_detection_meta_to_roi(self, ball_meta, ball_roi=None):
+        """Restrict secondary ball detections to the user-selected ball ROI."""
+        if ball_roi is None:
+            return ball_meta or self._empty_detections()
+
+        meta = dict(ball_meta or self._empty_detections())
+        boxes = self._ensure_xyxy_boxes(meta.get('boxes'))
+        if len(boxes) == 0:
+            return meta
+
+        keep_mask = boxes_center_inside_roi(boxes, ball_roi)
+        meta['boxes'] = boxes[keep_mask]
+
+        classes = self._tensor_like_to_numpy(meta.get('classes'), dtype=np.int32).reshape(-1)
+        if len(classes) == len(boxes):
+            meta['classes'] = classes[keep_mask]
+        scores = self._tensor_like_to_numpy(meta.get('scores'), dtype=np.float32).reshape(-1)
+        if len(scores) == len(boxes):
+            meta['scores'] = scores[keep_mask]
+        class_names = np.asarray(meta.get('class_names', np.empty((0,), dtype=object)), dtype=object).reshape(-1)
+        if len(class_names) == len(boxes):
+            meta['class_names'] = class_names[keep_mask]
+        prompt_indices = self._tensor_like_to_numpy(meta.get('prompt_indices'), dtype=np.int32).reshape(-1)
+        if len(prompt_indices) == len(boxes):
+            meta['prompt_indices'] = prompt_indices[keep_mask]
+
+        ball_boxes = self._ensure_xyxy_boxes(meta.get('ball_boxes'))
+        ball_keep_mask = boxes_center_inside_roi(ball_boxes, ball_roi)
+        meta['ball_boxes'] = ball_boxes[ball_keep_mask]
+        ball_scores = self._tensor_like_to_numpy(meta.get('ball_scores'), dtype=np.float32).reshape(-1)
+        if len(ball_scores) == len(ball_boxes):
+            meta['ball_scores'] = ball_scores[ball_keep_mask]
+        return meta
 
     @staticmethod
     def _tensor_like_to_numpy(value, dtype=None):
@@ -435,7 +562,9 @@ class SynthPosePoseTracker:
             prompt_indices = np.empty((0,), dtype=np.int32)
 
         if metadata_score_threshold is not None and len(scores) == len(boxes):
-            meta_mask = scores >= float(metadata_score_threshold)
+            meta_mask = np.ones((len(scores),), dtype=bool)
+            finite_score_mask = np.isfinite(scores)
+            meta_mask[finite_score_mask] = scores[finite_score_mask] >= float(metadata_score_threshold)
             boxes = boxes[meta_mask]
             classes = classes[meta_mask]
             scores = scores[meta_mask]
@@ -449,11 +578,14 @@ class SynthPosePoseTracker:
 
         person_mask = classes == PERSON_CLASS_ID
         if person_score_threshold is not None and len(scores) == len(boxes):
-            person_mask = person_mask & (scores >= float(person_score_threshold))
+            finite_score_mask = np.isfinite(scores)
+            person_mask = person_mask & (
+                ~finite_score_mask | (scores >= float(person_score_threshold))
+            )
         person_boxes_xyxy = boxes[person_mask]
         if len(person_boxes_xyxy) == 0 and len(boxes) > 0:
             unique_classes = np.unique(classes)
-            if len(unique_classes) == 1:
+            if len(unique_classes) == 1 and int(unique_classes[0]) == PERSON_CLASS_ID:
                 if person_score_threshold is None or np.any(scores >= float(person_score_threshold)):
                     fallback_mask = np.ones((len(boxes),), dtype=bool)
                     if person_score_threshold is not None:
@@ -463,7 +595,10 @@ class SynthPosePoseTracker:
         if self._primary_detector_handles_ball():
             ball_mask = np.isin(classes, self.ball_class_ids)
             if len(scores) == len(boxes):
-                ball_mask = ball_mask & (scores >= self.ball_detection_threshold)
+                finite_score_mask = np.isfinite(scores)
+                ball_mask = ball_mask & (
+                    ~finite_score_mask | (scores >= self.ball_detection_threshold)
+                )
             ball_boxes_xyxy = boxes[ball_mask]
             ball_scores_xyxy = scores[ball_mask]
         else:
@@ -848,41 +983,105 @@ class SynthPosePoseTracker:
         - scores: np.array shape (N_persons, 52)
         '''
         import cv2
-        
+
         self.frame_count += 1
-        height, width = frame.shape[:2]
         self.last_detections = self._empty_detections()
-        
+        person_roi, ball_roi = self._resolve_manual_rois(frame.shape)
+        primary_roi = person_roi
+        primary_frame = frame
+        person_filter_roi = None
+        ball_filter_roi = None
+
+        if person_roi is not None:
+            if self.detect_ball and not self._uses_secondary_sam3_ball_detector():
+                primary_roi = union_rois(person_roi, ball_roi) or person_roi
+                if (
+                    ball_roi is not None
+                    and primary_roi != person_roi
+                    and not self._warned_shared_union_roi
+                ):
+                    logging.info(
+                        "manual_roi=true with a shared detector uses the union of person_roi and ball_roi."
+                    )
+                    self._warned_shared_union_roi = True
+            primary_frame = crop_frame_to_roi(frame, primary_roi)
+            person_filter_roi = translate_roi_to_local(person_roi, primary_roi)
+            ball_filter_roi = (
+                translate_roi_to_local(ball_roi, primary_roi)
+                if ball_roi is not None else None
+            )
+
         # Stage 1: Person Detection using YOLOX or RT-DETR
         # Fix: det_frequency=1 means run every frame, det_frequency=2 means every 2nd frame, etc.
         run_detection = (self.frame_count % self.det_frequency == 0) or (self.prev_boxes is None)
-        
+
         if run_detection:
-            person_boxes = self._detect_persons(frame, height, width)
-            if self._uses_secondary_sam3_ball_detector():
-                self._merge_secondary_ball_detections(self._detect_balls_sam3(frame))
+            person_boxes = self._detect_persons(primary_frame)
+            if primary_roi is not None and not self._uses_secondary_sam3_ball_detector():
+                person_boxes = self._filter_primary_detections_to_rois(
+                    person_boxes,
+                    person_roi=person_filter_roi,
+                    ball_roi=ball_filter_roi,
+                )
+            primary_meta = self.last_detections
             self.prev_boxes = person_boxes if len(person_boxes) > 0 else None
+            if primary_roi is not None and len(person_boxes) > 0:
+                self._manual_person_roi_released = True
+                self.prev_boxes = self._offset_coco_boxes_to_full_frame(person_boxes, primary_roi)
+                if not self._uses_secondary_sam3_ball_detector():
+                    self._manual_ball_roi_released = True
+            elif (
+                primary_roi is not None
+                and not self._uses_secondary_sam3_ball_detector()
+                and len(self._ensure_xyxy_boxes(primary_meta.get('ball_boxes'))) > 0
+            ):
+                self._manual_person_roi_released = True
+                self._manual_ball_roi_released = True
         else:
             person_boxes = self.prev_boxes if self.prev_boxes is not None else np.array([])
             self.last_detections = self._empty_detections()
-            if self._uses_secondary_sam3_ball_detector():
-                self._merge_secondary_ball_detections(self._detect_balls_sam3(frame))
+            primary_meta = self.last_detections
+
+        if primary_roi is not None:
+            self.last_detections = offset_detection_meta_to_full_frame(primary_meta, primary_roi)
+        else:
+            self.last_detections = dict(primary_meta or self._empty_detections())
+
+        if self._uses_secondary_sam3_ball_detector():
+            ball_inference_roi = ball_roi
+            if ball_roi is not None:
+                ball_inference_roi = expand_roi_with_context(
+                    ball_roi,
+                    frame.shape,
+                    scale=2.5,
+                    min_size=128,
+                )
+            ball_frame = crop_frame_to_roi(frame, ball_inference_roi)
+            ball_meta = self._detect_balls_sam3(ball_frame)
+            if ball_inference_roi is not None:
+                ball_meta = offset_detection_meta_to_full_frame(ball_meta, ball_inference_roi)
+            ball_meta = self._filter_ball_detection_meta_to_roi(ball_meta, ball_roi=ball_roi)
+            if ball_roi is not None and len(self._ensure_xyxy_boxes(ball_meta.get('ball_boxes'))) > 0:
+                self._manual_ball_roi_released = True
+            self._merge_secondary_ball_detections(ball_meta)
 
         # No persons detected
         if len(person_boxes) == 0:
             return np.array([]).reshape(0, 52, 2), np.array([]).reshape(0, 52)
-        
+
         # Stage 2: Pose Estimation using VitPose
         # Convert BGR to RGB PIL Image for VitPose
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_rgb = cv2.cvtColor(primary_frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(frame_rgb)
-        
+
         keypoints, scores = self._estimate_poses(pil_image, person_boxes)
-        
+
         # Handle empty pose results
         if keypoints.size == 0:
             return np.array([]).reshape(0, 52, 2), np.array([]).reshape(0, 52)
-        
+
+        if primary_roi is not None:
+            keypoints = offset_keypoints_to_full_frame(keypoints, primary_roi)
         return keypoints, scores
     
     def _detect_persons(self, frame, height=None, width=None):

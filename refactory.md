@@ -8,6 +8,19 @@
 
 ## 최근 동작 변경 메모
 
+- 2026-03-29: `base.person_ordering_method='medicine_ball'` 설정이 추가되었습니다.
+  - `detect_ball=true`일 때 메디신볼 thrower를 자동 선택하기 위한 post-pass ordering mode입니다.
+  - 첫 10프레임에서 selected ball에 가장 가까운 사람을 우선 후보로 보되, 전체 시퀀스에서 95% 이상 존재한 사람만 남깁니다.
+  - `ball_ordering_method='on_click'` 또는 opening window에 usable selected ball이 없으면 `highest_likelihood`로 fallback 합니다.
+- 2026-03-29: `pose.manual_roi`, `pose.manual_roi_padding_px` 설정이 추가되었습니다.
+  - `manual_roi=true`이면 inference 전에 static person ROI를 먼저 선택합니다.
+  - `detect_ball=true`일 때는 ball ROI도 따로 선택하며, `ball_detector_backend='sam3'`이면 person ROI와 ball ROI를 분리해서 씁니다.
+  - shared-detector 경로는 person/ball 둘 다 놓치지 않도록 선택된 ROI의 union으로 fallback 합니다.
+- 2026-03-29: `pose.draw_keypoint_likelihood_threshold`, `pose.draw_skeleton_likelihood_threshold` 설정이 추가되었습니다.
+  - 둘 다 표시 전용 threshold이며, pose filtering/export/angle 계산 기준인 `keypoint_likelihood_threshold`와는 별개입니다.
+  - `draw_keypoint_likelihood_threshold`는 키포인트 마커 표시 여부만 제어합니다.
+  - `draw_skeleton_likelihood_threshold`는 선 양 끝점이 모두 기준 이상일 때만 skeleton line을 그립니다.
+  - 기본 fallback은 각각 `keypoint_likelihood_threshold`, `draw_keypoint_likelihood_threshold`입니다.
 - 2026-03-19: `motion.vertical_jump` 설정이 추가되었습니다.
   - `true`이면 Sports2D가 `Hip`-`Neck` pelvis-trunk proxy CoM으로 vertical GRF를 추정합니다.
   - 결과로 `GRF.trc`와 metrics JSON이 저장되고, 저장 비디오/이미지에는 CoM 점과 vertical GRF 화살표가 오버레이됩니다.

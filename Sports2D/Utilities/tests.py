@@ -16,12 +16,21 @@
 from importlib.metadata import version
 import json
 import os
+import sys
 import toml
 import subprocess
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+
+
+try:
+    import tkinter  # noqa: F401
+except ModuleNotFoundError:
+    test_stub_path = Path(__file__).resolve().parents[2] / '.omx' / 'test_stubs'
+    if test_stub_path.exists():
+        sys.path.insert(0, str(test_stub_path))
 
 
 ## AUTHORSHIP INFORMATION
@@ -211,9 +220,9 @@ def test_track_balls_sports2d_keeps_ids_when_detection_order_swaps():
     assert next_id == 2
 
 
-def test_track_balls_sports2d_reuses_id_after_short_missing_gap():
+def test_track_balls_sports2d_splits_raw_id_after_short_missing_gap():
     '''
-    Verify a temporarily missing ball keeps the same ID within missing-frame budget.
+    Verify a temporarily missing ball resumes as a new raw ID after the gap.
     '''
 
     from Sports2D.process import track_balls_sports2d
@@ -250,14 +259,19 @@ def test_track_balls_sports2d_reuses_id_after_short_missing_gap():
         max_dist=50.0,
         max_missing_frames=2,
     )
+    assert len(tracks_f3) == 2
     assert tracks_f3[0]['id'] == 0
-    assert tracks_f3[0]['visible'] is True
-    assert next_id == 1
+    assert tracks_f3[0]['visible'] is False
+    assert tracks_f3[0]['missing'] == 2
+    assert tracks_f3[1]['id'] == 1
+    assert tracks_f3[1]['visible'] is True
+    assert tracks_f3[1]['center'] == (58, 57)
+    assert next_id == 2
 
 
-def test_track_balls_sports2d_reassociates_after_three_missing_frames():
+def test_track_balls_sports2d_starts_new_raw_id_after_three_missing_frames():
     '''
-    Verify a ball track survives a three-frame gap and re-associates to the same ID.
+    Verify a ball track resumes as a new raw ID after a longer missing gap.
     '''
 
     from Sports2D.process import track_balls_sports2d
@@ -303,15 +317,17 @@ def test_track_balls_sports2d_reassociates_after_three_missing_frames():
         max_missing_frames=3,
     )
 
-    assert tracks_f2[0]['id'] == 0
+    assert len(tracks_f2) == 1
+    assert tracks_f2[0]['id'] == 1
     assert tracks_f2[0]['visible'] is True
     assert tracks_f2[0]['missing'] == 0
-    assert next_id == 1
+    assert tracks_f2[0]['center'] == (58, 57)
+    assert next_id == 2
 
 
-def test_track_balls_sports2d_uses_velocity_state_to_reassociate_after_gap():
+def test_track_balls_sports2d_splits_raw_id_after_gap_even_with_velocity_state():
     '''
-    Verify motion-aware reassociation can recover the same ID when raw last-center distance is too large.
+    Verify velocity prediction no longer reuses the same raw ID after a missing gap.
     '''
 
     from Sports2D.process import track_balls_sports2d
@@ -369,9 +385,46 @@ def test_track_balls_sports2d_uses_velocity_state_to_reassociate_after_gap():
         max_missing_frames=3,
     )
 
+    assert len(tracks_f5) == 2
     assert tracks_f5[0]['id'] == 0
-    assert tracks_f5[0]['visible'] is True
-    assert next_id == 1
+    assert tracks_f5[0]['visible'] is False
+    assert tracks_f5[0]['missing'] == 3
+    assert tracks_f5[1]['id'] == 1
+    assert tracks_f5[1]['visible'] is True
+    assert tracks_f5[1]['center'] == (95, 15)
+    assert next_id == 2
+
+
+def test_track_balls_sports2d_rejects_large_visible_jump_even_with_velocity_prediction():
+    '''
+    Verify max_dist still blocks a same-frame visible jump that only the velocity predictor would allow.
+    '''
+
+    from Sports2D.process import track_balls_sports2d
+
+    velocity_state = {0: (220.0, 0.0)}
+    tracks_f2, updated_kpts, updated_ids, updated_missing, next_id = track_balls_sports2d(
+        np.array([[210.0, -5.0, 230.0, 5.0]], dtype=np.float32),
+        previous_keypoints=np.array([[[0.0, 0.0]]], dtype=np.float32),
+        previous_track_ids=[0],
+        previous_missing_counts=[0],
+        next_track_id=1,
+        track_velocities_by_id=velocity_state,
+        max_dist=100.0,
+        max_missing_frames=12,
+    )
+
+    assert len(tracks_f2) == 2
+    assert tracks_f2[0]['id'] == 0
+    assert tracks_f2[0]['visible'] is False
+    assert tracks_f2[0]['missing'] == 1
+    assert tracks_f2[1]['id'] == 1
+    assert tracks_f2[1]['visible'] is True
+    assert tracks_f2[1]['center'] == (220, 0)
+    assert updated_ids == [0, 1]
+    assert updated_missing == [1, 0]
+    assert updated_kpts.shape == (2, 1, 2)
+    assert next_id == 2
 
 
 def test_track_balls_sports2d_initializes_new_track_velocity_without_nan():
@@ -757,6 +810,199 @@ def test_select_ball_track_id_preserves_selected_id_across_raw_split():
     assert selected_center == (98, 42)
 
 
+def test_select_ball_track_id_rejects_far_visible_previous_track():
+    '''
+    Verify a visible previous selected ID is still gated by max_recovery_dist before reuse.
+    '''
+
+    from Sports2D.process import select_ball_track_id
+
+    tracked_balls = [
+        {'id': 4, 'center': (260, 30), 'box': np.array([250, 20, 270, 40]), 'score': 0.91, 'visible': True, 'missing': 0},
+        {'id': 7, 'center': (24, 24), 'box': np.array([18, 18, 30, 30]), 'score': 0.75, 'visible': True, 'missing': 0},
+    ]
+
+    selected_id, selected_center = select_ball_track_id(
+        tracked_balls,
+        selection_mode='auto',
+        previous_selected_id=4,
+        previous_selected_center=(20, 20),
+        previous_selected_velocity=(0.0, 0.0),
+        ordering_method='first_detected',
+        track_stats_by_id={
+            4: {'first_seen_frame': 0, 'score_sum': 0.91, 'score_count': 1},
+            7: {'first_seen_frame': 5, 'score_sum': 0.75, 'score_count': 1},
+        },
+        max_recovery_dist=40.0,
+    )
+
+    assert selected_id == 4
+    assert selected_center == (24, 24)
+
+
+def test_get_personIDs_for_medicine_ball_prefers_person_nearest_to_opening_ball():
+    '''
+    Verify medicine-ball ordering picks the eligible person nearest to the selected ball early in the trial.
+    '''
+
+    from Sports2D.process import get_personIDs_for_medicine_ball
+
+    frame_count = 12
+    all_frames_X_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+    all_frames_Y_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+    all_frames_scores_homog = np.ones((frame_count, 2, 2), dtype=float)
+
+    all_frames_X_homog[:, 0, :] = np.array([10.0, 14.0])
+    all_frames_Y_homog[:, 0, :] = np.array([20.0, 24.0])
+    all_frames_X_homog[:, 1, :] = np.array([90.0, 94.0])
+    all_frames_Y_homog[:, 1, :] = np.array([20.0, 24.0])
+    all_frames_ball_centers = [(12, 22)] * 10 + [None, None]
+
+    selected_persons, diagnostics = get_personIDs_for_medicine_ball(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        all_frames_ball_centers,
+        nb_persons_to_detect=1,
+    )
+
+    assert selected_persons == [0]
+    assert diagnostics['eligible_person_ids'] == [0, 1]
+    assert diagnostics['usable_ball_frame_count'] == 10
+
+
+def test_get_personIDs_for_medicine_ball_rejects_nearest_person_below_presence_threshold():
+    '''
+    Verify the 95% presence gate removes the nearest opening-window person when they are too sparse.
+    '''
+
+    from Sports2D.process import get_personIDs_for_medicine_ball
+
+    frame_count = 20
+    all_frames_X_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+    all_frames_Y_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+    all_frames_scores_homog = np.ones((frame_count, 2, 2), dtype=float)
+
+    all_frames_X_homog[:, 0, :] = np.array([10.0, 14.0])
+    all_frames_Y_homog[:, 0, :] = np.array([20.0, 24.0])
+    all_frames_X_homog[:, 1, :] = np.array([90.0, 94.0])
+    all_frames_Y_homog[:, 1, :] = np.array([20.0, 24.0])
+    all_frames_ball_centers = [(12, 22)] * 10 + [None] * 10
+
+    all_frames_scores_homog[-2:, 0, :] = np.nan
+    all_frames_X_homog[-2:, 0, :] = np.nan
+    all_frames_Y_homog[-2:, 0, :] = np.nan
+
+    selected_persons, diagnostics = get_personIDs_for_medicine_ball(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        all_frames_ball_centers,
+        nb_persons_to_detect=1,
+    )
+
+    assert selected_persons == [1]
+    assert diagnostics['eligible_person_ids'] == [1]
+
+
+@pytest.mark.parametrize(
+    "detect_ball,ball_ordering_method,all_frames_ball_centers,expected_reason",
+    [
+        (False, 'first_detected', [(12, 22)] * 10, 'detect_ball=false'),
+        (True, 'on_click', [(12, 22)] * 10, "ball_ordering_method='on_click'"),
+        (True, 'first_detected', [None] * 10, 'opening_window_has_no_selected_ball'),
+    ],
+)
+def test_resolve_personIDs_for_medicine_ball_falls_back_to_highest_likelihood(
+        detect_ball, ball_ordering_method, all_frames_ball_centers, expected_reason):
+    '''
+    Verify medicine-ball ordering falls back deterministically when its ball timeline requirements are not met.
+    '''
+
+    from Sports2D.process import resolve_personIDs_for_medicine_ball
+
+    frame_count = 10
+    all_frames_X_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+    all_frames_Y_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+    all_frames_scores_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+
+    all_frames_X_homog[:, 0, :] = np.array([10.0, 14.0])
+    all_frames_Y_homog[:, 0, :] = np.array([20.0, 24.0])
+    all_frames_X_homog[:, 1, :] = np.array([90.0, 94.0])
+    all_frames_Y_homog[:, 1, :] = np.array([20.0, 24.0])
+    all_frames_scores_homog[:, 0, :] = 0.2
+    all_frames_scores_homog[:, 1, :] = 0.9
+
+    selected_persons, diagnostics = resolve_personIDs_for_medicine_ball(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        all_frames_ball_centers,
+        nb_persons_to_detect=1,
+        detect_ball=detect_ball,
+        ball_ordering_method=ball_ordering_method,
+    )
+
+    assert selected_persons == [1]
+    assert diagnostics['used_fallback'] is True
+    assert diagnostics['fallback_reason'] == expected_reason
+
+
+def test_resolve_personIDs_for_medicine_ball_falls_back_when_presence_gate_removes_all_candidates():
+    '''
+    Verify medicine-ball ordering falls back when the 95% presence gate eliminates every candidate.
+    '''
+
+    from Sports2D.process import resolve_personIDs_for_medicine_ball
+
+    frame_count = 10
+    all_frames_X_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+    all_frames_Y_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+    all_frames_scores_homog = np.full((frame_count, 2, 2), np.nan, dtype=float)
+
+    all_frames_X_homog[:, 0, :] = np.array([10.0, 14.0])
+    all_frames_Y_homog[:, 0, :] = np.array([20.0, 24.0])
+    all_frames_X_homog[:, 1, :] = np.array([90.0, 94.0])
+    all_frames_Y_homog[:, 1, :] = np.array([20.0, 24.0])
+    all_frames_scores_homog[:, 0, :] = 0.2
+    all_frames_scores_homog[:, 1, :] = 0.9
+    all_frames_ball_centers = [(12, 22)] * frame_count
+
+    all_frames_X_homog[0, 0, :] = np.nan
+    all_frames_Y_homog[0, 0, :] = np.nan
+    all_frames_scores_homog[0, 0, :] = np.nan
+    all_frames_X_homog[1, 1, :] = np.nan
+    all_frames_Y_homog[1, 1, :] = np.nan
+    all_frames_scores_homog[1, 1, :] = np.nan
+
+    selected_persons, diagnostics = resolve_personIDs_for_medicine_ball(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        all_frames_ball_centers,
+        nb_persons_to_detect=1,
+        detect_ball=True,
+        ball_ordering_method='first_detected',
+    )
+
+    assert selected_persons == [1]
+    assert diagnostics['used_fallback'] is True
+    assert diagnostics['fallback_reason'] == 'medicine_ball_presence_gate_removed_all_candidates'
+
+
+def test_sam3_mask_available_handles_bool_flag_and_mask_list():
+    '''
+    Verify SAM3 mask availability accepts the lightweight bool flag and explicit masks.
+    '''
+
+    from Sports2D.process import _sam3_mask_available
+
+    assert _sam3_mask_available(True) is True
+    assert _sam3_mask_available(False) is False
+    assert _sam3_mask_available({'masks': [np.ones((2, 2), dtype=np.uint8)]}) is True
+    assert _sam3_mask_available({'masks': []}) is False
+
+
 def test_sam3_prompt_presets_resolve_ball_and_broad_jump_targets():
     '''
     Verify SAM3 target presets normalize aliases and return the expected prompts.
@@ -924,7 +1170,7 @@ def test_build_ball_export_series_uses_selected_ball_metadata():
             [{'id': 7, 'center': (14, 16), 'box': None, 'score': float('nan'), 'visible': False}],
         ],
         all_frames_selected_ball_ids=[7, 7],
-        all_frames_sam3_ball_mask_meta=[{'masks': [np.ones((2, 2), dtype=np.uint8)]}, {}],
+        all_frames_sam3_ball_mask_meta=[True, False],
         frame_offset=12,
         multi_id_tracking=True,
     )
@@ -984,7 +1230,7 @@ def test_build_ball_export_series_keeps_selected_track_id_through_raw_split():
             ],
         ],
         all_frames_selected_ball_ids=[7, 7],
-        all_frames_sam3_ball_mask_meta=[{'masks': [np.ones((2, 2), dtype=np.uint8)]}, {}],
+        all_frames_sam3_ball_mask_meta=[True, False],
         multi_id_tracking=True,
     )
 
@@ -997,6 +1243,61 @@ def test_build_ball_export_series_keeps_selected_track_id_through_raw_split():
     assert export_series[1]['ball']['center_xy'] == [18, 20]
     assert export_series[1]['ball']['box_xyxy'] == [16.0, 18.0, 20.0, 22.0]
     assert export_series[1]['ball']['score'] == pytest.approx(0.77)
+
+
+def test_build_ball_export_series_rejects_far_visible_selected_track():
+    '''
+    Verify export does not snap back to a far visible raw track when the selected timeline center is elsewhere.
+    '''
+
+    from Sports2D.process import build_ball_export_series
+
+    export_series = build_ball_export_series(
+        pd.Series([0.0], name='time'),
+        all_frames_ball_centers=[(100, 100)],
+        all_frames_ball_boxes=[np.array([[96.0, 96.0, 104.0, 104.0]], dtype=np.float32)],
+        all_frames_ball_scores=[np.array([0.8], dtype=np.float32)],
+        all_frames_ball_tracks=[[
+            {'id': 7, 'center': (500, 500), 'box': np.array([490.0, 490.0, 510.0, 510.0], dtype=np.float32), 'score': 0.3, 'visible': True},
+            {'id': 19, 'center': (104, 102), 'box': np.array([98.0, 96.0, 110.0, 108.0], dtype=np.float32), 'score': 0.9, 'visible': True},
+        ]],
+        all_frames_selected_ball_ids=[7],
+        all_frames_sam3_ball_mask_meta=[False],
+        multi_id_tracking=True,
+        max_recovery_dist=40.0,
+    )
+
+    assert export_series[0]['ball']['track_id'] == 7
+    assert export_series[0]['ball']['source_track_id'] == 19
+    assert export_series[0]['ball']['center_xy'] == [104, 102]
+    assert export_series[0]['ball']['score'] == pytest.approx(0.9)
+
+
+def test_build_ball_export_series_does_not_reuse_visible_track_when_center_was_rejected():
+    '''
+    Verify export/replay does not snap back to a visible raw track when the live path cleared the selected center.
+    '''
+
+    from Sports2D.process import build_ball_export_series
+
+    export_series = build_ball_export_series(
+        pd.Series([0.0], name='time'),
+        all_frames_ball_centers=[None],
+        all_frames_ball_boxes=[np.array([[490.0, 490.0, 510.0, 510.0]], dtype=np.float32)],
+        all_frames_ball_scores=[np.array([0.3], dtype=np.float32)],
+        all_frames_ball_tracks=[[
+            {'id': 7, 'center': (500, 500), 'box': np.array([490.0, 490.0, 510.0, 510.0], dtype=np.float32), 'score': 0.3, 'visible': True},
+        ]],
+        all_frames_selected_ball_ids=[7],
+        all_frames_sam3_ball_mask_meta=[False],
+        multi_id_tracking=True,
+        max_recovery_dist=40.0,
+    )
+
+    assert export_series[0]['ball']['track_id'] == 7
+    assert export_series[0]['ball']['source_track_id'] is None
+    assert export_series[0]['ball']['visible'] is False
+    assert export_series[0]['ball']['center_xy'] is None
 
 
 def test_stitch_selected_ball_timeline_recovers_earlier_fragment_from_clicked_seed():
@@ -1654,6 +1955,298 @@ def test_synthpose_tracker_yolo26_adapter_builds_detection_metadata():
     assert metadata['class_names'].tolist() == ['person', 'sports ball', 'person']
 
 
+def test_synthpose_tracker_yolox_human_mode_keeps_scoreless_person_boxes():
+    '''
+    Verify YOLOX human-mode detections without explicit scores still produce person boxes.
+    '''
+
+    from Sports2D.Utilities.synthpose_tracker import (
+        PERSON_CLASS_ID,
+        SynthPosePoseTracker,
+    )
+
+    class FakeDetector:
+        def __call__(self, frame):
+            return np.array([[10.0, 20.0, 30.0, 44.0]], dtype=np.float32)
+
+    tracker = SynthPosePoseTracker.__new__(SynthPosePoseTracker)
+    tracker.detector = FakeDetector()
+    tracker.person_threshold = 0.3
+    tracker.ball_detection_threshold = 0.1
+    tracker.ball_class_ids = [32]
+    tracker.detect_ball = False
+    tracker.ball_detector_backend = 'same'
+    tracker.detector_type = 'yolox'
+    tracker.sam3_collect_masks = False
+    tracker.last_detections = tracker._empty_detections()
+
+    person_boxes = tracker._detect_persons_yolox(
+        np.zeros((32, 32, 3), dtype=np.uint8)
+    )
+    metadata = tracker.last_detections
+
+    assert person_boxes.shape == (1, 4)
+    assert person_boxes[0].tolist() == pytest.approx([10.0, 20.0, 20.0, 24.0])
+    assert metadata['boxes'].shape == (1, 4)
+    assert metadata['classes'].tolist() == [PERSON_CLASS_ID]
+    assert metadata['person_boxes'].shape == (1, 4)
+    assert metadata['ball_boxes'].shape == (0, 4)
+    assert np.isnan(metadata['scores'][0])
+
+
+def test_synthpose_tracker_ball_only_metadata_is_not_promoted_to_person():
+    '''
+    Verify ball-only shared-detector metadata never becomes a person box.
+    '''
+
+    from Sports2D.Utilities.synthpose_tracker import (
+        SPORTS_BALL_CLASS_ID,
+        SynthPosePoseTracker,
+    )
+
+    tracker = SynthPosePoseTracker.__new__(SynthPosePoseTracker)
+    tracker.detect_ball = True
+    tracker.ball_detector_backend = 'same'
+    tracker.detector_type = 'yolox'
+    tracker.ball_class_ids = [SPORTS_BALL_CLASS_ID]
+    tracker.ball_detection_threshold = 0.1
+    tracker.sam3_collect_masks = False
+    tracker.last_detections = tracker._empty_detections()
+
+    person_boxes = tracker._set_last_detections(
+        np.array([[1.0, 2.0, 11.0, 12.0]], dtype=np.float32),
+        classes=np.array([SPORTS_BALL_CLASS_ID], dtype=np.int32),
+        scores=np.array([0.9], dtype=np.float32),
+        metadata_score_threshold=0.1,
+        person_score_threshold=0.3,
+    )
+    metadata = tracker.last_detections
+
+    assert person_boxes.shape == (0, 4)
+    assert metadata['person_boxes'].shape == (0, 4)
+    assert metadata['ball_boxes'].shape == (1, 4)
+    assert metadata['ball_scores'].tolist() == pytest.approx([0.9])
+
+
+def test_manual_roi_helpers_round_trip_boxes_and_keypoints():
+    '''
+    Verify manual ROI helpers clamp selections and restore full-frame coordinates.
+    '''
+
+    from Sports2D.Utilities.manual_roi import (
+        boxes_center_inside_roi,
+        expand_roi_with_context,
+        fit_frame_to_screen,
+        normalize_roi_xyxy,
+        offset_keypoints_to_full_frame,
+        offset_xyxy_boxes_to_full_frame,
+        scale_selection_to_full_frame,
+        translate_roi_to_local,
+        union_rois,
+        xywh_to_xyxy,
+    )
+
+    frame_shape = (120, 200, 3)
+    person_roi = normalize_roi_xyxy(xywh_to_xyxy((10, 20, 40, 50)), frame_shape, padding_px=4)
+    ball_roi = normalize_roi_xyxy((150, 10, 190, 30), frame_shape)
+
+    assert person_roi == (6, 16, 54, 74)
+    assert union_rois(person_roi, ball_roi) == (6, 10, 190, 74)
+    assert translate_roi_to_local(ball_roi, union_rois(person_roi, ball_roi)) == (144, 0, 184, 20)
+    assert expand_roi_with_context((100, 100, 120, 120), (300, 300, 3), scale=2.5, min_size=128) == (
+        46, 46, 174, 174
+    )
+    resized, scale = fit_frame_to_screen(
+        np.zeros((2000, 4000, 3), dtype=np.uint8),
+        screen_width=1000,
+        screen_height=800,
+        margin=100,
+    )
+    assert resized.shape[:2] == (450, 900)
+    assert scale == pytest.approx(0.225)
+    assert scale_selection_to_full_frame((90, 45, 90, 45), scale) == (400, 200, 800, 400)
+
+    local_keypoints = np.array([[[1.0, 2.0], [5.0, 6.0]]], dtype=np.float32)
+    local_boxes = np.array([[3.0, 4.0, 13.0, 14.0]], dtype=np.float32)
+    assert np.allclose(
+        offset_keypoints_to_full_frame(local_keypoints, person_roi),
+        np.array([[[7.0, 18.0], [11.0, 22.0]]], dtype=np.float32),
+    )
+    assert np.allclose(
+        offset_xyxy_boxes_to_full_frame(local_boxes, person_roi),
+        np.array([[9.0, 20.0, 19.0, 30.0]], dtype=np.float32),
+    )
+    assert boxes_center_inside_roi(local_boxes, (0, 0, 20, 20)).tolist() == [True]
+
+
+def test_synthpose_tracker_manual_roi_offsets_person_and_ball_outputs():
+    '''
+    Verify manual ROI cropping keeps returned keypoints and metadata in full-frame coordinates.
+    '''
+
+    from Sports2D.Utilities.synthpose_tracker import (
+        PERSON_CLASS_ID,
+        SPORTS_BALL_CLASS_ID,
+        SynthPosePoseTracker,
+    )
+
+    person_frame_shapes = []
+    ball_frame_shapes = []
+
+    tracker = SynthPosePoseTracker.__new__(SynthPosePoseTracker)
+    tracker.frame_count = 0
+    tracker.det_frequency = 1
+    tracker.prev_boxes = None
+    tracker.detect_ball = True
+    tracker.ball_detector_backend = 'sam3'
+    tracker.detector_type = 'yolox'
+    tracker.ball_class_ids = [SPORTS_BALL_CLASS_ID]
+    tracker.ball_detection_threshold = 0.1
+    tracker.sam3_collect_masks = False
+    tracker.last_detections = tracker._empty_detections()
+    tracker.manual_person_roi = (10, 20, 60, 70)
+    tracker.manual_ball_roi = (100, 100, 120, 120)
+    tracker._warned_shared_union_roi = False
+
+    def fake_detect_persons(frame, *_args):
+        person_frame_shapes.append(frame.shape)
+        tracker.last_detections = {
+            'boxes': np.array([[1.0, 2.0, 11.0, 22.0]], dtype=np.float32),
+            'classes': np.array([PERSON_CLASS_ID], dtype=np.int32),
+            'scores': np.array([0.9], dtype=np.float32),
+            'person_boxes': np.array([[1.0, 2.0, 11.0, 22.0]], dtype=np.float32),
+            'ball_boxes': np.empty((0, 4), dtype=np.float32),
+            'ball_scores': np.empty((0,), dtype=np.float32),
+            'class_names': np.empty((0,), dtype=object),
+            'prompt_indices': np.empty((0,), dtype=np.int32),
+            'sam3_ball_meta': {},
+        }
+        return np.array([[1.0, 2.0, 10.0, 20.0]], dtype=np.float32)
+
+    def fake_detect_balls(frame):
+        ball_frame_shapes.append(frame.shape)
+        return {
+            'boxes': np.array([[54.0, 54.0, 74.0, 74.0], [0.0, 0.0, 10.0, 10.0]], dtype=np.float32),
+            'classes': np.array([SPORTS_BALL_CLASS_ID, SPORTS_BALL_CLASS_ID], dtype=np.int32),
+            'scores': np.array([0.8, 0.4], dtype=np.float32),
+            'person_boxes': np.empty((0, 4), dtype=np.float32),
+            'ball_boxes': np.array([[54.0, 54.0, 74.0, 74.0], [0.0, 0.0, 10.0, 10.0]], dtype=np.float32),
+            'ball_scores': np.array([0.8, 0.4], dtype=np.float32),
+            'class_names': np.array(['sports ball', 'sports ball'], dtype=object),
+            'prompt_indices': np.array([0, 0], dtype=np.int32),
+            'sam3_ball_meta': {},
+        }
+
+    tracker._detect_persons = fake_detect_persons
+    tracker._detect_balls_sam3 = fake_detect_balls
+    tracker._estimate_poses = lambda pil_image, person_boxes: (
+        np.array([[[5.0, 6.0], [7.0, 8.0]]], dtype=np.float32),
+        np.array([[0.9, 0.85]], dtype=np.float32),
+    )
+
+    keypoints, _scores = tracker(np.zeros((128, 160, 3), dtype=np.uint8))
+
+    assert person_frame_shapes == [(50, 50, 3)]
+    assert ball_frame_shapes == [(82, 114, 3)]
+    assert np.allclose(
+        keypoints,
+        np.array([[[15.0, 26.0], [17.0, 28.0]]], dtype=np.float32),
+    )
+    assert np.allclose(
+        tracker.last_detections['person_boxes'],
+        np.array([[11.0, 22.0, 21.0, 42.0]], dtype=np.float32),
+    )
+    assert np.allclose(
+        tracker.last_detections['ball_boxes'],
+        np.array([[100.0, 100.0, 120.0, 120.0]], dtype=np.float32),
+    )
+    assert tracker.last_detections['classes'].tolist() == [PERSON_CLASS_ID, SPORTS_BALL_CLASS_ID]
+
+
+def test_synthpose_tracker_releases_manual_rois_after_first_acquisition():
+    '''
+    Verify manual person/ball ROI constraints are only used for initial acquisition.
+    '''
+
+    from Sports2D.Utilities.synthpose_tracker import (
+        PERSON_CLASS_ID,
+        SPORTS_BALL_CLASS_ID,
+        SynthPosePoseTracker,
+    )
+
+    person_frame_shapes = []
+    ball_frame_shapes = []
+    pose_box_history = []
+
+    tracker = SynthPosePoseTracker.__new__(SynthPosePoseTracker)
+    tracker.frame_count = 0
+    tracker.det_frequency = 3
+    tracker.prev_boxes = None
+    tracker.detect_ball = True
+    tracker.ball_detector_backend = 'sam3'
+    tracker.detector_type = 'yolox'
+    tracker.ball_class_ids = [SPORTS_BALL_CLASS_ID]
+    tracker.ball_detection_threshold = 0.1
+    tracker.sam3_collect_masks = False
+    tracker.last_detections = tracker._empty_detections()
+    tracker.manual_person_roi = (10, 20, 60, 70)
+    tracker.manual_ball_roi = (100, 100, 120, 120)
+    tracker._manual_person_roi_released = False
+    tracker._manual_ball_roi_released = False
+    tracker._warned_shared_union_roi = False
+
+    def fake_detect_persons(frame, *_args):
+        person_frame_shapes.append(frame.shape)
+        tracker.last_detections = {
+            'boxes': np.array([[1.0, 2.0, 11.0, 22.0]], dtype=np.float32),
+            'classes': np.array([PERSON_CLASS_ID], dtype=np.int32),
+            'scores': np.array([0.9], dtype=np.float32),
+            'person_boxes': np.array([[1.0, 2.0, 11.0, 22.0]], dtype=np.float32),
+            'ball_boxes': np.empty((0, 4), dtype=np.float32),
+            'ball_scores': np.empty((0,), dtype=np.float32),
+            'class_names': np.empty((0,), dtype=object),
+            'prompt_indices': np.empty((0,), dtype=np.int32),
+            'sam3_ball_meta': {},
+        }
+        return np.array([[1.0, 2.0, 10.0, 20.0]], dtype=np.float32)
+
+    def fake_detect_balls(frame):
+        ball_frame_shapes.append(frame.shape)
+        return {
+            'boxes': np.array([[54.0, 54.0, 74.0, 74.0]], dtype=np.float32),
+            'classes': np.array([SPORTS_BALL_CLASS_ID], dtype=np.int32),
+            'scores': np.array([0.8], dtype=np.float32),
+            'person_boxes': np.empty((0, 4), dtype=np.float32),
+            'ball_boxes': np.array([[54.0, 54.0, 74.0, 74.0]], dtype=np.float32),
+            'ball_scores': np.array([0.8], dtype=np.float32),
+            'class_names': np.array(['sports ball'], dtype=object),
+            'prompt_indices': np.array([0], dtype=np.int32),
+            'sam3_ball_meta': {},
+        }
+
+    def fake_estimate_poses(pil_image, person_boxes):
+        pose_box_history.append(np.asarray(person_boxes, dtype=np.float32).copy())
+        return (
+            np.array([[[5.0, 6.0], [7.0, 8.0]]], dtype=np.float32),
+            np.array([[0.9, 0.85]], dtype=np.float32),
+        )
+
+    tracker._detect_persons = fake_detect_persons
+    tracker._detect_balls_sam3 = fake_detect_balls
+    tracker._estimate_poses = fake_estimate_poses
+
+    frame = np.zeros((128, 160, 3), dtype=np.uint8)
+    tracker(frame)
+    tracker(frame)
+
+    assert person_frame_shapes == [(50, 50, 3)]
+    assert ball_frame_shapes == [(82, 114, 3), (128, 160, 3)]
+    assert np.allclose(pose_box_history[0], np.array([[1.0, 2.0, 10.0, 20.0]], dtype=np.float32))
+    assert np.allclose(pose_box_history[1], np.array([[11.0, 22.0, 10.0, 20.0]], dtype=np.float32))
+    assert tracker._manual_person_roi_released is True
+    assert tracker._manual_ball_roi_released is True
+
+
 def test_resolve_sam3_runtime_auto_switches_raw_checkpoint_to_meta(tmp_path):
     '''
     Verify raw SAM3 checkpoints bypass processor_path and use the Meta runtime.
@@ -1727,6 +2320,17 @@ def test_default_config_exposes_ball_ordering_method():
     assert 'ball_ordering_method' in CONFIG_HELP
 
 
+def test_config_help_mentions_medicine_ball_person_ordering():
+    '''
+    Verify the public person-ordering help text exposes the medicine-ball mode.
+    '''
+
+    from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
+
+    assert DEFAULT_CONFIG['base']['person_ordering_method'] == 'on_click'
+    assert 'medicine_ball' in CONFIG_HELP['person_ordering_method'][1]
+
+
 def test_config_help_mentions_ball_pose_exports():
     '''
     Verify help text explains the new ball export behavior.
@@ -1758,6 +2362,33 @@ def test_default_config_exposes_sam3_settings():
     assert 'sam3_processor_path' in CONFIG_HELP
     assert 'sam3_show_realtime_masks' in CONFIG_HELP
     assert 'sam3_realtime_mask_alpha' in CONFIG_HELP
+
+
+def test_default_config_exposes_manual_roi_settings():
+    '''
+    Verify manual ROI settings are available in defaults and CLI help.
+    '''
+
+    from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
+
+    assert DEFAULT_CONFIG['pose']['manual_roi'] is False
+    assert DEFAULT_CONFIG['pose']['manual_roi_padding_px'] == 16
+    assert 'manual_roi' in CONFIG_HELP
+    assert 'manual_roi_padding_px' in CONFIG_HELP
+    assert 'union of person_roi and ball_roi' in CONFIG_HELP['manual_roi_padding_px'][1]
+
+
+def test_default_config_draw_thresholds_defer_to_pose_threshold():
+    '''
+    Verify display-only draw thresholds stay unset by default so pose threshold fallback still works.
+    '''
+
+    from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
+
+    assert DEFAULT_CONFIG['pose']['draw_keypoint_likelihood_threshold'] == ''
+    assert DEFAULT_CONFIG['pose']['draw_skeleton_likelihood_threshold'] == ''
+    assert "Falls back to keypoint_likelihood_threshold" in CONFIG_HELP['draw_keypoint_likelihood_threshold'][1]
+    assert "Falls back to draw_keypoint_likelihood_threshold" in CONFIG_HELP['draw_skeleton_likelihood_threshold'][1]
 
 
 def test_config_help_mentions_yolo26_detector():
@@ -2089,6 +2720,7 @@ def test_rtmlib_ball_tracker_honors_detection_frequency_cadence():
     tracker._ball_class_ids = {SPORTS_BALL_CLASS_ID}
     tracker._det_frequency = 2
     tracker._frame_count = 0
+    tracker._ball_roi = None
     tracker.last_detections = tracker._empty_detections()
 
     frame = np.zeros((64, 64, 3), dtype=np.uint8)
@@ -2098,6 +2730,85 @@ def test_rtmlib_ball_tracker_honors_detection_frequency_cadence():
 
     assert len(detector_calls) == 2
     assert tracker.last_detections['ball_boxes'].shape == (1, 4)
+
+
+def test_static_person_roi_tracker_offsets_keypoints():
+    '''
+    Verify the static person ROI wrapper restores full-frame keypoints after cropped inference.
+    '''
+
+    from Sports2D.Utilities.pose_backend import _StaticPersonROITracker
+
+    seen_shapes = []
+
+    def fake_pose_tracker(frame):
+        seen_shapes.append(frame.shape)
+        return (
+            np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=np.float32),
+            np.array([[0.9, 0.8]], dtype=np.float32),
+        )
+
+    wrapped = _StaticPersonROITracker(
+        pose_tracker=fake_pose_tracker,
+        person_roi=(20, 30, 60, 80),
+    )
+
+    keypoints, scores = wrapped(np.zeros((100, 120, 3), dtype=np.uint8))
+    wrapped(np.zeros((100, 120, 3), dtype=np.uint8))
+
+    assert np.allclose(
+        keypoints,
+        np.array([[[21.0, 32.0], [23.0, 34.0]]], dtype=np.float32),
+    )
+    assert np.allclose(scores, np.array([[0.9, 0.8]], dtype=np.float32))
+    assert seen_shapes == [(50, 40, 3), (100, 120, 3)]
+
+
+def test_rtmlib_ball_tracker_crops_detector_to_ball_roi():
+    '''
+    Verify the RTMLib ball detector runs on the cropped ball ROI and restores full-frame boxes.
+    '''
+
+    from Sports2D.Utilities.pose_backend import (
+        _RTMLibBallAwareTracker,
+        SPORTS_BALL_CLASS_ID,
+    )
+
+    tracker = _RTMLibBallAwareTracker.__new__(_RTMLibBallAwareTracker)
+    tracker._pose_tracker = lambda frame: (
+        np.array([[[10.0, 10.0], [14.0, 16.0]]], dtype=np.float32),
+        np.array([[0.9, 0.8]], dtype=np.float32),
+    )
+    tracker._ball_class_ids = {SPORTS_BALL_CLASS_ID}
+    tracker._det_frequency = 1
+    tracker._frame_count = 0
+    tracker._ball_roi = (30, 40, 70, 90)
+    tracker.last_detections = tracker._empty_detections()
+    seen_shapes = []
+
+    def fake_ball_detector(frame):
+        seen_shapes.append(frame.shape)
+        if frame.shape[:2] == (50, 40):
+            boxes = np.array([[1.0, 2.0, 11.0, 12.0]], dtype=np.float32)
+        else:
+            boxes = np.array([[31.0, 42.0, 41.0, 52.0]], dtype=np.float32)
+        return (
+            boxes,
+            np.array([SPORTS_BALL_CLASS_ID], dtype=np.int32),
+            np.array([0.93], dtype=np.float32),
+        )
+
+    tracker._ball_detector = fake_ball_detector
+
+    frame = np.zeros((128, 160, 3), dtype=np.uint8)
+    tracker(frame)
+    tracker(frame)
+
+    assert seen_shapes == [(50, 40, 3), (128, 160, 3)]
+    assert np.allclose(
+        tracker.last_detections['ball_boxes'],
+        np.array([[31.0, 42.0, 41.0, 52.0]], dtype=np.float32),
+    )
 
 
 class _FakeHybridCapture:
@@ -2351,6 +3062,94 @@ def test_evaluate_pose_frame_keeps_keypoints_when_thresholds_pass():
     assert filtered_scores.tolist() == pytest.approx([0.9, 0.4, 0.35])
 
 
+def test_draw_pose_supports_stricter_keypoint_display_threshold(monkeypatch):
+    '''
+    Verify display-only keypoint threshold can hide markers without affecting skeleton settings.
+    '''
+
+    from anytree import Node
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / '.omx' / 'test_stubs'))
+    from Sports2D.process import draw_pose
+
+    pose_root = Node('Nose', id=0)
+    Node('LShoulder', parent=pose_root, id=1)
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    all_x = [np.array([20.0, 42.0], dtype=float)]
+    all_y = [np.array([20.0, 20.0], dtype=float)]
+    all_scores = [np.array([0.4, 0.2], dtype=float)]
+    keypoint_names = ['Nose', 'LShoulder']
+
+    visible = draw_pose(
+        image.copy(),
+        all_x,
+        all_y,
+        all_scores,
+        pose_root,
+        keypoint_names=keypoint_names,
+        backend_name='synthpose',
+        keypoint_draw_threshold=0.3,
+        skeleton_draw_threshold=1.0,
+    )
+    hidden = draw_pose(
+        image.copy(),
+        all_x,
+        all_y,
+        all_scores,
+        pose_root,
+        keypoint_names=keypoint_names,
+        backend_name='synthpose',
+        keypoint_draw_threshold=0.5,
+        skeleton_draw_threshold=1.0,
+    )
+
+    assert int(visible.sum()) > 0
+    assert int(hidden.sum()) == 0
+
+
+def test_draw_pose_supports_stricter_skeleton_display_threshold(monkeypatch):
+    '''
+    Verify display-only skeleton threshold can hide uncertain links while leaving point thresholds unchanged.
+    '''
+
+    from anytree import Node
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / '.omx' / 'test_stubs'))
+    from Sports2D.process import draw_pose
+
+    pose_root = Node('Nose', id=0)
+    Node('LShoulder', parent=pose_root, id=1)
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    all_x = [np.array([18.0, 46.0], dtype=float)]
+    all_y = [np.array([18.0, 18.0], dtype=float)]
+    all_scores = [np.array([0.95, 0.4], dtype=float)]
+    keypoint_names = ['Nose', 'LShoulder']
+
+    visible = draw_pose(
+        image.copy(),
+        all_x,
+        all_y,
+        all_scores,
+        pose_root,
+        keypoint_names=keypoint_names,
+        backend_name='synthpose',
+        keypoint_draw_threshold=1.0,
+        skeleton_draw_threshold=0.3,
+    )
+    hidden = draw_pose(
+        image.copy(),
+        all_x,
+        all_y,
+        all_scores,
+        pose_root,
+        keypoint_names=keypoint_names,
+        backend_name='synthpose',
+        keypoint_draw_threshold=1.0,
+        skeleton_draw_threshold=0.5,
+    )
+
+    assert int(visible.sum()) > 0
+    assert int(hidden.sum()) == 0
+
+
 def test_build_pose_issue_list_reports_missing_low_confidence_and_manual_points():
     '''
     Verify pose diagnostics surface missing, low-confidence, and manual statuses.
@@ -2503,7 +3302,7 @@ def test_create_pose_backend_surfaces_raw_sam3_guidance(monkeypatch):
     message = str(exc_info.value)
     assert "official Meta sam3 package" in message
     assert "sam3_runtime='transformers'" in message
-    assert "sports2d[synthpose]" not in message
+    assert "Raw SAM3 checkpoint mode is separate from sports2d[synthpose]" in message
 
 
 def test_create_pose_backend_surfaces_ultralytics_guidance(monkeypatch):
@@ -2555,6 +3354,55 @@ def test_create_pose_backend_surfaces_transformers_sam3_guidance(monkeypatch):
     assert "current transformers install in this environment is too old for SAM3" in message
     assert "git+https://github.com/huggingface/transformers" in message
     assert "Raw SAM3 checkpoint mode is separate" not in message
+
+
+def test_synthpose_backend_disables_saved_sam3_mask_collection_when_preview_is_off(monkeypatch):
+    '''
+    Verify save_vid/save_img no longer trigger SAM3 mask collection when live preview is disabled.
+    '''
+
+    import sys
+    import types
+
+    from Sports2D.Utilities import pose_backend
+
+    captured = {}
+
+    class FakeTracker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.device = kwargs.get('device', 'cpu')
+            self.frame_count = 0
+            self.prev_boxes = None
+
+        def __call__(self, frame):
+            return np.empty((0, 52, 2)), np.empty((0, 52))
+
+    fake_tracker_module = types.SimpleNamespace(SynthPosePoseTracker=FakeTracker)
+    monkeypatch.setitem(sys.modules, 'Sports2D.Utilities.synthpose_tracker', fake_tracker_module)
+
+    pose_backend.SynthPoseBackend({
+        'base': {
+            'show_realtime_results': False,
+            'save_vid': True,
+            'save_img': True,
+        },
+        'pose': {
+            'pose_model': 'synthpose',
+            'backend': 'openvino',
+            'detect_ball': True,
+            'ball_detector_backend': 'sam3',
+            'sam3_show_realtime_masks': True,
+            '_manual_person_roi': [10, 20, 30, 40],
+            '_manual_ball_roi': [50, 60, 70, 80],
+        },
+    })
+
+    assert captured['backend'] == 'openvino'
+    assert captured['sam3_show_realtime_masks'] is False
+    assert captured['sam3_save_ball_masks'] is False
+    assert captured['manual_person_roi'] == [10, 20, 30, 40]
+    assert captured['manual_ball_roi'] == [50, 60, 70, 80]
 
 
 def test_get_start_time_ffmpeg_uses_utf8_decoding(monkeypatch):
@@ -2777,10 +3625,132 @@ def test_expand_video_input_paths_raises_on_empty_directory(tmp_path):
         _expand_video_input_paths('empty', tmp_path)
 
 
+def test_process_pipeline_keeps_rejected_ball_center_out_of_pose_ball_export(monkeypatch, tmp_path):
+    '''
+    Verify the end-to-end Sports2D.process path does not resurrect a ball center that the live jump gate rejected.
+    '''
+
+    import copy
+    import json
+
+    import cv2
+
+    from Sports2D import Sports2D
+    import Sports2D.process as process_module
+
+    video_dir = tmp_path / 'videos'
+    result_dir = tmp_path / 'results'
+    video_dir.mkdir()
+    result_dir.mkdir()
+    video_path = video_dir / 'ball_jump.mp4'
+
+    writer = cv2.VideoWriter(
+        str(video_path),
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        30.0,
+        (320, 240),
+    )
+    for _ in range(3):
+        writer.write(np.zeros((240, 320, 3), dtype=np.uint8))
+    writer.release()
+
+    class FakeBackend:
+        def __init__(self):
+            self.backend_name = 'rtmlib'
+            self.num_keypoints = 4
+            self.keypoint_names = ['LHip', 'RHip', 'LShoulder', 'RShoulder']
+            self.frame_idx = 0
+            self.last_detections = {}
+
+        def __call__(self, frame):
+            centers = [(10.0, 20.0), (30.0, 20.0), (120.0, 20.0)]
+            center = centers[min(self.frame_idx, len(centers) - 1)]
+            self.last_detections = {
+                'boxes': np.array([[center[0] - 5.0, center[1] - 5.0, center[0] + 5.0, center[1] + 5.0]], dtype=np.float32),
+                'classes': np.array([32], dtype=np.int32),
+                'scores': np.array([0.8], dtype=np.float32),
+                'person_boxes': np.array([[10.0, 10.0, 20.0, 20.0]], dtype=np.float32),
+                'ball_boxes': np.array([[center[0] - 5.0, center[1] - 5.0, center[0] + 5.0, center[1] + 5.0]], dtype=np.float32),
+                'ball_scores': np.array([0.8], dtype=np.float32),
+            }
+            self.frame_idx += 1
+            keypoints = np.array([[[100.0, 100.0], [120.0, 100.0], [100.0, 70.0], [120.0, 70.0]]], dtype=np.float32)
+            scores = np.array([[1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+            return keypoints, scores
+
+        def reset(self):
+            self.frame_idx = 0
+            self.last_detections = {}
+
+    monkeypatch.setattr(process_module, 'create_pose_backend', lambda _config: FakeBackend())
+
+    config = copy.deepcopy(Sports2D.DEFAULT_CONFIG)
+    config['base'].update({
+        'video_input': [video_path.name],
+        'video_dir': str(video_dir),
+        'result_dir': str(result_dir),
+        'nb_persons_to_detect': 1,
+        'person_ordering_method': 'highest_likelihood',
+        'show_realtime_results': False,
+        'save_vid': False,
+        'save_img': False,
+        'save_pose': True,
+        'calculate_angles': True,
+        'save_angles': True,
+        'visible_side': ['auto'],
+        'load_trc_px': '',
+    })
+    config['pose'].update({
+        'pose_model': 'body',
+        'detect_ball': True,
+        'ball_tracking_mode': 'sports2d',
+        'ball_selection_mode': 'auto',
+        'ball_ordering_method': 'first_detected',
+        'ball_tracking_max_distance': 200,
+        'ball_max_jump_px': 50,
+        'keypoint_likelihood_threshold': 0.0,
+        'average_likelihood_threshold': 0.0,
+        'keypoint_number_threshold': 0.0,
+        'max_distance': 250,
+    })
+    config['px_to_meters_conversion'].update({
+        'to_meters': False,
+        'make_c3d': False,
+        'save_calib': False,
+        'calib_file': '',
+    })
+    config['post-processing'].update({
+        'filter': False,
+        'show_graphs': False,
+        'save_graphs': False,
+    })
+    config['kinematics'].update({
+        'do_ik': False,
+        'use_augmentation': False,
+    })
+    config['motion'].update({'vertical_jump': False})
+    config['logging'].update({'use_custom_logging': True})
+
+    Sports2D.process(config)
+
+    pose_ball_dir = result_dir / 'ball_jump_Sports2D' / 'pose_ball'
+    frame2 = json.loads((pose_ball_dir / 'ball_jump_Sports2D_000002.json').read_text(encoding='utf-8'))
+    ball = frame2['balls'][0]
+
+    assert ball['track_id'] == 0
+    assert ball['source_track_id'] is None
+    assert ball['visible'] is False
+    assert ball['center_xy'] is None
+
+
 def test_workflow():
     '''
     Test the workflow of Sports2D.
     '''
+
+    pytest.importorskip('torch')
+    pytest.importorskip('transformers')
+    pytest.importorskip('ultralytics')
 
     from Sports2D import Sports2D
     root_dir = os.path.dirname(os.path.abspath(__file__))
