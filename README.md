@@ -476,6 +476,17 @@ sports2d --video_input demo.mp4 other_video.mp4 --time_range 1.2 2.7 0 3.5
   ```
   `manual_roi=true` asks you to draw a static person ROI before inference starts; when `detect_ball=true`, Sports2D also asks for a ball ROI. Person detection, pose estimation, and ball detection then run inside those regions instead of scanning the full frame first. With `ball_detector_backend='sam3'`, the person ROI and ball ROI stay separate. With shared detectors, Sports2D falls back to the union of the selected regions so both people and ball can still be found. For the lower-risk `transformers` path, `--sam3_model_path` must be a Hugging Face repo ID or a local HF snapshot folder such as `facebook/sam3`. Raw `.pt` checkpoints cannot stay on `transformers`; they auto-switch to the official Meta `sam3` runtime and ignore `--sam3_processor_path`. With `--detect_ball true --save_pose true`, Sports2D also writes `pose_ball/` JSON files, appends a trailing `ball` marker to saved pixel/meter TRCs, and adds a Blender helper script that turns the imported `ball` marker into a sphere mesh. SAM3 mask fills are available in the live preview when enabled, but saved videos/images keep the lighter ball overlays without replaying the mask pixels. Missing ball frames stay empty in export, while multi-ID ball JSON exposes both the selected timeline ID (`track_id`) and the raw visible source track (`source_track_id`) when a short raw-ID split is stitched back together.
   Sports2D now keeps two ball notions in hybrid multi-ID mode: raw detector/track IDs for debugging, and one selected-ball timeline for export/review. The selected timeline can stay continuous across short raw-ID splits, while `ball_show_ids=true` still shows the raw IDs on boxes.
+- Use SAM3.1 video mode for the hybrid sports-ball path
+  ``` cmd
+  sports2d --pose_model synthpose `
+           --synthpose_detector yolox `
+           --ball_detector_backend sam3 `
+           --detect_ball true `
+           --sam3_model_path /absolute/path/to/sam3.1_multiplex.pt `
+           --sam3_runtime meta `
+           --sam3_inference_mode video
+  ```
+  Phase-1 SAM3.1 video mode is file-video only and currently applies to the hybrid ball path (`ball_detector_backend='sam3'`). Sports2D bootstraps a stable ball seed from the opening frames with SAM3.1 image detection and then switches to the official Meta SAM3.1 video predictor. If the predictor loses the ball or no stable seed is found yet, Sports2D falls back to per-frame SAM3 image detection until a new stable seed is available. Webcam input is downgraded to image mode before any video session is created.
 - Use SynthPose with Ultralytics YOLO26 detection
   ``` cmd
   pip install sports2d[synthpose,yolo26]

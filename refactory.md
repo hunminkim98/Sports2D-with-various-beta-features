@@ -21,6 +21,11 @@
   - `draw_keypoint_likelihood_threshold`는 키포인트 마커 표시 여부만 제어합니다.
   - `draw_skeleton_likelihood_threshold`는 선 양 끝점이 모두 기준 이상일 때만 skeleton line을 그립니다.
   - 기본 fallback은 각각 `keypoint_likelihood_threshold`, `draw_keypoint_likelihood_threshold`입니다.
+- 2026-03-30: `pose.sam3_inference_mode`, `pose.sam3_bootstrap_frames`, `pose.sam3_video_refresh_frequency`, `pose.sam3_video_reseed_on_loss`, `pose.sam3_video_loss_patience` 설정이 추가되었습니다.
+  - phase 1 범위에서는 `ball_detector_backend='sam3'`인 hybrid sports-ball path에만 `sam3_inference_mode='video'`가 적용됩니다.
+  - 이 경로는 local raw `sam3.1` checkpoint + official Meta runtime을 전제로 하며, file video에서만 활성화됩니다.
+  - `manual_roi=false`이면 opening frames에서 SAM3 image detection으로 stable seed를 찾은 뒤 video predictor segment를 시작합니다.
+  - predictor가 끊기거나 stable seed가 없으면 해당 segment는 image-mode SAM3로 fallback 하고, refresh boundary에서 다시 reseed를 시도합니다.
 - 2026-03-19: `motion.vertical_jump` 설정이 추가되었습니다.
   - `true`이면 Sports2D가 `Hip`-`Neck` pelvis-trunk proxy CoM으로 vertical GRF를 추정합니다.
   - 결과로 `GRF.trc`와 metrics JSON이 저장되고, 저장 비디오/이미지에는 CoM 점과 vertical GRF 화살표가 오버레이됩니다.

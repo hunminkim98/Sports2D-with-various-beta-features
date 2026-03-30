@@ -41,6 +41,7 @@ from Sports2D.Utilities.sam3_detector import (
     Sam3Detector,
     empty_sam3_detections,
 )
+from Sports2D.Utilities.sam3_video_detector import Sam3VideoDetector
 
 PERSON_CLASS_ID = 0
 SPORTS_BALL_CLASS_ID = 32
@@ -131,6 +132,19 @@ def _normalize_ball_detector_backend(ball_detector_backend, detector=None, defau
     return default
 
 
+def _normalize_sam3_inference_mode(sam3_inference_mode, default='image'):
+    """Normalize the SAM3 inference-mode selector."""
+    normalized = str(default if sam3_inference_mode is None else sam3_inference_mode).strip().lower()
+    if normalized in {'image', 'video'}:
+        return normalized
+    logging.warning(
+        "Unsupported sam3_inference_mode '%s'. Falling back to '%s'.",
+        sam3_inference_mode,
+        default,
+    )
+    return default
+
+
 class SynthPosePoseTracker:
     '''
     Pose tracker using rtmlib YOLOX + VitPose for 52-keypoint pose estimation.
@@ -164,6 +178,11 @@ class SynthPosePoseTracker:
                  sam3_store_masks=False,
                  sam3_show_realtime_masks=False,
                  sam3_save_ball_masks=False,
+                 sam3_inference_mode='image',
+                 sam3_bootstrap_frames=12,
+                 sam3_video_refresh_frequency=4,
+                 sam3_video_reseed_on_loss=True,
+                 sam3_video_loss_patience=3,
                  ball_detector_backend='same',
                  manual_person_roi=None,
                  manual_ball_roi=None):
@@ -217,6 +236,11 @@ class SynthPosePoseTracker:
         self.sam3_store_masks = bool(sam3_store_masks)
         self.sam3_show_realtime_masks = bool(sam3_show_realtime_masks)
         self.sam3_save_ball_masks = bool(sam3_save_ball_masks)
+        self.sam3_inference_mode = _normalize_sam3_inference_mode(sam3_inference_mode)
+        self.sam3_bootstrap_frames = max(1, int(sam3_bootstrap_frames))
+        self.sam3_video_refresh_frequency = max(1, int(sam3_video_refresh_frequency))
+        self.sam3_video_reseed_on_loss = bool(sam3_video_reseed_on_loss)
+        self.sam3_video_loss_patience = max(1, int(sam3_video_loss_patience))
         self.ball_detector_backend = _normalize_ball_detector_backend(
             ball_detector_backend,
             detector=detector,
@@ -231,6 +255,9 @@ class SynthPosePoseTracker:
         self.last_detections = self._empty_detections()
         self.sam3_detector = None
         self.sam3_ball_detector = None
+        self.video_input_kind = 'video'
+        self.video_file_path = None
+        self.video_frame_index_offset = 0
         self.detector = None
         self.detector_size = self._resolve_detector_size(
             detector_size,
@@ -283,11 +310,42 @@ class SynthPosePoseTracker:
                 self.det_frequency,
             )
             self._warned_ball_detection_cadence = True
+        if self.sam3_inference_mode == 'video' and not self._uses_secondary_sam3_ball_detector():
+            logging.warning(
+                "sam3_inference_mode='video' is currently supported only for the hybrid "
+                "ball path (ball_detector_backend='sam3'). Falling back to image mode."
+            )
+            self.sam3_inference_mode = 'image'
         
         # Load models
         self._load_models()
         
         logging.info(f'SynthPose ready. Output: 52 keypoints (17 COCO + 35 anatomical markers)')
+
+    def prepare_video_context(self, *, video_file_path=None, frame_range=None, input_kind='video'):
+        """Store file-video context for video-aware SAM3 modes."""
+        self.video_input_kind = str(input_kind or 'video').strip().lower()
+        self.video_file_path = str(video_file_path) if video_file_path is not None else None
+        if isinstance(frame_range, (list, tuple)) and len(frame_range) >= 1:
+            self.video_frame_index_offset = int(frame_range[0])
+        else:
+            self.video_frame_index_offset = 0
+        if self.sam3_ball_detector is not None and hasattr(self.sam3_ball_detector, 'prepare_video_context'):
+            self.sam3_ball_detector.prepare_video_context(
+                video_file_path=self.video_file_path,
+                frame_index_offset=self.video_frame_index_offset,
+                input_kind=self.video_input_kind,
+            )
+
+    def reset(self):
+        """Reset tracker runtime state for a new video session."""
+        self.frame_count = 0
+        self.prev_boxes = None
+        self.last_detections = self._empty_detections()
+        self._manual_person_roi_released = False
+        self._manual_ball_roi_released = False
+        if self.sam3_ball_detector is not None and hasattr(self.sam3_ball_detector, 'close'):
+            self.sam3_ball_detector.close()
 
     @staticmethod
     def _resolve_detector_size(size_value, detector='yolox'):
@@ -707,6 +765,34 @@ class SynthPosePoseTracker:
 
     def _load_sam3_ball_detector(self):
         '''Load a SAM3 detector dedicated to sports-ball prompts for hybrid person/ball mode.'''
+        if self.sam3_inference_mode == 'video':
+            self.sam3_ball_detector = Sam3VideoDetector(
+                model_path=self.sam3_model_path,
+                processor_path=self.sam3_processor_path,
+                runtime=self.sam3_runtime,
+                device=self.device,
+                prompts=BALL_ONLY_SAM3_PROMPTS,
+                store_masks=self.sam3_collect_masks,
+                person_threshold=self.person_threshold,
+                ball_detection_threshold=self.ball_detection_threshold,
+                bootstrap_frames=self.sam3_bootstrap_frames,
+                refresh_frequency=self.sam3_video_refresh_frequency,
+                reseed_on_loss=self.sam3_video_reseed_on_loss,
+                loss_patience=self.sam3_video_loss_patience,
+            )
+            self.sam3_ball_detector.prepare_video_context(
+                video_file_path=self.video_file_path,
+                frame_index_offset=self.video_frame_index_offset,
+                input_kind=self.video_input_kind,
+            )
+            logging.info(
+                "SAM3.1 sports-ball video detector loaded (runtime=%s, prompts=%s, bootstrap_frames=%s)",
+                self.sam3_ball_detector.runtime,
+                self.sam3_ball_detector.prompts,
+                self.sam3_bootstrap_frames,
+            )
+            return
+
         self.sam3_ball_detector = Sam3Detector(
             model_path=self.sam3_model_path,
             processor_path=self.sam3_processor_path,
@@ -1048,8 +1134,9 @@ class SynthPosePoseTracker:
             self.last_detections = dict(primary_meta or self._empty_detections())
 
         if self._uses_secondary_sam3_ball_detector():
-            ball_inference_roi = ball_roi
-            if ball_roi is not None:
+            uses_video_ball_detector = isinstance(getattr(self, 'sam3_ball_detector', None), Sam3VideoDetector)
+            ball_inference_roi = None if uses_video_ball_detector else ball_roi
+            if ball_roi is not None and not uses_video_ball_detector:
                 ball_inference_roi = expand_roi_with_context(
                     ball_roi,
                     frame.shape,
@@ -1058,7 +1145,7 @@ class SynthPosePoseTracker:
                 )
             ball_frame = crop_frame_to_roi(frame, ball_inference_roi)
             ball_meta = self._detect_balls_sam3(ball_frame)
-            if ball_inference_roi is not None:
+            if ball_inference_roi is not None and not uses_video_ball_detector:
                 ball_meta = offset_detection_meta_to_full_frame(ball_meta, ball_inference_roi)
             ball_meta = self._filter_ball_detection_meta_to_roi(ball_meta, ball_roi=ball_roi)
             if ball_roi is not None and len(self._ensure_xyxy_boxes(ball_meta.get('ball_boxes'))) > 0:
@@ -1241,6 +1328,12 @@ class SynthPosePoseTracker:
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(frame_rgb)
+        if isinstance(self.sam3_ball_detector, Sam3VideoDetector):
+            absolute_frame_idx = self.video_frame_index_offset + max(0, int(self.frame_count) - 1)
+            return self.sam3_ball_detector.detect(
+                pil_image,
+                frame_index=absolute_frame_idx,
+            ) or self._empty_detections()
         return self.sam3_ball_detector.detect(pil_image) or self._empty_detections()
 
     def _merge_secondary_ball_detections(self, ball_meta):

@@ -2247,6 +2247,79 @@ def test_synthpose_tracker_releases_manual_rois_after_first_acquisition():
     assert tracker._manual_ball_roi_released is True
 
 
+def test_synthpose_tracker_video_ball_detector_keeps_full_frame_boxes_under_ball_roi():
+    '''
+    Verify SAM3.1 video-mode ball detections are filtered by ball ROI without double offsetting full-frame boxes.
+    '''
+
+    from Sports2D.Utilities.sam3_video_detector import Sam3VideoDetector
+    from Sports2D.Utilities.synthpose_tracker import (
+        PERSON_CLASS_ID,
+        SPORTS_BALL_CLASS_ID,
+        SynthPosePoseTracker,
+    )
+
+    class FakeVideoBallDetector(Sam3VideoDetector):
+        def detect(self, pil_image, frame_index):
+            return {
+                'boxes': np.array([[100.0, 100.0, 120.0, 120.0], [0.0, 0.0, 10.0, 10.0]], dtype=np.float32),
+                'classes': np.array([SPORTS_BALL_CLASS_ID, SPORTS_BALL_CLASS_ID], dtype=np.int32),
+                'scores': np.array([0.8, 0.4], dtype=np.float32),
+                'person_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_boxes': np.array([[100.0, 100.0, 120.0, 120.0], [0.0, 0.0, 10.0, 10.0]], dtype=np.float32),
+                'ball_scores': np.array([0.8, 0.4], dtype=np.float32),
+                'class_names': np.array(['sports ball', 'sports ball'], dtype=object),
+                'prompt_indices': np.array([0, 0], dtype=np.int32),
+                'sam3_ball_meta': {},
+            }
+
+    tracker = SynthPosePoseTracker.__new__(SynthPosePoseTracker)
+    tracker.frame_count = 0
+    tracker.det_frequency = 1
+    tracker.prev_boxes = None
+    tracker.detect_ball = True
+    tracker.ball_detector_backend = 'sam3'
+    tracker.detector_type = 'yolox'
+    tracker.ball_class_ids = [SPORTS_BALL_CLASS_ID]
+    tracker.ball_detection_threshold = 0.1
+    tracker.sam3_collect_masks = False
+    tracker.last_detections = tracker._empty_detections()
+    tracker.manual_person_roi = None
+    tracker.manual_ball_roi = (100, 100, 120, 120)
+    tracker.video_frame_index_offset = 0
+    tracker._warned_shared_union_roi = False
+    tracker._manual_person_roi_released = False
+    tracker._manual_ball_roi_released = False
+    tracker.sam3_ball_detector = FakeVideoBallDetector.__new__(FakeVideoBallDetector)
+
+    def fake_detect_persons(frame, *_args):
+        tracker.last_detections = {
+            'boxes': np.array([[1.0, 2.0, 11.0, 22.0]], dtype=np.float32),
+            'classes': np.array([PERSON_CLASS_ID], dtype=np.int32),
+            'scores': np.array([0.9], dtype=np.float32),
+            'person_boxes': np.array([[1.0, 2.0, 11.0, 22.0]], dtype=np.float32),
+            'ball_boxes': np.empty((0, 4), dtype=np.float32),
+            'ball_scores': np.empty((0,), dtype=np.float32),
+            'class_names': np.empty((0,), dtype=object),
+            'prompt_indices': np.empty((0,), dtype=np.int32),
+            'sam3_ball_meta': {},
+        }
+        return np.array([[1.0, 2.0, 10.0, 20.0]], dtype=np.float32)
+
+    tracker._detect_persons = fake_detect_persons
+    tracker._estimate_poses = lambda pil_image, person_boxes: (
+        np.array([[[5.0, 6.0], [7.0, 8.0]]], dtype=np.float32),
+        np.array([[0.9, 0.85]], dtype=np.float32),
+    )
+
+    tracker(np.zeros((128, 160, 3), dtype=np.uint8))
+
+    assert np.allclose(
+        tracker.last_detections['ball_boxes'],
+        np.array([[100.0, 100.0, 120.0, 120.0]], dtype=np.float32),
+    )
+
+
 def test_resolve_sam3_runtime_auto_switches_raw_checkpoint_to_meta(tmp_path):
     '''
     Verify raw SAM3 checkpoints bypass processor_path and use the Meta runtime.
@@ -2353,6 +2426,11 @@ def test_default_config_exposes_sam3_settings():
 
     assert DEFAULT_CONFIG['pose']['sam3_target'] == 'ball'
     assert DEFAULT_CONFIG['pose']['sam3_runtime'] == 'transformers'
+    assert DEFAULT_CONFIG['pose']['sam3_inference_mode'] == 'image'
+    assert DEFAULT_CONFIG['pose']['sam3_bootstrap_frames'] == 12
+    assert DEFAULT_CONFIG['pose']['sam3_video_refresh_frequency'] == 4
+    assert DEFAULT_CONFIG['pose']['sam3_video_reseed_on_loss'] is True
+    assert DEFAULT_CONFIG['pose']['sam3_video_loss_patience'] == 3
     assert DEFAULT_CONFIG['pose']['ball_detector_backend'] == 'same'
     assert DEFAULT_CONFIG['pose']['sam3_show_realtime_masks'] is False
     assert DEFAULT_CONFIG['pose']['sam3_realtime_mask_alpha'] == pytest.approx(0.22)
@@ -2360,8 +2438,311 @@ def test_default_config_exposes_sam3_settings():
     assert 'sam3_target' in CONFIG_HELP
     assert 'sam3_model_path' in CONFIG_HELP
     assert 'sam3_processor_path' in CONFIG_HELP
+    assert 'sam3_inference_mode' in CONFIG_HELP
+    assert 'sam3_bootstrap_frames' in CONFIG_HELP
+    assert 'sam3_video_refresh_frequency' in CONFIG_HELP
+    assert 'sam3_video_reseed_on_loss' in CONFIG_HELP
+    assert 'sam3_video_loss_patience' in CONFIG_HELP
     assert 'sam3_show_realtime_masks' in CONFIG_HELP
     assert 'sam3_realtime_mask_alpha' in CONFIG_HELP
+
+
+def test_sam3_video_detector_prepare_video_context_downgrades_webcam(monkeypatch):
+    '''
+    Verify webcam input downgrades SAM3.1 video mode before any predictor session is created.
+    '''
+
+    from Sports2D.Utilities import sam3_video_detector as video_module
+
+    class FakeImageDetector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def detect(self, pil_image):
+            return {
+                'boxes': np.empty((0, 4), dtype=np.float32),
+                'classes': np.empty((0,), dtype=np.int32),
+                'scores': np.empty((0,), dtype=np.float32),
+                'person_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_scores': np.empty((0,), dtype=np.float32),
+                'class_names': np.empty((0,), dtype=object),
+                'prompt_indices': np.empty((0,), dtype=np.int32),
+            }
+
+    def fail_load():
+        raise AssertionError("video predictor should not load for webcam input")
+
+    monkeypatch.setattr(video_module, 'Sam3Detector', FakeImageDetector)
+    monkeypatch.setattr(video_module, '_load_meta_video_dependencies', fail_load)
+
+    detector = video_module.Sam3VideoDetector(
+        model_path='sam3.1.pt',
+        runtime='meta',
+        prompts=['sports ball'],
+    )
+    detector.prepare_video_context(video_file_path=None, frame_index_offset=0, input_kind='webcam')
+
+    assert detector.mode == detector.STATE_IMAGE_FALLBACK
+
+
+def test_sam3_video_detector_bootstrap_promotes_to_video_mode(monkeypatch):
+    '''
+    Verify a stable bootstrap seed starts a predictor-backed SAM3.1 segment.
+    '''
+
+    from Sports2D.Utilities import sam3_video_detector as video_module
+
+    class FakeImageDetector:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def detect(self, pil_image):
+            boxes = [
+                np.array([[10.0, 20.0, 20.0, 30.0]], dtype=np.float32),
+                np.array([[12.0, 21.0, 22.0, 31.0]], dtype=np.float32),
+            ]
+            box = boxes[min(self.calls, len(boxes) - 1)]
+            self.calls += 1
+            return {
+                'boxes': box.copy(),
+                'classes': np.array([32], dtype=np.int32),
+                'scores': np.array([0.9], dtype=np.float32),
+                'person_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_boxes': box.copy(),
+                'ball_scores': np.array([0.9], dtype=np.float32),
+                'class_names': np.array(['sports ball'], dtype=object),
+                'prompt_indices': np.array([0], dtype=np.int32),
+            }
+
+    class FakePredictor:
+        def handle_request(self, request):
+            if request['type'] == 'start_session':
+                return {'session_id': 'session-1'}
+            if request['type'] == 'add_prompt':
+                return {
+                    'frame_index': request['frame_index'],
+                    'outputs': {
+                        'out_boxes_xywh': np.array([[12.0, 21.0, 10.0, 10.0]], dtype=np.float32),
+                        'out_obj_ids': np.array([0], dtype=np.int32),
+                    },
+                }
+            if request['type'] == 'close_session':
+                return {'is_success': True}
+            raise AssertionError(f"unexpected request: {request}")
+
+        def handle_stream_request(self, request):
+            yield {
+                'frame_index': request['start_frame_index'],
+                'outputs': {
+                    'out_boxes_xywh': np.array([[12.0, 21.0, 10.0, 10.0]], dtype=np.float32),
+                    'out_obj_ids': np.array([0], dtype=np.int32),
+                },
+            }
+            yield {
+                'frame_index': request['start_frame_index'] + 1,
+                'outputs': {
+                    'out_boxes_xywh': np.array([[13.0, 22.0, 10.0, 10.0]], dtype=np.float32),
+                    'out_obj_ids': np.array([0], dtype=np.int32),
+                },
+            }
+
+        def shutdown(self):
+            return None
+
+    monkeypatch.setattr(video_module, 'Sam3Detector', FakeImageDetector)
+    monkeypatch.setattr(video_module, '_load_meta_video_dependencies', lambda: (lambda **kwargs: FakePredictor()))
+
+    detector = video_module.Sam3VideoDetector(
+        model_path='sam3.1.pt',
+        runtime='meta',
+        prompts=['sports ball'],
+        bootstrap_frames=12,
+    )
+    detector.prepare_video_context(video_file_path='demo.mp4', frame_index_offset=0, input_kind='video')
+
+    detector.detect(object(), frame_index=0)
+    frame1_meta = detector.detect(object(), frame_index=1)
+
+    assert detector.mode == detector.STATE_VIDEO_ACTIVE
+    assert frame1_meta['ball_boxes'].shape == (1, 4)
+
+
+def test_sam3_video_detector_falls_back_after_missing_predictions(monkeypatch):
+    '''
+    Verify repeated empty predictor outputs drop SAM3.1 video mode back to image fallback.
+    '''
+
+    from Sports2D.Utilities import sam3_video_detector as video_module
+
+    class FakeImageDetector:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def detect(self, pil_image):
+            self.calls += 1
+            return {
+                'boxes': np.empty((0, 4), dtype=np.float32),
+                'classes': np.empty((0,), dtype=np.int32),
+                'scores': np.empty((0,), dtype=np.float32),
+                'person_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_scores': np.empty((0,), dtype=np.float32),
+                'class_names': np.empty((0,), dtype=object),
+                'prompt_indices': np.empty((0,), dtype=np.int32),
+            }
+
+    class FakePredictor:
+        def handle_request(self, request):
+            if request['type'] == 'start_session':
+                return {'session_id': 'session-1'}
+            if request['type'] == 'add_prompt':
+                return {'frame_index': request['frame_index'], 'outputs': {}}
+            if request['type'] == 'close_session':
+                return {'is_success': True}
+            raise AssertionError(f"unexpected request: {request}")
+
+        def handle_stream_request(self, request):
+            while True:
+                yield {'frame_index': request['start_frame_index'] + 1, 'outputs': {}}
+
+        def shutdown(self):
+            return None
+
+    monkeypatch.setattr(video_module, 'Sam3Detector', FakeImageDetector)
+    monkeypatch.setattr(video_module, '_load_meta_video_dependencies', lambda: (lambda **kwargs: FakePredictor()))
+
+    detector = video_module.Sam3VideoDetector(
+        model_path='sam3.1.pt',
+        runtime='meta',
+        prompts=['sports ball'],
+        loss_patience=1,
+    )
+    detector.prepare_video_context(video_file_path='demo.mp4', frame_index_offset=0, input_kind='video')
+    detector._start_segment(seed_frame_idx=0, seed_box_xyxy=[10.0, 20.0, 20.0, 30.0])
+
+    detector.detect(object(), frame_index=1)
+
+    assert detector.mode == detector.STATE_IMAGE_FALLBACK
+
+
+def test_sam3_video_detector_prefers_image_metadata_during_short_predictor_miss(monkeypatch):
+    '''
+    Verify a short predictor miss returns image-mode metadata immediately before loss patience is exhausted.
+    '''
+
+    from Sports2D.Utilities import sam3_video_detector as video_module
+
+    class FakeImageDetector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def detect(self, pil_image):
+            box = np.array([[20.0, 30.0, 30.0, 40.0]], dtype=np.float32)
+            return {
+                'boxes': box.copy(),
+                'classes': np.array([32], dtype=np.int32),
+                'scores': np.array([0.7], dtype=np.float32),
+                'person_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_boxes': box.copy(),
+                'ball_scores': np.array([0.7], dtype=np.float32),
+                'class_names': np.array(['sports ball'], dtype=object),
+                'prompt_indices': np.array([0], dtype=np.int32),
+            }
+
+    class FakePredictor:
+        def handle_request(self, request):
+            if request['type'] == 'start_session':
+                return {'session_id': 'session-1'}
+            if request['type'] == 'add_prompt':
+                return {'frame_index': request['frame_index'], 'outputs': {}}
+            if request['type'] == 'close_session':
+                return {'is_success': True}
+            raise AssertionError(f"unexpected request: {request}")
+
+        def handle_stream_request(self, request):
+            yield {'frame_index': request['start_frame_index'] + 1, 'outputs': {}}
+
+        def shutdown(self):
+            return None
+
+    monkeypatch.setattr(video_module, 'Sam3Detector', FakeImageDetector)
+    monkeypatch.setattr(video_module, '_load_meta_video_dependencies', lambda: (lambda **kwargs: FakePredictor()))
+
+    detector = video_module.Sam3VideoDetector(
+        model_path='sam3.1.pt',
+        runtime='meta',
+        prompts=['sports ball'],
+        loss_patience=3,
+    )
+    detector.prepare_video_context(video_file_path='demo.mp4', frame_index_offset=0, input_kind='video')
+    detector._start_segment(seed_frame_idx=0, seed_box_xyxy=[10.0, 20.0, 20.0, 30.0])
+
+    meta = detector.detect(object(), frame_index=1)
+
+    assert detector.mode == detector.STATE_VIDEO_ACTIVE
+    assert meta['ball_boxes'].shape == (1, 4)
+
+
+def test_extract_video_outputs_derives_boxes_from_masks_without_name_error():
+    '''
+    Verify mask-only video outputs recover boxes from masks instead of raising NameError.
+    '''
+
+    from Sports2D.Utilities.sam3_common import extract_video_outputs
+
+    mask = np.zeros((1, 8, 8), dtype=np.uint8)
+    mask[0, 2:6, 3:7] = 1
+
+    boxes, scores, masks, obj_ids = extract_video_outputs(
+        {
+            'out_binary_masks': mask,
+            'out_obj_ids': np.array([0], dtype=np.int32),
+        }
+    )
+
+    assert boxes.shape == (1, 4)
+    assert masks[0].shape == (8, 8)
+    assert obj_ids.tolist() == [0]
+
+
+def test_sam3_video_detector_prepare_video_context_raises_on_missing_meta_runtime(monkeypatch):
+    '''
+    Verify video-mode preparation fails fast with a clear ImportError when Meta predictor support is unavailable.
+    '''
+
+    from Sports2D.Utilities import sam3_video_detector as video_module
+
+    class FakeImageDetector:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def detect(self, pil_image):
+            return {
+                'boxes': np.empty((0, 4), dtype=np.float32),
+                'classes': np.empty((0,), dtype=np.int32),
+                'scores': np.empty((0,), dtype=np.float32),
+                'person_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_boxes': np.empty((0, 4), dtype=np.float32),
+                'ball_scores': np.empty((0,), dtype=np.float32),
+                'class_names': np.empty((0,), dtype=object),
+                'prompt_indices': np.empty((0,), dtype=np.int32),
+            }
+
+    def fail_load():
+        raise ImportError("missing build_sam3_video_predictor")
+
+    monkeypatch.setattr(video_module, 'Sam3Detector', FakeImageDetector)
+    monkeypatch.setattr(video_module, '_load_meta_video_dependencies', fail_load)
+
+    detector = video_module.Sam3VideoDetector(
+        model_path='sam3.1.pt',
+        runtime='meta',
+        prompts=['sports ball'],
+    )
+
+    with pytest.raises(ImportError):
+        detector.prepare_video_context(video_file_path='demo.mp4', frame_index_offset=0, input_kind='video')
 
 
 def test_default_config_exposes_manual_roi_settings():

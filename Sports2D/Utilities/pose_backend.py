@@ -168,6 +168,10 @@ class PoseBackend(ABC):
         """
         return {}
 
+    def prepare_video_context(self, video_file_path=None, frame_range=None, input_kind='video') -> None:
+        """Optional hook for backends that need file-video context."""
+        return None
+
 
 class _StaticPersonROITracker:
     """Crop person inference to a static ROI and restore full-frame keypoints."""
@@ -749,6 +753,11 @@ class SynthPoseBackend(PoseBackend):
             sam3_store_masks=bool(pose_config.get('sam3_store_masks', False)),
             sam3_show_realtime_masks=show_realtime_sam3_masks,
             sam3_save_ball_masks=False,
+            sam3_inference_mode=pose_config.get('sam3_inference_mode', 'image'),
+            sam3_bootstrap_frames=pose_config.get('sam3_bootstrap_frames', 12),
+            sam3_video_refresh_frequency=pose_config.get('sam3_video_refresh_frequency', pose_config.get('det_frequency', 4)),
+            sam3_video_reseed_on_loss=bool(pose_config.get('sam3_video_reseed_on_loss', True)),
+            sam3_video_loss_patience=pose_config.get('sam3_video_loss_patience', 3),
             ball_detector_backend=pose_config.get('ball_detector_backend', 'same'),
             manual_person_roi=pose_config.get('_manual_person_roi'),
             manual_ball_roi=pose_config.get('_manual_ball_roi'),
@@ -776,9 +785,21 @@ class SynthPoseBackend(PoseBackend):
 
     def reset(self) -> None:
         """Reset tracker state."""
-        self._tracker.frame_count = 0
-        self._tracker.prev_boxes = None
+        if hasattr(self._tracker, 'reset'):
+            self._tracker.reset()
+        else:
+            self._tracker.frame_count = 0
+            self._tracker.prev_boxes = None
         self._last_detections = {}
+
+    def prepare_video_context(self, video_file_path=None, frame_range=None, input_kind='video') -> None:
+        """Forward file-video context to the tracker when supported."""
+        if hasattr(self._tracker, 'prepare_video_context'):
+            self._tracker.prepare_video_context(
+                video_file_path=video_file_path,
+                frame_range=frame_range,
+                input_kind=input_kind,
+            )
 
     @property
     def skeleton_tree(self):

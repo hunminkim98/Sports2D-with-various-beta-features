@@ -4363,6 +4363,13 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             logging.error(f'Error: Pose estimation backend initialization failed: {e}')
             raise ValueError(f'Error: Pose estimation backend initialization failed: {e}')
 
+        if hasattr(pose_tracker, 'prepare_video_context'):
+            pose_tracker.prepare_video_context(
+                video_file_path=video_file_path if video_file != 'webcam' else None,
+                frame_range=frame_range,
+                input_kind='webcam' if video_file == 'webcam' else 'video',
+            )
+
         keypoints_names = list(getattr(pose_tracker, 'keypoint_names', []) or [])
         if len(keypoints_names) == 0:
             indexed_names = sorted(
