@@ -16,6 +16,18 @@
   - `manual_roi=true`이면 inference 전에 static person ROI를 먼저 선택합니다.
   - `detect_ball=true`일 때는 ball ROI도 따로 선택하며, `ball_detector_backend='sam3'`이면 person ROI와 ball ROI를 분리해서 씁니다.
   - shared-detector 경로는 person/ball 둘 다 놓치지 않도록 선택된 ROI의 union으로 fallback 합니다.
+- 2026-04-03: `pose.manual_roi_mode='adaptive_person'` 설정이 추가되었습니다.
+  - 기존 `manual_roi=true`의 기본 동작은 그대로 `bootstrap`이며, 초기 획득 후 full-frame으로 복귀합니다.
+  - `adaptive_person`은 manually selected person ROI를 계속 유지하면서 accepted full-frame person detections 기준으로 ROI를 매 detection pass마다 갱신합니다.
+  - 이 모드는 `manual_roi=true`가 있어야 활성화되며, `load_trc_px`에서는 무시됩니다.
+  - v1 범위는 person ROI 전용입니다. `detect_ball=true`이면서 SynthPose shared detector (`ball_detector_backend='same'`)를 쓰는 조합은 warning 후 `bootstrap`으로 fallback 합니다.
+- 2026-04-04: 별도 `knee valgus/varus` angle surface를 제거했습니다.
+  - 이제 public `joint_angles`에는 기존 `Right/Left knee`만 남습니다.
+  - `Right/Left knee valgus/varus`는 demo config, help text, README, utility registry에서 제거했습니다.
+  - 기존 Sports2D의 `knee angle` 구현은 그대로 유지합니다.
+- 2026-04-04: `motion.vertical_jump=true` 이면서 `visible_side='front'`인 경우 `Right knee` 각도의 부호를 반전합니다.
+  - front view vertical jump 분석에서는 `Right knee`가 `valgus = -`, `varus = +`가 되도록 맞췄습니다.
+  - 이 규칙은 `Right knee`에만 적용되며, `vertical_jump=false` 또는 다른 visible side에서는 기존 부호를 유지합니다.
 - 2026-03-29: `pose.draw_keypoint_likelihood_threshold`, `pose.draw_skeleton_likelihood_threshold` 설정이 추가되었습니다.
   - 둘 다 표시 전용 threshold이며, pose filtering/export/angle 계산 기준인 `keypoint_likelihood_threshold`와는 별개입니다.
   - `draw_keypoint_likelihood_threshold`는 키포인트 마커 표시 여부만 제어합니다.
