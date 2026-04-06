@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-03-10 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-04-05 -->
 
 # AGENTS.md
 
@@ -8,7 +8,7 @@
 - See `../AGENTS.md` for repository and package defaults.
 
 ## Scope
-- Governs demo configs, command examples, and sample outputs under `Sports2D/Demo`.
+- Governs demo configs, command examples, and checked-in sample media under `Sports2D/Demo`.
 
 ## Scope-specific rules
 - Keep demo config files as executable examples.
@@ -20,30 +20,28 @@
 - Pair config changes with `process.py`/`Sports2D.py` behavior changes where needed.
 
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-03-10
+Last reviewed: 2026-04-05
 
 ## Purpose
-Demo and sample-data directory for Sports2D. It mixes hand-maintained configuration files and raw sample videos with many generated result bundles that demonstrate expected outputs. Recent generated bundles now include `pose_ball/` JSON artifacts when `detect_ball=true` and `save_pose=true`.
+Demo and sample-data directory for Sports2D. Hand-maintained inputs here are the config and calibration examples plus a few raw media files. Generated `*_Sports2D/` bundles, nested `pose_ball/`, logs, caches, and similar local-run folders are parent-covered artifacts, excluded from AGENTS scoring, and should not get child AGENTS files.
 
 ## Key Files
 | File | Description |
 |------|-------------|
-| `Config_demo.toml` | Canonical example configuration covering base, pose, calibration, output, hybrid ball detection, and optional backend settings. |
+| `Config_demo.toml` | Canonical example configuration covering CLI defaults, calibration, output, hybrid ball detection, and optional backend settings. |
 | `Calib_demo.toml` | Example calibration data used by demo and perspective-conversion flows. |
-| `nfl.mp4` | Short sample input video used for football-style demo runs. |
-| `logs.txt` | Local run log output from demo executions; useful for debugging but not a source of truth. |
+| `최서현_re.mp4` | Checked-in local demo clip used for recent manual smoke runs. |
 
 ## Subdirectories
 | Directory | Purpose |
 |-----------|---------|
-| `20260220/` | Raw sample capture set containing `.MOV` and `.mp4` inputs from 2026-02-20. |
-| `메디신볼/` | Raw medicine-ball capture set used for local testing. |
-| `*_Sports2D/` | Generated output bundles containing rendered video, `.trc`, `.mot`, `.c3d`, `pose_ball/` JSON files, calibration files, and optional graph assets. |
+| `*_Sports2D/` | Generated output bundles containing rendered video, `.trc`, `.mot`, optional `.c3d`, nested `pose_ball/`, calibration files, and other export artifacts. Parent-covered, excluded from scoring, no child `AGENTS.md`. |
+| `*_오류/` and similar local-run folders | Scratch or troubleshooting directories. Keep parent-covered and unscored unless a task explicitly targets them. |
 
 ## For AI Agents
 
 ### Working In This Directory
-- Edit the hand-maintained TOML configs and raw inputs intentionally; avoid bulk changes inside generated `*_Sports2D/` result folders, including `pose_ball/`, unless the task is explicitly about artifacts.
+- Edit the hand-maintained TOML configs and raw inputs intentionally; generated `*_Sports2D/` bundles, nested `pose_ball/`, logs, caches, and similar local-run folders stay parent-covered artifacts and should not sprout child `AGENTS.md` files.
 - Keep demo examples path-agnostic so the default `sports2d` smoke run remains portable across machines.
 
 ### Testing Requirements

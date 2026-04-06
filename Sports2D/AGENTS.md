@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-03-10 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-04-05 -->
 
 # AGENTS.md
 
@@ -8,7 +8,7 @@
 - See `../AGENTS.md` for repository defaults.
 
 ## Scope
-- Applies to core code under `Sports2D/` including Python modules and package entry points.
+- Applies to shipped runtime code under `Sports2D/` including Python modules and package entry points.
 - Prioritize behavior-safe changes in the processing path (`Sports2D.py`, `process.py`).
 
 ## Core constraints
@@ -22,10 +22,10 @@
 - Run `flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics` before finalizing.
 - Add changelog notes or inline rationale when touching dependency/feature boundaries.
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-03-10
+Last reviewed: 2026-04-05
 
 ## Purpose
-Active Python package root for the published Sports2D CLI and processing pipeline. This directory owns the runtime API, configuration defaults, demo bundle, utility modules, and model-integration notes. It now also defines hybrid YOLOX+SAM3 ball handling and the saved `pose_ball/` plus TRC ball-marker export behavior.
+Shipped runtime source of truth for the published Sports2D CLI and processing pipeline. This directory owns the runtime API, configuration defaults, demo bundle, utility modules, and packaged model-integration notes. It also defines hybrid YOLOX+SAM3 ball handling plus saved `pose_ball/` and TRC ball-marker export behavior.
 
 ## Key Files
 | File | Description |
@@ -39,13 +39,14 @@ Active Python package root for the published Sports2D CLI and processing pipelin
 |-----------|---------|
 | `Demo/` | Demo config files, raw sample media, and generated example outputs (see `Demo/AGENTS.md`). |
 | `Utilities/` | Shared helpers, backend abstraction, realtime display helpers, and test coverage (see `Utilities/AGENTS.md`). |
-| `models/` | Model asset notes and detector-specific vendor guidance (see `models/AGENTS.md`). |
+| `models/` | Packaged model subtree and detector-specific vendor guidance, distinct from the root-level `models/` stash (see `models/AGENTS.md`). |
 
 ## For AI Agents
 
 ### Working In This Directory
 - Keep `Sports2D.py`, `process.py`, `Demo/Config_demo.toml`, and `README.md` aligned when adding or renaming CLI/config options or changing output bundle contents.
 - Treat `process.py` as the behavioral hot path: prefer small, isolated edits and verify optional-backend imports remain lazy where intended.
+- Let `Demo/` and `Utilities/` child AGENTS own their source scopes; generated run artifacts beneath them stay parent-covered, not new AGENTS domains.
 
 ### Testing Requirements
 - Use `pytest -v Sports2D/Utilities/tests.py` after logic changes.

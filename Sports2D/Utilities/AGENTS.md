@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-03-10 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-04-05 -->
 
 # AGENTS.md
 
@@ -22,10 +22,10 @@
 - Use `pytest -v Sports2D/Utilities/tests.py` as the baseline for utility changes.
 - Keep error messages explicit for optional dependencies (for example missing SynthPose extras).
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-03-10
+Last reviewed: 2026-04-05
 
 ## Purpose
-Shared utility layer for the Sports2D runtime. This folder contains backend abstraction, skeleton metadata, tracking helpers, realtime-display adapters, SAM3 detector plumbing, common math/output helpers, and the main automated test module.
+Shared utility layer for the Sports2D runtime. This folder contains backend abstraction, skeleton metadata, tracking and review helpers, realtime-display adapters, SAM3 plumbing, common math/output helpers, and the main automated test module. Checked-in `*_Sports2D/` bundles, logs, caches, and any nested `pose_ball/` exports here are parent-covered artifacts, excluded from AGENTS scoring, and not child domains.
 
 ## Key Files
 | File | Description |
@@ -43,14 +43,13 @@ Shared utility layer for the Sports2D runtime. This folder contains backend abst
 ## Subdirectories
 | Directory | Purpose |
 |-----------|---------|
-| `IMG_*_Sports2D/` | Generated result bundles from utility or backend smoke runs; treat as artifacts, not source. |
-| `강원피스톤_테스트_Sports2D/` | Local result bundle for a named test run; also artifact-only. |
+| `*_Sports2D/` | Generated smoke-test or local-run result bundles, including nested `pose_ball/`, videos, TRCs, MOTs, and plots. Parent-covered, excluded from scoring, no child `AGENTS.md`. |
 
 ## For AI Agents
 
 ### Working In This Directory
 - Keep backend-specific imports behind `pose_backend.py` and tracker helpers unless a broader API migration is deliberate.
-- Treat `logs.txt*` and result folders as disposable runtime artifacts; they should not become hidden dependencies for tests.
+- Treat `logs.txt*`, `__pycache__/`, generated `*_Sports2D/` bundles, nested `pose_ball/`, and similar local-run folders as disposable parent-covered artifacts; they should not become hidden dependencies for tests or get child `AGENTS.md` files.
 
 ### Testing Requirements
 - Update or extend `tests.py` when behavior, signatures, defaults, or export-helper contracts change in utility modules.

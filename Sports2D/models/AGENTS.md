@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-02-13 | Updated: 2026-03-10 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-04-05 -->
 
 # AGENTS.md
 
@@ -8,7 +8,7 @@
 - See `../AGENTS.md` for repository defaults.
 
 ## Scope
-- Governs model assets and model loader integrations under `Sports2D/models`.
+- Governs packaged model assets and model loader integrations under `Sports2D/models`.
 - Treat this area as binary-heavy and operationally constrained.
 
 ## Constraints
@@ -21,10 +21,10 @@
 - Keep changes here limited to metadata and reference docs unless runtime is being deliberately changed.
 - Validate import/loading paths when touch points affect runtime model loading.
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-03-10
+Last reviewed: 2026-04-05
 
 ## Purpose
-Model-asset staging area for detector integrations that are too large or too vendor-specific to live in the main Python source tree. Most changes here should be metadata, setup notes, or clearly intentional binary drops. The tree now includes SAM3 checkpoint staging alongside RT-DETRv4 notes.
+Packaged model subtree for detector integrations that are too large or too vendor-specific to live in the main Python source tree. This is distinct from the repository-root `models/` stash, which is only a local artifact area. Most changes here should be metadata, setup notes, or clearly intentional binary drops. The tree includes SAM3 checkpoint staging alongside RT-DETRv4 notes.
 
 ## Key Files
 | File | Description |
@@ -43,6 +43,7 @@ Model-asset staging area for detector integrations that are too large or too ven
 ### Working In This Directory
 - Document provenance, expected filenames, and setup steps whenever model-related paths change.
 - Prefer README/config updates over binary churn; only add or replace weights when the task explicitly requires it.
+- Do not confuse this packaged subtree with the root `models/` directory, which is not part of this AGENTS domain.
 
 ### Testing Requirements
 - After path or naming changes, confirm the runtime lookup logic in `Sports2D/Utilities/synthpose_tracker.py` still points at the documented locations.

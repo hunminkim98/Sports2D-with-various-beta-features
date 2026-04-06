@@ -1,4 +1,4 @@
-<!-- Generated: 2026-02-13 | Updated: 2026-03-10 -->
+<!-- Generated: 2026-02-13 | Updated: 2026-04-05 -->
 
 # AGENTS.md
 
@@ -19,21 +19,21 @@
 - Never commit secrets, local credentials, or machine-specific test artifacts.
 
 ## Directory ownership model
-- `Sports2D/` contains core library and execution pipeline.
-- `SynthPose_PM/` is an optional subproject with separate runtime expectations.
+- `Sports2D/` is the shipped runtime source of truth, core library, and execution pipeline.
 - `Content/` is artifact and media-only.
-- `build/` is generated packaging output.
 - `.github/` owns automation and release workflows.
+- `models/` is a local artifact stash, currently `models/sam3.1_multiplex.pt`, not a separate AGENTS domain.
+- `src/` is an inactive scaffold, parent-covered unless it becomes tracked runtime source.
 
 ## Maintenance policy
 - Keep each AGENTS file concise and scoped.
 - Preserve manual sections across regeneration.
 - Use stable headings so future tooling can update safely.
 <!-- AUTO-GENERATED SECTION -->
-Last reviewed: 2026-03-10
+Last reviewed: 2026-04-05
 
 ## Purpose
-Repository root for packaging metadata, user-facing documentation, CI entry points, and high-level agent guidance. Shipped runtime code lives in `Sports2D/`; the other top-level directories mainly support workflows, publication assets, or currently inactive scaffolding. Recent backend work added hybrid SAM3 ball detection, `pose_ball/` result artifacts, and expanded model/runtime guidance that is documented from here downward.
+Repository root for packaging metadata, user-facing documentation, CI entry points, and high-level agent guidance. `Sports2D/` is the shipped runtime source of truth; the other top-level paths here are support material, local artifact stash, or inactive scaffold. Recent backend work added hybrid SAM3 ball detection and `pose_ball/` result artifacts that are documented from here downward.
 
 ## Key Files
 | File | Description |
@@ -52,7 +52,8 @@ Repository root for packaging metadata, user-facing documentation, CI entry poin
 | `.github/` | GitHub Actions workflows and release automation (see `.github/AGENTS.md`). |
 | `Content/` | Paper sources and media assets used by docs/publication flows (see `Content/AGENTS.md`). |
 | `Sports2D/` | Published Python package, CLI, processing pipeline, demo assets, and model notes (see `Sports2D/AGENTS.md`). |
-| `src/` | Placeholder clean-architecture scaffold with no tracked runtime source files today (see `src/AGENTS.md`). |
+| `models/` | Local artifact stash, currently only `sam3.1_multiplex.pt`; not an AGENTS-covered domain. |
+| `src/` | Inactive clean-architecture scaffold placeholder; no local `AGENTS.md`. |
 
 ## For AI Agents
 
@@ -86,12 +87,13 @@ Covered AGENTS files:
 - `Sports2D/models/AGENTS.md`
 - `Sports2D/models/sam3/AGENTS.md`
 - `Sports2D/models/rtdetrv4/AGENTS.md`
-- `src/AGENTS.md`
 
-Skipped generated or runtime-state directories:
-- `.omx/`, `.pytest_cache/`, `.sisyphus/`, `sports2d.egg-info/`, and `**/__pycache__/`
-- Empty placeholder model directory `Sports2D/models/RT-DETRv4/`
+Parent-covered / excluded from scoring:
+- `src/` remains an inactive scaffold with no local `AGENTS.md`.
+- Root `models/` is a local artifact stash, currently `models/sam3.1_multiplex.pt`, not its own AGENTS domain.
+- Generated or runtime-state paths such as `.omx/`, `.pytest_cache/`, `.sisyphus/`, `sports2d.egg-info/`, `**/__pycache__/`, top-level local-run folders, and nested result artifacts like `*_Sports2D/`, `pose_ball/`, logs, and caches stay parent-covered and do not get child `AGENTS.md` files.
+- `Sports2D/models/RT-DETRv4/` stays a placeholder until intentionally populated.
 
 Suggested upkeep:
 - Refresh the covered list whenever AGENTS files are added or removed.
-- Reassess `src/` coverage only if tracked source files are added there.
+- Only promote placeholder or artifact areas into new AGENTS domains when they become real tracked source.
