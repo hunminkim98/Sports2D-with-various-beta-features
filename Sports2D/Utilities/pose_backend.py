@@ -28,9 +28,13 @@ import numpy as np
 import logging
 
 from Sports2D.Utilities.manual_roi import (
+    boxes_outside_rois,
     crop_frame_to_roi,
+    expand_roi_xyxy,
+    normalize_manual_roi_mode,
     offset_keypoints_to_full_frame,
     offset_xyxy_boxes_to_full_frame,
+    roi_from_boxes_xyxy,
 )
 
 
@@ -199,6 +203,139 @@ class _StaticPersonROITracker:
             self._pose_tracker.reset()
 
 
+class _AdaptivePersonROITracker:
+    """Crop person inference to a mutable ROI that follows accepted person detections."""
+
+    def __init__(
+        self,
+        pose_tracker,
+        person_roi: Sequence[int],
+        tracking_margin_px: int = 48,
+        reacquire_patience: int = 6,
+        reacquire_frequency: int = 15,
+    ):
+        self._pose_tracker = pose_tracker
+        self._seed_person_roi = tuple(int(v) for v in person_roi)
+        self._tracking_margin_px = max(0, int(tracking_margin_px))
+        self._reacquire_patience = max(1, int(reacquire_patience))
+        self._reacquire_frequency = max(1, int(reacquire_frequency))
+        self.reset()
+
+    @staticmethod
+    def _person_boxes_from_keypoints(keypoints) -> np.ndarray:
+        kpts = np.asarray(keypoints, dtype=np.float32)
+        if kpts.size == 0 or kpts.ndim != 3 or kpts.shape[-1] < 2:
+            return np.empty((0, 4), dtype=np.float32)
+        person_boxes = []
+        for person_kpts in kpts:
+            valid = ~np.isnan(person_kpts[:, 0]) & ~np.isnan(person_kpts[:, 1])
+            if not np.any(valid):
+                continue
+            xs = person_kpts[valid, 0]
+            ys = person_kpts[valid, 1]
+            person_boxes.append([np.min(xs), np.min(ys), np.max(xs), np.max(ys)])
+        if not person_boxes:
+            return np.empty((0, 4), dtype=np.float32)
+        return np.asarray(person_boxes, dtype=np.float32)
+
+    def _should_force_full_frame_reacquire(self) -> bool:
+        if self._person_roi_miss_count < self._reacquire_patience:
+            return False
+        if self._last_full_frame_reacquire_frame is None:
+            return True
+        return (self._frame_count - self._last_full_frame_reacquire_frame) >= self._reacquire_frequency
+
+    def _tracker_uses_detection_cadence(self) -> bool:
+        return hasattr(self._pose_tracker, 'frame_cnt') and hasattr(self._pose_tracker, 'det_frequency')
+
+    def _tracker_will_run_detection(self) -> bool:
+        if not self._tracker_uses_detection_cadence():
+            return True
+        det_frequency = max(1, int(getattr(self._pose_tracker, 'det_frequency', 1)))
+        frame_cnt = int(getattr(self._pose_tracker, 'frame_cnt', 0))
+        return frame_cnt % det_frequency == 0
+
+    def _clear_tracker_local_state(self) -> None:
+        if hasattr(self._pose_tracker, 'bboxes_last_frame'):
+            self._pose_tracker.bboxes_last_frame = []
+        if hasattr(self._pose_tracker, 'track_ids_last_frame'):
+            self._pose_tracker.track_ids_last_frame = []
+
+    def _schedule_next_roi(self, roi) -> None:
+        if roi is None:
+            return
+        next_roi = tuple(int(v) for v in roi)
+        if self._tracker_uses_detection_cadence():
+            self._pending_person_roi = next_roi
+        else:
+            self._active_person_roi = next_roi
+            self._pending_person_roi = None
+
+    def _apply_pending_roi_if_needed(self) -> None:
+        if self._pending_person_roi is None:
+            return
+        self._active_person_roi = self._pending_person_roi
+        self._pending_person_roi = None
+
+    def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        frame_shape = frame.shape
+        tracker_runs_detection = self._tracker_will_run_detection()
+        if tracker_runs_detection:
+            self._apply_pending_roi_if_needed()
+        force_full_frame = tracker_runs_detection and self._should_force_full_frame_reacquire()
+        if tracker_runs_detection:
+            inference_roi = None if force_full_frame else roi_from_boxes_xyxy(
+                [self._active_person_roi],
+                frame_shape,
+                padding_px=0,
+            ) if self._active_person_roi is not None else None
+        else:
+            inference_roi = self._last_inference_roi
+
+        if tracker_runs_detection and inference_roi != self._last_inference_roi:
+            self._clear_tracker_local_state()
+
+        keypoints, scores = self._pose_tracker(crop_frame_to_roi(frame, inference_roi))
+        if inference_roi is not None:
+            keypoints = offset_keypoints_to_full_frame(keypoints, inference_roi)
+        self._last_inference_roi = inference_roi
+
+        if tracker_runs_detection:
+            person_boxes = self._person_boxes_from_keypoints(keypoints)
+            if len(person_boxes) > 0:
+                updated_roi = roi_from_boxes_xyxy(
+                    person_boxes,
+                    frame_shape,
+                    padding_px=self._tracking_margin_px,
+                )
+                self._schedule_next_roi(updated_roi)
+                self._person_roi_miss_count = 0
+            elif inference_roi is not None:
+                self._person_roi_miss_count += 1
+                self._schedule_next_roi(
+                    expand_roi_xyxy(
+                        self._active_person_roi,
+                        frame_shape,
+                        padding_px=self._tracking_margin_px,
+                    )
+                )
+            if force_full_frame:
+                self._last_full_frame_reacquire_frame = self._frame_count
+
+        self._frame_count += 1
+        return keypoints, scores
+
+    def reset(self) -> None:
+        self._active_person_roi = tuple(int(v) for v in self._seed_person_roi)
+        self._pending_person_roi = None
+        self._person_roi_miss_count = 0
+        self._last_full_frame_reacquire_frame = None
+        self._last_inference_roi = None
+        self._frame_count = 0
+        if hasattr(self._pose_tracker, 'reset'):
+            self._pose_tracker.reset()
+
+
 class _RTMLibBallAwareTracker:
     """
     Wrapper tracker that preserves standard RTMLib person pose behavior and
@@ -230,6 +367,7 @@ class _RTMLibBallAwareTracker:
         ball_detection_threshold: float = 0.1,
         ball_nms_score_threshold: float = 0.2,
         ball_roi: Optional[Sequence[int]] = None,
+        ball_ignore_zones=None,
     ):
         from rtmlib import YOLOX
 
@@ -239,6 +377,7 @@ class _RTMLibBallAwareTracker:
         self._frame_count = 0
         self._ball_class_ids = set(ball_class_ids or [SPORTS_BALL_CLASS_ID])
         self._ball_roi = tuple(int(v) for v in ball_roi) if ball_roi is not None else None
+        self._ball_ignore_zones = self._normalize_runtime_rois(ball_ignore_zones)
         self._ball_roi_released = False
         self.last_detections: Dict[str, np.ndarray] = self._empty_detections()
 
@@ -289,6 +428,38 @@ class _RTMLibBallAwareTracker:
         if boxes.shape[1] < 4:
             return np.empty((0, 4), dtype=np.float32)
         return boxes[:, :4].astype(np.float32, copy=False)
+
+    @staticmethod
+    def _normalize_runtime_rois(rois):
+        """Normalize runtime ignore-zone payloads to xyxy integer tuples."""
+        normalized = []
+        for roi in rois or []:
+            arr = np.asarray(roi, dtype=np.float32).reshape(-1)
+            if arr.size != 4 or not np.all(np.isfinite(arr)):
+                continue
+            normalized.append(tuple(int(round(v)) for v in arr.tolist()))
+        return normalized
+
+    def _filter_ignored_ball_detections(self, boxes, classes, scores):
+        """Remove ball detections whose boxes overlap any configured ignore zone."""
+        boxes = self._ensure_xyxy(boxes)
+        classes = np.asarray(classes, dtype=np.int32).reshape(-1)
+        scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+        ignore_zones = getattr(self, '_ball_ignore_zones', None) or []
+        if len(ignore_zones) == 0 or len(boxes) == 0:
+            return boxes, classes, scores
+        if len(classes) != len(boxes):
+            return boxes, classes, scores
+        if len(scores) != len(boxes):
+            scores = np.full((len(boxes),), np.nan, dtype=np.float32)
+
+        ball_mask = np.isin(classes, list(self._ball_class_ids))
+        if not np.any(ball_mask):
+            return boxes, classes, scores
+
+        keep_mask = np.ones((len(boxes),), dtype=bool)
+        keep_mask[ball_mask] = boxes_outside_rois(boxes[ball_mask], ignore_zones)
+        return boxes[keep_mask], classes[keep_mask], scores[keep_mask]
 
     @staticmethod
     def _person_boxes_from_keypoints(keypoints) -> np.ndarray:
@@ -357,6 +528,12 @@ class _RTMLibBallAwareTracker:
             scores = np.full((len(boxes),), np.nan, dtype=np.float32)
         if not getattr(self, '_ball_roi_released', False) and self._ball_roi is not None and len(boxes) > 0:
             boxes = offset_xyxy_boxes_to_full_frame(boxes, self._ball_roi)
+        boxes, classes, scores = self._filter_ignored_ball_detections(
+            boxes,
+            classes,
+            scores,
+        )
+        if not getattr(self, '_ball_roi_released', False) and self._ball_roi is not None and len(boxes) > 0:
             self._ball_roi_released = True
         return boxes, classes, scores
 
@@ -445,6 +622,24 @@ class RTMLibBackend(PoseBackend):
         detect_ball = bool(pose_config.get('detect_ball', False))
         manual_person_roi = pose_config.get('_manual_person_roi')
         manual_ball_roi = pose_config.get('_manual_ball_roi') or manual_person_roi
+        manual_roi_mode = normalize_manual_roi_mode(
+            pose_config.get('manual_roi_mode', 'bootstrap'),
+        )
+        manual_roi_tracking_margin_px = max(
+            0,
+            int(pose_config.get('manual_roi_tracking_margin_px', 48)),
+        )
+        manual_roi_reacquire_patience = max(
+            1,
+            int(pose_config.get('manual_roi_reacquire_patience', 6)),
+        )
+        manual_roi_reacquire_frequency = max(
+            1,
+            int(pose_config.get('manual_roi_reacquire_frequency', 15)),
+        )
+        manual_ball_ignore_zones = _RTMLibBallAwareTracker._normalize_runtime_rois(
+            pose_config.get('_manual_ball_ignore_zones'),
+        )
         ball_class_ids = pose_config.get('ball_class_ids', [SPORTS_BALL_CLASS_ID])
         ball_detection_threshold = pose_config.get(
             'ball_detection_threshold',
@@ -461,6 +656,12 @@ class RTMLibBackend(PoseBackend):
                 ball_class_ids = [int(c) for c in ball_class_ids]
             except Exception:
                 ball_class_ids = [SPORTS_BALL_CLASS_ID]
+
+        if manual_roi_mode == 'adaptive_person' and manual_person_roi is None:
+            logging.warning(
+                "manual_roi_mode='adaptive_person' requires a manual person ROI. Falling back to bootstrap."
+            )
+            manual_roi_mode = 'bootstrap'
 
         # Cache keypoint names and count
         self._keypoint_names = _keypoint_names_in_output_order(self._pose_model)
@@ -488,7 +689,15 @@ class RTMLibBackend(PoseBackend):
         if detect_ball:
             try:
                 default_tracker = _init_default_tracker()
-                if manual_person_roi is not None:
+                if manual_person_roi is not None and manual_roi_mode == 'adaptive_person':
+                    default_tracker = _AdaptivePersonROITracker(
+                        pose_tracker=default_tracker,
+                        person_roi=manual_person_roi,
+                        tracking_margin_px=manual_roi_tracking_margin_px,
+                        reacquire_patience=manual_roi_reacquire_patience,
+                        reacquire_frequency=manual_roi_reacquire_frequency,
+                    )
+                elif manual_person_roi is not None:
                     default_tracker = _StaticPersonROITracker(
                         pose_tracker=default_tracker,
                         person_roi=manual_person_roi,
@@ -504,6 +713,7 @@ class RTMLibBackend(PoseBackend):
                     ball_detection_threshold=ball_detection_threshold,
                     ball_nms_score_threshold=ball_nms_score_threshold,
                     ball_roi=manual_ball_roi,
+                    ball_ignore_zones=manual_ball_ignore_zones,
                 )
                 self._supports_ball_detection = True
             except Exception as e:
@@ -512,7 +722,15 @@ class RTMLibBackend(PoseBackend):
                     'Falling back to standard RTMLib tracker.'
                 )
                 default_tracker = _init_default_tracker()
-                if manual_person_roi is not None:
+                if manual_person_roi is not None and manual_roi_mode == 'adaptive_person':
+                    default_tracker = _AdaptivePersonROITracker(
+                        pose_tracker=default_tracker,
+                        person_roi=manual_person_roi,
+                        tracking_margin_px=manual_roi_tracking_margin_px,
+                        reacquire_patience=manual_roi_reacquire_patience,
+                        reacquire_frequency=manual_roi_reacquire_frequency,
+                    )
+                elif manual_person_roi is not None:
                     default_tracker = _StaticPersonROITracker(
                         pose_tracker=default_tracker,
                         person_roi=manual_person_roi,
@@ -520,7 +738,15 @@ class RTMLibBackend(PoseBackend):
                 self._tracker = default_tracker
         else:
             default_tracker = _init_default_tracker()
-            if manual_person_roi is not None:
+            if manual_person_roi is not None and manual_roi_mode == 'adaptive_person':
+                default_tracker = _AdaptivePersonROITracker(
+                    pose_tracker=default_tracker,
+                    person_roi=manual_person_roi,
+                    tracking_margin_px=manual_roi_tracking_margin_px,
+                    reacquire_patience=manual_roi_reacquire_patience,
+                    reacquire_frequency=manual_roi_reacquire_frequency,
+                )
+            elif manual_person_roi is not None:
                 default_tracker = _StaticPersonROITracker(
                     pose_tracker=default_tracker,
                     person_roi=manual_person_roi,
@@ -761,6 +987,13 @@ class SynthPoseBackend(PoseBackend):
             ball_detector_backend=pose_config.get('ball_detector_backend', 'same'),
             manual_person_roi=pose_config.get('_manual_person_roi'),
             manual_ball_roi=pose_config.get('_manual_ball_roi'),
+            manual_ball_ignore_zones=_RTMLibBallAwareTracker._normalize_runtime_rois(
+                pose_config.get('_manual_ball_ignore_zones'),
+            ),
+            manual_roi_mode=pose_config.get('manual_roi_mode', 'bootstrap'),
+            manual_roi_tracking_margin_px=pose_config.get('manual_roi_tracking_margin_px', 48),
+            manual_roi_reacquire_patience=pose_config.get('manual_roi_reacquire_patience', 6),
+            manual_roi_reacquire_frequency=pose_config.get('manual_roi_reacquire_frequency', 15),
         )
 
         # Store skeleton tree and keypoint names

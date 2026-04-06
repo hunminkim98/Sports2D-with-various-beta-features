@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -13,7 +13,22 @@ import numpy as np
 ROI = Tuple[int, int, int, int]
 
 
-def get_manual_roi_screen_size(default: Tuple[int, int] = (1920, 1080)) -> Tuple[int, int]:
+def normalize_manual_roi_mode(value, default: str = "bootstrap") -> str:
+    """Normalize manual ROI runtime mode names."""
+    normalized = str(default if value in [None, ""] else value).strip().lower()
+    if normalized in {"bootstrap", "adaptive_person"}:
+        return normalized
+    logging.warning(
+        "Unsupported manual_roi_mode '%s'. Falling back to '%s'.",
+        value,
+        default,
+    )
+    return default
+
+
+def get_manual_roi_screen_size(
+    default: Tuple[int, int] = (1920, 1080),
+) -> Tuple[int, int]:
     """Best-effort screen size lookup for ROI dialogs."""
     try:
         import tkinter as tk
@@ -33,7 +48,9 @@ def get_manual_roi_screen_size(default: Tuple[int, int] = (1920, 1080)) -> Tuple
         return default
 
 
-def fit_frame_to_screen(frame: np.ndarray, screen_width: int, screen_height: int, margin: int = 120):
+def fit_frame_to_screen(
+    frame: np.ndarray, screen_width: int, screen_height: int, margin: int = 120
+):
     """Resize a frame for ROI display while preserving aspect ratio."""
     frame_height, frame_width = frame.shape[:2]
     max_width = max(1, int(screen_width) - int(margin))
@@ -46,11 +63,15 @@ def fit_frame_to_screen(frame: np.ndarray, screen_width: int, screen_height: int
     scale = min(width_ratio, height_ratio)
     scaled_width = max(1, int(round(frame_width * scale)))
     scaled_height = max(1, int(round(frame_height * scale)))
-    resized = cv2.resize(frame, (scaled_width, scaled_height), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(
+        frame, (scaled_width, scaled_height), interpolation=cv2.INTER_AREA
+    )
     return resized, float(scale)
 
 
-def scale_selection_to_full_frame(selection: Sequence[float], scale: float) -> Optional[ROI]:
+def scale_selection_to_full_frame(
+    selection: Sequence[float], scale: float
+) -> Optional[ROI]:
     """Convert a scaled-window xywh ROI selection back to full-frame xyxy coordinates."""
     roi_xyxy = xywh_to_xyxy(selection)
     if roi_xyxy is None:
@@ -75,6 +96,8 @@ def xywh_to_xyxy(selection: Sequence[float]) -> Optional[ROI]:
     if arr.size != 4 or not np.all(np.isfinite(arr)):
         return None
     x, y, width, height = arr.tolist()
+    if width <= 0 or height <= 0:
+        return None
     return (int(round(x)), int(round(y)), int(round(x + width)), int(round(y + height)))
 
 
@@ -108,6 +131,47 @@ def normalize_roi_xyxy(
     return (x1, y1, x2, y2)
 
 
+def roi_from_boxes_xyxy(
+    boxes,
+    frame_shape,
+    padding_px: int = 0,
+) -> Optional[ROI]:
+    """Return one ROI that covers every valid xyxy box."""
+    box_arr = np.asarray(boxes, dtype=np.float32)
+    if box_arr.size == 0:
+        return None
+    if box_arr.ndim == 1:
+        box_arr = box_arr.reshape(1, -1)
+    if box_arr.shape[1] < 4:
+        return None
+
+    box_arr = box_arr[:, :4]
+    finite_mask = np.all(np.isfinite(box_arr), axis=1)
+    if not np.any(finite_mask):
+        return None
+    valid_boxes = box_arr[finite_mask]
+    roi = (
+        float(np.min(valid_boxes[:, 0])),
+        float(np.min(valid_boxes[:, 1])),
+        float(np.max(valid_boxes[:, 2])),
+        float(np.max(valid_boxes[:, 3])),
+    )
+    return normalize_roi_xyxy(roi, frame_shape, padding_px=padding_px)
+
+
+def expand_roi_xyxy(
+    roi: Optional[Sequence[float]],
+    frame_shape,
+    padding_px: int = 0,
+) -> Optional[ROI]:
+    """Expand an xyxy ROI by a fixed padding while staying inside the frame."""
+    return normalize_roi_xyxy(
+        roi,
+        frame_shape,
+        padding_px=max(0, int(padding_px)),
+    )
+
+
 def union_rois(*rois: Optional[Sequence[int]]) -> Optional[ROI]:
     """Return the smallest ROI covering every provided ROI."""
     valid = [tuple(int(v) for v in roi) for roi in rois if roi is not None]
@@ -139,7 +203,9 @@ def expand_roi_with_context(
     center_y = (y1 + y2) / 2.0
 
     target_width = min(float(frame_width), max(width * float(scale), float(min_size)))
-    target_height = min(float(frame_height), max(height * float(scale), float(min_size)))
+    target_height = min(
+        float(frame_height), max(height * float(scale), float(min_size))
+    )
     half_width = target_width / 2.0
     half_height = target_height / 2.0
 
@@ -152,7 +218,9 @@ def expand_roi_with_context(
     return normalize_roi_xyxy(expanded, frame_shape, padding_px=0)
 
 
-def translate_roi_to_local(roi: Optional[Sequence[int]], parent_roi: Optional[Sequence[int]]) -> Optional[ROI]:
+def translate_roi_to_local(
+    roi: Optional[Sequence[int]], parent_roi: Optional[Sequence[int]]
+) -> Optional[ROI]:
     """Translate a full-frame ROI into the local coordinates of its parent ROI."""
     if roi is None or parent_roi is None:
         return None
@@ -219,12 +287,51 @@ def boxes_center_inside_roi(boxes, roi: Optional[Sequence[int]]) -> np.ndarray:
     x1, y1, x2, y2 = [float(v) for v in roi]
     centers_x = (box_arr[:, 0] + box_arr[:, 2]) / 2.0
     centers_y = (box_arr[:, 1] + box_arr[:, 3]) / 2.0
-    return (
-        (centers_x >= x1)
-        & (centers_x <= x2)
-        & (centers_y >= y1)
-        & (centers_y <= y2)
-    )
+    return (centers_x >= x1) & (centers_x <= x2) & (centers_y >= y1) & (centers_y <= y2)
+
+
+def boxes_overlap_any_roi(boxes, rois) -> np.ndarray:
+    """Return a mask selecting boxes whose xyxy extents overlap any ROI."""
+    box_arr = np.asarray(boxes, dtype=np.float32)
+    if box_arr.size == 0:
+        return np.zeros((0,), dtype=bool)
+    if box_arr.ndim == 1:
+        box_arr = box_arr.reshape(1, -1)
+    if box_arr.shape[1] < 4:
+        return np.zeros((len(box_arr),), dtype=bool)
+
+    valid_rois = []
+    for roi in rois or []:
+        arr = np.asarray(roi, dtype=np.float32).reshape(-1)
+        if arr.size != 4 or not np.all(np.isfinite(arr)):
+            continue
+        valid_rois.append(arr[:4])
+    if len(valid_rois) == 0:
+        return np.zeros((len(box_arr),), dtype=bool)
+
+    overlap_mask = np.zeros((len(box_arr),), dtype=bool)
+    for x1, y1, x2, y2 in valid_rois:
+        overlap_mask |= (
+            (box_arr[:, 0] <= x2)
+            & (box_arr[:, 2] >= x1)
+            & (box_arr[:, 1] <= y2)
+            & (box_arr[:, 3] >= y1)
+        )
+    return overlap_mask
+
+
+def boxes_outside_rois(boxes, rois) -> np.ndarray:
+    """Return a keep mask that excludes boxes overlapping any ROI."""
+    box_arr = np.asarray(boxes, dtype=np.float32)
+    if box_arr.size == 0:
+        return np.zeros((0,), dtype=bool)
+    if box_arr.ndim == 1:
+        box_arr = box_arr.reshape(1, -1)
+    if box_arr.shape[1] < 4:
+        return np.zeros((len(box_arr),), dtype=bool)
+    if not rois:
+        return np.ones((len(box_arr),), dtype=bool)
+    return ~boxes_overlap_any_roi(box_arr, rois)
 
 
 def offset_detection_meta_to_full_frame(meta, roi: Optional[Sequence[int]]):
@@ -307,3 +414,75 @@ def select_manual_rois(
             ball_roi = person_roi
 
     return {"person_roi": person_roi, "ball_roi": ball_roi}
+
+
+def _draw_saved_ignore_zones(
+    frame: np.ndarray, ignore_rois: Sequence[ROI]
+) -> np.ndarray:
+    """Render previously saved ignore zones with translucent fills and labels."""
+    overlay = np.asarray(frame).copy()
+    annotated = np.asarray(frame).copy()
+    for idx, (x1, y1, x2, y2) in enumerate(ignore_rois, start=1):
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), -1)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        label_y = y1 - 10 if y1 >= 22 else min(y2 + 18, annotated.shape[0] - 8)
+        cv2.putText(
+            annotated,
+            f"Ignore {idx}",
+            (x1, label_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    if len(ignore_rois) > 0:
+        annotated = cv2.addWeighted(overlay, 0.18, annotated, 0.82, 0.0)
+    return annotated
+
+
+def select_manual_ball_ignore_zones(
+    frame: np.ndarray,
+    padding_px: int = 0,
+    window_prefix: str = "Manual ROI",
+) -> List[ROI]:
+    """Collect zero or more static ball ignore rectangles from the user."""
+    display_frame = np.asarray(frame).copy()
+    screen_width, screen_height = get_manual_roi_screen_size()
+    ignore_rois: List[ROI] = []
+    logging.info(
+        "Ball ignore zone selection: each window collects one zone and keeps previously saved zones visible. "
+        "Draw a rectangle and press SPACE or ENTER to save it. "
+        "To finish, press ESC or confirm an empty selection without drawing a box. "
+        "Press c to cancel the current rectangle."
+    )
+    selection_index = 1
+    while True:
+        overlay_frame = _draw_saved_ignore_zones(display_frame, ignore_rois)
+        scaled_frame, scale = fit_frame_to_screen(
+            overlay_frame,
+            screen_width=screen_width,
+            screen_height=screen_height,
+        )
+        window_name = (
+            f"{window_prefix} - Select ball ignore zone #{selection_index} "
+            "(SPACE/ENTER: save, ESC: finish)"
+        )
+        selection = cv2.selectROI(
+            window_name,
+            scaled_frame,
+            showCrosshair=False,
+            fromCenter=False,
+        )
+        cv2.destroyWindow(window_name)
+        ignore_roi = normalize_roi_xyxy(
+            scale_selection_to_full_frame(selection, scale),
+            display_frame.shape,
+            padding_px=padding_px,
+        )
+        if ignore_roi is None:
+            break
+        ignore_rois.append(ignore_roi)
+        selection_index += 1
+
+    return ignore_rois
