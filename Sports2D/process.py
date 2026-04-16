@@ -69,6 +69,8 @@ import os
 import re
 import platform
 import time
+import tempfile
+import unicodedata
 from importlib.metadata import version
 from datetime import datetime
 import itertools as it
@@ -937,6 +939,296 @@ def append_trc_marker_aliases(trc_data, marker_aliases=None):
     if len(alias_triplets) == 0:
         return trc_data
     return pd.concat([trc_data] + alias_triplets, axis=1)
+
+
+BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS = [
+    "Hip",
+    "RHip",
+    "RKnee",
+    "RAnkle",
+    "RBigToe",
+    "RSmallToe",
+    "RHeel",
+    "LHip",
+    "LKnee",
+    "LAnkle",
+    "LBigToe",
+    "LSmallToe",
+    "LHeel",
+    "Neck",
+    "Head",
+    "Nose",
+    "RShoulder",
+    "RElbow",
+    "RWrist",
+    "LShoulder",
+    "LElbow",
+    "LWrist",
+]
+
+
+def _build_body_with_feet_opensim_bridge_trc_data(trc_data):
+    """
+    Build the original 22-marker body_with_feet TRC contract for the OpenSim bridge.
+    """
+
+    trc_data = pd.DataFrame(trc_data).copy()
+    bridge_parts = [trc_data.iloc[:, :1].copy()]
+    marker_names = list(trc_data.columns[1::3]) if len(trc_data.columns) > 1 else []
+    existing_markers = {str(name) for name in marker_names}
+
+    missing_markers = [
+        marker_name
+        for marker_name in BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS
+        if marker_name not in existing_markers
+    ]
+    if missing_markers:
+        raise ValueError(
+            "body_with_feet OpenSim bridge TRC is missing required markers: "
+            + ", ".join(missing_markers)
+        )
+
+    for marker_name in BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS:
+        marker_triplet = trc_data.loc[:, trc_data.columns == marker_name]
+        if marker_triplet.shape[1] < 3:
+            raise ValueError(
+                f"body_with_feet OpenSim bridge marker '{marker_name}' does not have a full XYZ triplet."
+            )
+        marker_triplet = marker_triplet.iloc[:, :3].copy()
+        marker_triplet.columns = [marker_name, marker_name, marker_name]
+        bridge_parts.append(marker_triplet)
+
+    return pd.concat(bridge_parts, axis=1)
+
+
+def _resolve_opensim_bridge_trc_data(pose_model_name, trc_data):
+    """
+    Return the TRC schema that should be staged into Pose2Sim/OpenSim.
+    """
+
+    normalized_name = str(pose_model_name or "").strip().lower()
+    if normalized_name == "body_with_feet":
+        return _build_body_with_feet_opensim_bridge_trc_data(trc_data)
+    return pd.DataFrame(trc_data).copy()
+
+
+def _resolve_meter_conversion_trc_data(pose_model_name, trc_data):
+    """
+    Return the TRC schema that should drive px->meter conversion and meter exports.
+
+    `body_with_feet` originally used the sparse 22-marker contract all the way
+    through height estimation, px->meter conversion, public `_m.trc` export,
+    and OpenSim staging. Keep that schema here so scaling matches the upstream
+    repo instead of converting the current dense 26-marker HALPE view first.
+    """
+
+    normalized_name = str(pose_model_name or "").strip().lower()
+    if normalized_name == "body_with_feet":
+        return _build_body_with_feet_opensim_bridge_trc_data(trc_data)
+    return pd.DataFrame(trc_data).copy()
+
+
+def _resolve_pose2sim_pose_model_name(pose_model_name):
+    """
+    Translate Sports2D runtime pose-model names to Pose2Sim/OpenSim bridge names.
+
+    Sports2D can run full SynthPose 52-keypoint inference at runtime, but the
+    Pose2Sim kinematics stack only recognizes its own canonical skeleton names
+    such as HALPE_26 and COCO_133. The bridge must therefore remap runtime
+    model names before marker augmentation or inverse kinematics starts.
+    """
+
+    normalized_name = str(pose_model_name or "body_with_feet").strip().lower()
+    pose2sim_model_names = {
+        "body_with_feet": "HALPE_26",
+        "whole_body_wrist": "COCO_133_WRIST",
+        "whole_body": "COCO_133",
+        "body": "COCO_17",
+        "hand": "HAND_21",
+        "face": "FACE_106",
+        "animal": "ANIMAL2D_17",
+        "synthpose": "HALPE_26",
+        "synthpose_base": "HALPE_26",
+    }
+    return pose2sim_model_names.get(
+        normalized_name, str(pose_model_name or "BODY_WITH_FEET").strip().upper()
+    )
+
+
+def _configure_pose2sim_kinematics_bridge(
+    pose2sim_config_dict, pose_model_name, feet_on_floor
+):
+    """
+    Apply Sports2D-to-Pose2Sim bridge settings needed for marker augmentation / IK.
+    """
+
+    pose2sim_config_dict["markerAugmentation"]["feet_on_floor"] = feet_on_floor
+    resolved_pose_model_name = _resolve_pose2sim_pose_model_name(pose_model_name)
+    pose2sim_config_dict["pose"]["pose_model"] = resolved_pose_model_name
+    return resolved_pose_model_name
+
+
+def _contains_non_ascii_path(path_like):
+    """
+    Return True when the provided path contains non-ASCII characters.
+    """
+
+    return any(ord(char) > 127 for char in str(path_like))
+
+
+def _sanitize_ascii_opensim_stem(value, fallback="opensim_item"):
+    """
+    Normalize a filename stem to a conservative ASCII-only representation.
+    """
+
+    normalized = (
+        unicodedata.normalize("NFKD", str(value))
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", normalized).strip("._-")
+    return normalized or str(fallback)
+
+
+def _should_use_ascii_safe_opensim_workspace(output_dir, trc_files):
+    """
+    Return True when OpenSim should avoid the native output path.
+    """
+
+    return _contains_non_ascii_path(output_dir) or any(
+        _contains_non_ascii_path(trc_file) for trc_file in (trc_files or [])
+    )
+
+
+def _restore_opensim_artifact_name(file_name, staged_stem_map):
+    """
+    Convert an ASCII-staged OpenSim artifact name back to its original stem.
+    """
+
+    artifact_path = Path(file_name)
+    for staged_stem, original_stem in sorted(
+        staged_stem_map.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if artifact_path.stem == staged_stem or artifact_path.stem.startswith(
+            staged_stem + "_"
+        ):
+            restored_stem = original_stem + artifact_path.stem[len(staged_stem) :]
+            return f"{restored_stem}{artifact_path.suffix}"
+    return artifact_path.name
+
+
+def _stage_opensim_input_trcs(
+    trc_files, destination_dir, bridge_trc_data_by_name=None, fps=30
+):
+    """
+    Stage the OpenSim input TRCs into the destination directory.
+    """
+
+    destination_dir = Path(destination_dir)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    bridge_trc_data_by_name = dict(bridge_trc_data_by_name or {})
+
+    staged_paths = []
+    for trc_file in trc_files:
+        trc_file = Path(trc_file)
+        staged_path = destination_dir / trc_file.name
+        if staged_path.exists():
+            os.remove(staged_path)
+        if trc_file.name in bridge_trc_data_by_name:
+            make_trc_with_trc_data(bridge_trc_data_by_name[trc_file.name], staged_path, fps=fps)
+        else:
+            shutil.copy2(trc_file, staged_path)
+        staged_paths.append(staged_path)
+    return staged_paths
+
+
+def _create_ascii_safe_opensim_workspace(
+    trc_files, bridge_trc_data_by_name=None, fps=30
+):
+    """
+    Stage TRC inputs into an ASCII-only temporary workspace for OpenSim.
+    """
+
+    temp_parent = Path(tempfile.gettempdir())
+    if _contains_non_ascii_path(temp_parent):
+        temp_parent = Path("C:/Temp") if os.name == "nt" else Path("/tmp")
+    temp_parent.mkdir(parents=True, exist_ok=True)
+
+    workspace_root = Path(
+        tempfile.mkdtemp(prefix="sports2d_opensim_", dir=str(temp_parent))
+    )
+    pose3d_dir = workspace_root / "pose-3d"
+    kinematics_dir = workspace_root / "kinematics"
+    pose3d_dir.mkdir(parents=True, exist_ok=True)
+    kinematics_dir.mkdir(parents=True, exist_ok=True)
+
+    staged_stem_map = {}
+    staged_input_names = set()
+    used_stems = set()
+
+    for idx, trc_file in enumerate(trc_files):
+        base_stem = _sanitize_ascii_opensim_stem(
+            trc_file.stem, fallback=f"opensim_trial_{idx:02d}"
+        )
+        staged_stem = base_stem
+        suffix_id = 1
+        while staged_stem in used_stems:
+            staged_stem = f"{base_stem}_{suffix_id:02d}"
+            suffix_id += 1
+        used_stems.add(staged_stem)
+
+        staged_path = pose3d_dir / f"{staged_stem}{trc_file.suffix}"
+        bridge_trc_data_by_name = dict(bridge_trc_data_by_name or {})
+        if trc_file.name in bridge_trc_data_by_name:
+            make_trc_with_trc_data(
+                bridge_trc_data_by_name[trc_file.name], staged_path, fps=fps
+            )
+        else:
+            shutil.copy2(trc_file, staged_path)
+        staged_stem_map[staged_stem] = trc_file.stem
+        staged_input_names.add(staged_path.name)
+
+    return {
+        "root_dir": workspace_root,
+        "pose3d_dir": pose3d_dir,
+        "kinematics_dir": kinematics_dir,
+        "staged_stem_map": staged_stem_map,
+        "staged_input_names": staged_input_names,
+    }
+
+
+def _move_ascii_safe_opensim_outputs(
+    workspace_info, final_pose3d_dir, final_kinematics_dir
+):
+    """
+    Restore OpenSim artifacts from the ASCII-safe workspace to the final output dirs.
+    """
+
+    pose3d_dir = workspace_info["pose3d_dir"]
+    kinematics_dir = workspace_info["kinematics_dir"]
+    staged_input_names = set(workspace_info["staged_input_names"])
+    staged_stem_map = dict(workspace_info["staged_stem_map"])
+    final_pose3d_dir = Path(final_pose3d_dir)
+    final_kinematics_dir = Path(final_kinematics_dir)
+    final_pose3d_dir.mkdir(parents=True, exist_ok=True)
+    final_kinematics_dir.mkdir(parents=True, exist_ok=True)
+
+    for directory in [pose3d_dir, kinematics_dir]:
+        for file_path in directory.glob("*"):
+            if not file_path.is_file():
+                continue
+            restored_name = _restore_opensim_artifact_name(
+                file_path.name, staged_stem_map
+            )
+            destination_dir = (
+                final_pose3d_dir if directory == pose3d_dir else final_kinematics_dir
+            )
+            destination_path = destination_dir / restored_name
+            if destination_path.exists():
+                os.remove(destination_path)
+            shutil.move(str(file_path), destination_path)
+
+    shutil.rmtree(workspace_info["root_dir"], ignore_errors=True)
 
 
 def strip_auxiliary_trc_markers(Q_coords, keypoints_names, ignored_marker_names=None):
@@ -2512,6 +2804,49 @@ def flip_left_right_direction(
     return person_X_flipped
 
 
+def _resolve_person_visible_side_frame(
+    person_X, visible_side_str, has_toe_heel, L_R_direction_idx=None
+):
+    """
+    Resolve the per-frame visible side using the original Sports2D semantics.
+    """
+
+    visible_side_str = str(visible_side_str or "auto").strip().lower()
+    if visible_side_str == "auto":
+        if has_toe_heel and L_R_direction_idx is not None:
+            Ltoe_idx, LHeel_idx, Rtoe_idx, RHeel_idx = L_R_direction_idx
+            right_orientation = person_X[Rtoe_idx] - person_X[RHeel_idx]
+            left_orientation = person_X[Ltoe_idx] - person_X[LHeel_idx]
+            global_orientation = right_orientation + left_orientation
+            return "right" if global_orientation >= 0 else "left"
+        return "right"
+    return visible_side_str
+
+
+def _apply_visible_side_whole_body_flip(
+    person_X, visible_side_frame, keypoints_names, keypoints_ids
+):
+    """
+    Apply the original visible_side-driven whole-body flip to the X coordinates.
+    """
+
+    person_X_flipped = np.asarray(person_X, dtype=float).copy()
+    visible_side_frame = str(visible_side_frame or "right").strip().lower()
+
+    if visible_side_frame in ["right", "none"]:
+        return person_X_flipped
+    if visible_side_frame == "left":
+        return -person_X_flipped
+    if visible_side_frame in ["front", "back"]:
+        negate_prefix = "R" if visible_side_frame == "front" else "L"
+        for keypoint_name in keypoints_names:
+            if keypoint_name.startswith(negate_prefix):
+                keypoint_idx = keypoints_ids[keypoints_names.index(keypoint_name)]
+                person_X_flipped[keypoint_idx] = -person_X_flipped[keypoint_idx]
+        return person_X_flipped
+    return person_X_flipped
+
+
 def compute_angle(
     ang_name, person_X_flipped, person_Y, angle_dict, keypoints_ids, keypoints_names
 ):
@@ -2574,41 +2909,90 @@ def _upsert_derived_pose_keypoint(
         "Hip": ("LHip", "RHip"),
         "Neck": ("LShoulder", "RShoulder"),
     }
-    source_names = source_map.get(derived_name)
-    if source_names is None:
-        return person_X, person_Y, person_scores, list(keypoint_names)
-
     keypoint_names = list(keypoint_names)
-    if not all(source_name in keypoint_names for source_name in source_names):
+    if derived_name == "Head":
+        if (
+            "LEye" in keypoint_names
+            and "REye" in keypoint_names
+            and np.all(
+                np.isfinite(
+                    [
+                        person_X[keypoint_names.index("LEye")],
+                        person_Y[keypoint_names.index("LEye")],
+                        person_X[keypoint_names.index("REye")],
+                        person_Y[keypoint_names.index("REye")],
+                    ]
+                )
+            )
+        ):
+            left_eye_idx = keypoint_names.index("LEye")
+            right_eye_idx = keypoint_names.index("REye")
+            left_eye = np.asarray(
+                [person_X[left_eye_idx], person_Y[left_eye_idx]], dtype=float
+            )
+            right_eye = np.asarray(
+                [person_X[right_eye_idx], person_Y[right_eye_idx]], dtype=float
+            )
+            eye_center = (left_eye + right_eye) * 0.5
+            eye_distance = float(np.linalg.norm(left_eye - right_eye))
+            x_value = float(eye_center[0])
+            y_value = float(eye_center[1] - eye_distance * 0.8)
+            score_value = float(
+                np.nanmean([person_scores[left_eye_idx], person_scores[right_eye_idx]])
+            )
+        elif "Nose" in keypoint_names:
+            nose_idx = keypoint_names.index("Nose")
+            x_value = float(person_X[nose_idx])
+            y_value = float(person_Y[nose_idx])
+            score_value = float(person_scores[nose_idx])
+        else:
+            x_value = np.nan
+            y_value = np.nan
+            score_value = np.nan
+    else:
+        source_names = source_map.get(derived_name)
+        if source_names is None:
+            return person_X, person_Y, person_scores, list(keypoint_names)
+        if not all(source_name in keypoint_names for source_name in source_names):
+            x_value = np.nan
+            y_value = np.nan
+            score_value = np.nan
+        else:
+            idx_a = keypoint_names.index(source_names[0])
+            idx_b = keypoint_names.index(source_names[1])
+            x_candidates = np.asarray([person_X[idx_a], person_X[idx_b]], dtype=float)
+            y_candidates = np.asarray([person_Y[idx_a], person_Y[idx_b]], dtype=float)
+            score_candidates = np.asarray(
+                [person_scores[idx_a], person_scores[idx_b]], dtype=float
+            )
+            x_value = (
+                float(np.nanmean(x_candidates))
+                if np.any(np.isfinite(x_candidates))
+                else np.nan
+            )
+            y_value = (
+                float(np.nanmean(y_candidates))
+                if np.any(np.isfinite(y_candidates))
+                else np.nan
+            )
+            score_value = (
+                float(np.nanmean(score_candidates))
+                if np.any(np.isfinite(score_candidates))
+                else np.nan
+            )
+    if not np.isfinite(x_value) or not np.isfinite(y_value):
         x_value = np.nan
         y_value = np.nan
         score_value = np.nan
-    else:
-        idx_a = keypoint_names.index(source_names[0])
-        idx_b = keypoint_names.index(source_names[1])
-        x_candidates = np.asarray([person_X[idx_a], person_X[idx_b]], dtype=float)
-        y_candidates = np.asarray([person_Y[idx_a], person_Y[idx_b]], dtype=float)
-        score_candidates = np.asarray(
-            [person_scores[idx_a], person_scores[idx_b]], dtype=float
-        )
-        x_value = (
-            float(np.nanmean(x_candidates))
-            if np.any(np.isfinite(x_candidates))
-            else np.nan
-        )
-        y_value = (
-            float(np.nanmean(y_candidates))
-            if np.any(np.isfinite(y_candidates))
-            else np.nan
-        )
-        score_value = (
-            float(np.nanmean(score_candidates))
-            if np.any(np.isfinite(score_candidates))
-            else np.nan
-        )
 
     if derived_name in keypoint_names:
         derived_idx = keypoint_names.index(derived_name)
+        if derived_idx >= len(person_X):
+            pad_width = derived_idx + 1 - len(person_X)
+            nan_pad = np.full((pad_width,), np.nan, dtype=float)
+            person_X = np.append(person_X, nan_pad)
+            person_Y = np.append(person_Y, nan_pad.copy())
+            person_scores = np.append(person_scores, nan_pad.copy())
         person_X[derived_idx] = x_value
         person_Y[derived_idx] = y_value
         person_scores[derived_idx] = score_value
@@ -2634,6 +3018,8 @@ def _recompute_pose_frame_from_raw(
     angle_names,
     calculate_angles,
     visible_side_person="auto",
+    use_visible_side_whole_body_flip=False,
+    has_toe_heel=False,
 ):
     """
     Recompute filtered coordinates, flipped coordinates, and angles from raw pose values.
@@ -2649,7 +3035,9 @@ def _recompute_pose_frame_from_raw(
     )
 
     keypoint_names = list(raw_keypoint_names)
-    for derived_name in ["Hip", "Neck"]:
+    for derived_name in ["Hip", "Neck", "Head"]:
+        if derived_name in keypoint_names:
+            continue
         person_X, person_Y, person_scores, keypoint_names = (
             _upsert_derived_pose_keypoint(
                 derived_name,
@@ -2661,12 +3049,23 @@ def _recompute_pose_frame_from_raw(
         )
 
     keypoint_ids = list(range(len(keypoint_names)))
-    if flip_left_right and L_R_direction_idx is not None:
-        person_X_flipped = flip_left_right_direction(
+    person_visible_side_frame = visible_side_person
+    if use_visible_side_whole_body_flip:
+        person_visible_side_frame = _resolve_person_visible_side_frame(
+            person_X,
+            visible_side_person,
+            has_toe_heel,
+            L_R_direction_idx=L_R_direction_idx if has_toe_heel else None,
+        )
+        person_X_flipped = _apply_visible_side_whole_body_flip(
             person_X.copy(),
-            L_R_direction_idx,
-            keypoint_names,
-            keypoint_ids,
+            person_visible_side_frame,
+            keypoints_names=keypoint_names,
+            keypoints_ids=keypoint_ids,
+        )
+    elif flip_left_right and L_R_direction_idx is not None:
+        person_X_flipped = flip_left_right_direction(
+            person_X.copy(), L_R_direction_idx, keypoint_names, keypoint_ids
         )
     else:
         person_X_flipped = person_X.copy()
@@ -2688,7 +3087,11 @@ def _recompute_pose_frame_from_raw(
             else:
                 ang = np.nan
             person_angles.append(ang)
-        if visible_side_person == "left" and not flip_left_right:
+        if (
+            not use_visible_side_whole_body_flip
+            and person_visible_side_frame == "left"
+            and not flip_left_right
+        ):
             person_angles = list(-np.array(person_angles, dtype=float))
     else:
         person_angles = []
@@ -2716,6 +3119,8 @@ def _recompute_pose_timelines_from_raw(
     angle_names,
     calculate_angles,
     visible_side_person="auto",
+    use_visible_side_whole_body_flip=False,
+    has_toe_heel=False,
 ):
     """
     Recompute timeline arrays for one selected person after manual edits.
@@ -2723,7 +3128,7 @@ def _recompute_pose_timelines_from_raw(
 
     frame_count = len(raw_frames_X)
     expected_keypoint_names = list(raw_keypoint_names)
-    for derived_name in ["Hip", "Neck"]:
+    for derived_name in ["Hip", "Neck", "Head"]:
         if derived_name not in expected_keypoint_names:
             expected_keypoint_names.append(derived_name)
 
@@ -2759,6 +3164,8 @@ def _recompute_pose_timelines_from_raw(
             angle_names,
             calculate_angles,
             visible_side_person=visible_side_person,
+            use_visible_side_whole_body_flip=use_visible_side_whole_body_flip,
+            has_toe_heel=has_toe_heel,
         )
         if keypoint_names != expected_keypoint_names:
             raise ValueError(
@@ -5488,11 +5895,15 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             Rtoe_idx = keypoints_ids[keypoints_names.index("RBigToe")]
             RHeel_idx = keypoints_ids[keypoints_names.index("RHeel")]
             L_R_direction_idx = [Ltoe_idx, LHeel_idx, Rtoe_idx, RHeel_idx]
+            has_toe_heel = True
         except ValueError:
             logging.warning(
                 f"Missing 'LBigToe', 'LHeel', 'RBigToe', 'RHeel' keypoints. flip_left_right will be set to False"
             )
             flip_left_right = False
+            has_toe_heel = False
+    else:
+        has_toe_heel = False
 
     if calculate_angles:
         for ang_name in angle_names:
@@ -5925,38 +6336,51 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         person_Y,
                         person_scores,
                     )
-                # Check whether the person is looking to the left or right
-                if flip_left_right:
+                person_visible_side_frame = (
+                    visible_side[person_idx] if len(visible_side) > person_idx else "auto"
+                )
+                # Restore the upstream visible_side whole-body flip for RTMLib/body_with_feet paths.
+                if not use_synthpose:
+                    person_visible_side_frame = _resolve_person_visible_side_frame(
+                        person_X,
+                        person_visible_side_frame,
+                        has_toe_heel,
+                        L_R_direction_idx=L_R_direction_idx if has_toe_heel else None,
+                    )
+                    person_X_flipped = _apply_visible_side_whole_body_flip(
+                        person_X,
+                        person_visible_side_frame,
+                        keypoints_names=keypoints_names,
+                        keypoints_ids=keypoints_ids,
+                    )
+                elif flip_left_right:
                     person_X_flipped = flip_left_right_direction(
                         person_X, L_R_direction_idx, keypoints_names, keypoints_ids
                     )
                 else:
                     person_X_flipped = person_X.copy()
 
-                # Add Neck and Hip if not provided
+                # Add derived markers needed by downstream pose/IK consumers.
                 new_keypoints_names, new_keypoints_ids = (
                     keypoints_names.copy(),
                     keypoints_ids.copy(),
                 )
-                for kpt in ["Hip", "Neck"]:
+                for kpt in ["Hip", "Neck", "Head"]:
                     if kpt not in new_keypoints_names:
-                        person_X_flipped, person_Y, person_scores = add_neck_hip_coords(
+                        person_X_flipped, person_Y, person_scores, new_keypoints_names = _upsert_derived_pose_keypoint(
                             kpt,
                             person_X_flipped,
                             person_Y,
                             person_scores,
-                            new_keypoints_ids,
                             new_keypoints_names,
                         )
-                        person_X, _, _ = add_neck_hip_coords(
+                        person_X, _, _, _ = _upsert_derived_pose_keypoint(
                             kpt,
                             person_X,
                             person_Y,
                             person_scores,
-                            new_keypoints_ids,
                             new_keypoints_names,
                         )
-                        new_keypoints_names.append(kpt)
                         new_keypoints_ids.append(len(person_X_flipped) - 1)
 
                 # Compute angles
@@ -5978,10 +6402,11 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             ang = np.nan
                         person_angles.append(ang)
 
-                    # flip angles on the left side if flip_left_right false
-                    if len(visible_side) <= person_idx:
-                        visible_side += ["auto"]  # set to 'auto' if list too short
-                    if visible_side[person_idx] == "left" and not flip_left_right:
+                    if (
+                        use_synthpose
+                        and person_visible_side_frame == "left"
+                        and not flip_left_right
+                    ):
                         person_angles_flipped = list(-np.array(person_angles))
                     else:
                         person_angles_flipped = person_angles.copy()
@@ -6068,8 +6493,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     )
 
                     realtime_kpt_names = list(SYNTHPOSE_KEYPOINT_NAMES)
-                    # Add Hip/Neck if they were added to the data
-                    for kpt in ["Hip", "Neck"]:
+                    # Add derived markers if they were appended to the processed arrays.
+                    for kpt in ["Hip", "Neck", "Head"]:
                         if kpt in new_keypoints_names and kpt not in realtime_kpt_names:
                             realtime_kpt_names.append(kpt)
                     kpt_names_for_draw = realtime_kpt_names
@@ -6486,6 +6911,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     angle_names,
                     calculate_angles,
                     visible_side_person=visible_side_person,
+                    use_visible_side_whole_body_flip=not use_synthpose,
+                    has_toe_heel=has_toe_heel,
                 )
                 if corrected_keypoint_names != new_keypoints_names:
                     raise ValueError(
@@ -6831,13 +7258,25 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
         # %% Convert px to meters
         trc_data_m = []
+        opensim_bridge_trc_data_by_name = {}
         if need_meter_pose and len(trc_data) > 0:
             logging.info("\nConverting pose to meters:")
+            meter_trc_data = [
+                _resolve_meter_conversion_trc_data(pose_model_name, trc_data_i)
+                for trc_data_i in trc_data
+            ]
+            meter_trc_data_unfiltered = [
+                _resolve_meter_conversion_trc_data(
+                    pose_model_name, trc_data_unfiltered_i
+                )
+                for trc_data_unfiltered_i in trc_data_unfiltered
+            ]
+            meter_keypoint_names = list(meter_trc_data[0].columns[1::3])
 
             # Compute height of the first person in pixels
             height_px = CORRECTION_2D_TO_3D * compute_height(
-                trc_data[0].iloc[:, 1:],
-                new_keypoints_names,
+                meter_trc_data[0].iloc[:, 1:],
+                meter_keypoint_names,
                 fastest_frames_to_remove_percent=fastest_frames_to_remove_percent,
                 close_to_zero_speed=close_to_zero_speed_px,
                 large_hip_knee_angles=large_hip_knee_angles,
@@ -6863,7 +7302,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 height_px=height_px,
                 height_m=first_person_height,
                 fps=fps,
-                trc_data=trc_data[0],
+                trc_data=meter_trc_data[0],
                 score_data=score_data[0],
                 toe_speed_below=1,
                 score_threshold=average_likelihood_threshold,
@@ -6973,13 +7412,15 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             # Coordinates in m
             new_visible_side = []
             for i in range(len(trc_data)):
+                meter_trc_data_i = meter_trc_data[i]
+                meter_trc_data_unfiltered_i = meter_trc_data_unfiltered[i]
                 jump_overlay_result = {
                     "body_weight_n": None,
                     "full_vgrf_n": np.full(
                         (len(all_frames_time),), np.nan, dtype=float
                     ),
                 }
-                if not np.array(trc_data[i].iloc[:, 1:] == 0).all():
+                if not np.array(meter_trc_data_i.iloc[:, 1:] == 0).all():
                     # Automatically determine visible side
                     visible_side_i = (
                         visible_side[i] if len(visible_side) > i else "auto"
@@ -6988,17 +7429,18 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     if visible_side_i == "auto":
                         try:
                             if all(
-                                key in trc_data[i] for key in ["LBigToe", "RBigToe"]
+                                key in meter_trc_data_i
+                                for key in ["LBigToe", "RBigToe"]
                             ):
                                 _, _, gait_direction = compute_floor_line(
-                                    trc_data[i],
+                                    meter_trc_data_i,
                                     score_data[i],
                                     keypoint_names=["LBigToe", "RBigToe"],
                                     score_threshold=keypoint_likelihood_threshold,
                                 )  # toe_speed_below=1 bu default
                             else:
                                 _, _, gait_direction = compute_floor_line(
-                                    trc_data[i],
+                                    meter_trc_data_i,
                                     score_data[i],
                                     keypoint_names=["LAnkle", "RAnkle"],
                                     score_threshold=keypoint_likelihood_threshold,
@@ -7032,7 +7474,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     # Convert to meters
                     px_to_m_i = [
                         convert_px_to_meters(
-                            trc_data[i][kpt_name],
+                            meter_trc_data_i[kpt_name],
                             first_person_height,
                             height_px,
                             distance_m,
@@ -7043,17 +7485,27 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             -floor_angle_estim,
                             visible_side=visible_side_i,
                         )
-                        for kpt_name in new_keypoints_names
+                        for kpt_name in meter_keypoint_names
                     ]
                     trc_data_m_i = pd.concat(
                         [all_frames_time.rename("time")] + px_to_m_i, axis=1
+                    )
+                    first_run_starts_meter = _select_pose_keypoint_columns(
+                        np.asarray(first_run_starts_everyone[i], dtype=int),
+                        new_keypoints_names,
+                        meter_keypoint_names,
+                    )
+                    last_run_ends_meter = _select_pose_keypoint_columns(
+                        np.asarray(last_run_ends_everyone[i], dtype=int),
+                        new_keypoints_names,
+                        meter_keypoint_names,
                     )
                     for c_id, c in enumerate(
                         3 * np.arange(len(trc_data_m_i.columns[3::3])) + 1
                     ):  # only X coordinates
                         first_run_start, last_run_end = (
-                            first_run_starts_everyone[i][c_id],
-                            last_run_ends_everyone[i][c_id],
+                            int(first_run_starts_meter[c_id]),
+                            int(last_run_ends_meter[c_id]),
                         )
                         trc_data_m_i.iloc[:first_run_start, c + 2] = np.nan
                         trc_data_m_i.iloc[last_run_end:, c + 2] = np.nan
@@ -7070,7 +7522,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     ]
                     px_to_m_unfiltered_i = [
                         convert_px_to_meters(
-                            trc_data_unfiltered[i][kpt_name],
+                            meter_trc_data_unfiltered_i[kpt_name],
                             first_person_height,
                             height_px,
                             distance_m,
@@ -7081,7 +7533,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             -floor_angle_estim,
                             visible_side=visible_side_i,
                         )
-                        for kpt_name in new_keypoints_names
+                        for kpt_name in meter_keypoint_names
                     ]
                     trc_data_unfiltered_m_i = pd.concat(
                         [all_frames_time.rename("time")] + px_to_m_unfiltered_i, axis=1
@@ -7208,6 +7660,13 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         public_meter_trc_data_by_name[pose_path_person_m_i.name] = (
                             public_trc_data_m_file_i
                         )
+                    if do_ik or use_augmentation:
+                        opensim_bridge_trc_data_by_name[
+                            pose_path_person_m_i.name
+                        ] = _resolve_opensim_bridge_trc_data(
+                            pose_model_name,
+                            trc_data_m_file_i,
+                        )
                     if write_meter_pose:
                         make_trc_with_trc_data(
                             trc_data_m_file_i, pose_path_person_m_i, fps=fps
@@ -7256,8 +7715,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 all_frames_angles_homog[:, idx_person, :], columns=angle_names
             )
 
-            # Flip angles for left side when flip_left_right false
-            if new_visible_side[i] == "left" and not flip_left_right:
+            # Keep the legacy left-side sign correction only for SynthPose paths.
+            if use_synthpose and new_visible_side[i] == "left" and not flip_left_right:
                 all_frames_angles_homog[:, idx_person, :] = -all_frames_angles_homog[
                     :, idx_person, :
                 ]
@@ -7738,15 +8197,40 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 "Skipping marker augmentation and inverse kinematics as to_meters was set to False."
             )
         else:
+            native_pose3d_dir = pose3d_dir
+            native_kinematics_dir = kinematics_dir
+            opensim_workspace_info = None
+            opensim_pose3d_dir = native_pose3d_dir
+            opensim_kinematics_dir = native_kinematics_dir
+
             # move all trc files containing _m_ string to pose3d_dir
             if not load_trc_px:
-                trc_list = output_dir.glob("*_m_*.trc")
+                trc_list = list(output_dir.glob("*_m_*.trc"))
             else:
                 trc_list = [pose_path_person_m_i]
-            for trc_file in trc_list:
-                if (pose3d_dir / trc_file.name).exists():
-                    os.remove(pose3d_dir / trc_file.name)
-                shutil.move(trc_file, pose3d_dir)
+
+            if _should_use_ascii_safe_opensim_workspace(output_dir, trc_list):
+                opensim_workspace_info = _create_ascii_safe_opensim_workspace(
+                    trc_list,
+                    bridge_trc_data_by_name=opensim_bridge_trc_data_by_name,
+                    fps=fps,
+                )
+                opensim_pose3d_dir = opensim_workspace_info["pose3d_dir"]
+                opensim_kinematics_dir = opensim_workspace_info["kinematics_dir"]
+                Pose2Sim_config_dict["project"]["project_dir"] = str(
+                    opensim_workspace_info["root_dir"]
+                )
+                logging.info(
+                    "Using ASCII-safe OpenSim workspace at %s for non-ASCII result paths.",
+                    opensim_workspace_info["root_dir"],
+                )
+            else:
+                _stage_opensim_input_trcs(
+                    trc_list,
+                    opensim_pose3d_dir,
+                    bridge_trc_data_by_name=opensim_bridge_trc_data_by_name,
+                    fps=fps,
+                )
 
             heights_m, masses = [], []
             for i in range(len(trc_data_m)):
@@ -7777,9 +8261,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     )
                 else:
                     # Provide missing data to Pose2Sim_config_dict
+                    trc_data_m_keypoint_names = list(trc_data_m_i.columns[1::3])
                     height_m_i = compute_height(
                         trc_data_m_i.iloc[:, 1:],
-                        keypoints_names,
+                        trc_data_m_keypoint_names,
                         fastest_frames_to_remove_percent=fastest_frames_to_remove_percent,
                         close_to_zero_speed=close_to_zero_speed_m,
                         large_hip_knee_angles=large_hip_knee_angles,
@@ -7800,17 +8285,32 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             Pose2Sim_config_dict["project"]["participant_height"] = heights_m
             Pose2Sim_config_dict["project"]["participant_mass"] = masses
             Pose2Sim_config_dict["project"]["frame_range"] = "all"
-            Pose2Sim_config_dict["markerAugmentation"]["feet_on_floor"] = feet_on_floor
-            Pose2Sim_config_dict["pose"]["pose_model"] = pose_model_name.upper()
+            resolved_pose2sim_model_name = _configure_pose2sim_kinematics_bridge(
+                Pose2Sim_config_dict,
+                pose_model_name=pose_model_name,
+                feet_on_floor=feet_on_floor,
+            )
+            if resolved_pose2sim_model_name != str(pose_model_name).strip().upper():
+                logging.info(
+                    "OpenSim bridge remapped pose_model '%s' -> '%s' for Pose2Sim kinematics.",
+                    pose_model_name,
+                    resolved_pose2sim_model_name,
+                )
             Pose2Sim_config_dict = to_dict(Pose2Sim_config_dict)
 
             # Marker augmentation
             if use_augmentation:
                 logging.info("Running marker augmentation...")
                 augment_markers_all(Pose2Sim_config_dict)
-                logging.info(
-                    f"Augmented trc results saved to {pose3d_dir.resolve()}.\n"
-                )
+                if opensim_workspace_info is not None:
+                    logging.info(
+                        "Augmented TRC results staged in temporary OpenSim workspace %s.",
+                        opensim_pose3d_dir.resolve(),
+                    )
+                else:
+                    logging.info(
+                        f"Augmented trc results saved to {opensim_pose3d_dir.resolve()}.\n"
+                    )
 
             if do_ik:
                 if not save_angles or not calculate_angles:
@@ -7820,25 +8320,53 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 else:
                     logging.info("Running inverse kinematics...")
                     kinematics_all(Pose2Sim_config_dict)
-                    for mot_file in kinematics_dir.glob("*.mot"):
+                    for mot_file in opensim_kinematics_dir.glob("*.mot"):
                         if (mot_file.parent / (mot_file.stem + "_ik.mot")).exists():
                             os.remove(mot_file.parent / (mot_file.stem + "_ik.mot"))
                         os.rename(
                             mot_file, mot_file.parent / (mot_file.stem + "_ik.mot")
                         )
-                    logging.info(
-                        f".osim model and .mot motion file results saved to {kinematics_dir.resolve().parent}.\n"
-                    )
+                    if opensim_workspace_info is not None:
+                        logging.info(
+                            "OpenSim intermediate .osim and .mot artifacts saved to temporary workspace %s.",
+                            opensim_kinematics_dir.resolve().parent,
+                        )
+                    else:
+                        logging.info(
+                            f".osim model and .mot motion file results saved to {opensim_kinematics_dir.resolve().parent}.\n"
+                        )
 
-            # Move all files in pose-3d and kinematics to the output_dir
+            # Restore or preserve final pose-3d / kinematics layout.
             osim.Logger.removeFileSink()
-            for directory in [pose3d_dir, kinematics_dir]:
-                for file in directory.glob("*"):
-                    if (output_dir / file.name).exists():
-                        os.remove(output_dir / file.name)
-                    shutil.move(file, output_dir)
-            pose3d_dir.rmdir()
-            kinematics_dir.rmdir()
+            if opensim_workspace_info is not None:
+                _move_ascii_safe_opensim_outputs(
+                    opensim_workspace_info,
+                    native_pose3d_dir,
+                    native_kinematics_dir,
+                )
+                if native_pose3d_dir.exists() and not any(native_pose3d_dir.iterdir()):
+                    native_pose3d_dir.rmdir()
+                if native_kinematics_dir.exists() and not any(
+                    native_kinematics_dir.iterdir()
+                ):
+                    native_kinematics_dir.rmdir()
+                logging.info(
+                    "OpenSim pose-3d artifacts saved to %s.",
+                    native_pose3d_dir.resolve(),
+                )
+                logging.info(
+                    "OpenSim kinematics artifacts saved to %s.\n",
+                    native_kinematics_dir.resolve(),
+                )
+            else:
+                logging.info(
+                    "OpenSim pose-3d artifacts saved to %s.",
+                    opensim_pose3d_dir.resolve(),
+                )
+                logging.info(
+                    "OpenSim kinematics artifacts saved to %s.\n",
+                    opensim_kinematics_dir.resolve(),
+                )
 
     if public_meter_trc_data_by_name:
         for trc_name, trc_data_with_ball in public_meter_trc_data_by_name.items():

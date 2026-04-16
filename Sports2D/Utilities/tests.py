@@ -1866,6 +1866,452 @@ def test_append_trc_marker_aliases_preserves_existing_small_toe_triplets():
     assert aliased.equals(trc_data)
 
 
+def test_resolve_pose2sim_pose_model_name_maps_synthpose_to_halpe26():
+    """
+    Verify the OpenSim bridge normalizes SynthPose runtime names to HALPE_26.
+    """
+
+    from Sports2D.process import _resolve_pose2sim_pose_model_name
+
+    assert _resolve_pose2sim_pose_model_name("synthpose") == "HALPE_26"
+    assert _resolve_pose2sim_pose_model_name("synthpose_base") == "HALPE_26"
+    assert _resolve_pose2sim_pose_model_name("body_with_feet") == "HALPE_26"
+    assert _resolve_pose2sim_pose_model_name("whole_body_wrist") == "COCO_133_WRIST"
+    assert _resolve_pose2sim_pose_model_name("body") == "COCO_17"
+
+
+def test_configure_pose2sim_kinematics_bridge_sets_canonical_pose_model():
+    """
+    Verify the OpenSim bridge writes canonical Pose2Sim model names into the config.
+    """
+
+    from Sports2D.process import _configure_pose2sim_kinematics_bridge
+
+    config_dict = {
+        "markerAugmentation": {},
+        "pose": {},
+    }
+
+    resolved_name = _configure_pose2sim_kinematics_bridge(
+        config_dict,
+        pose_model_name="synthpose",
+        feet_on_floor=True,
+    )
+
+    assert resolved_name == "HALPE_26"
+    assert config_dict["pose"]["pose_model"] == "HALPE_26"
+    assert config_dict["markerAugmentation"]["feet_on_floor"] is True
+
+
+def test_should_use_ascii_safe_opensim_workspace_detects_non_ascii_paths(tmp_path):
+    """
+    Verify the OpenSim workspace workaround activates on non-ASCII paths.
+    """
+
+    from Sports2D.process import _should_use_ascii_safe_opensim_workspace
+
+    ascii_output_dir = tmp_path / "results"
+    unicode_output_dir = tmp_path / "정면_results"
+    ascii_trc = ascii_output_dir / "demo_m_person00.trc"
+    unicode_trc = ascii_output_dir / "정면_m_person00.trc"
+
+    assert _should_use_ascii_safe_opensim_workspace(ascii_output_dir, [ascii_trc]) is False
+    assert _should_use_ascii_safe_opensim_workspace(unicode_output_dir, [ascii_trc]) is True
+    assert _should_use_ascii_safe_opensim_workspace(ascii_output_dir, [unicode_trc]) is True
+
+
+def test_ascii_safe_opensim_workspace_restores_original_artifact_names(tmp_path):
+    """
+    Verify ASCII-staged OpenSim artifacts are moved back under their original stems.
+    """
+
+    from Sports2D.process import (
+        _create_ascii_safe_opensim_workspace,
+        _move_ascii_safe_opensim_outputs,
+    )
+
+    output_dir = tmp_path / "정면_Sports2D"
+    output_dir.mkdir()
+    final_pose3d_dir = output_dir / "pose-3d"
+    final_kinematics_dir = output_dir / "kinematics"
+    source_trc = output_dir / "정면_Sports2D_m_person00.trc"
+    source_trc.write_text("dummy trc", encoding="utf-8")
+
+    workspace_info = _create_ascii_safe_opensim_workspace([source_trc])
+    staged_files = list(workspace_info["pose3d_dir"].glob("*.trc"))
+
+    assert len(staged_files) == 1
+    assert staged_files[0].name.isascii()
+
+    staged_stem = next(iter(workspace_info["staged_stem_map"].keys()))
+    (workspace_info["pose3d_dir"] / f"{staged_stem}_LSTM.trc").write_text(
+        "augmented trc", encoding="utf-8"
+    )
+    (workspace_info["kinematics_dir"] / f"{staged_stem}.osim").write_text(
+        "scaled model", encoding="utf-8"
+    )
+    (workspace_info["kinematics_dir"] / f"{staged_stem}.mot").write_text(
+        "ik motion", encoding="utf-8"
+    )
+
+    _move_ascii_safe_opensim_outputs(
+        workspace_info,
+        final_pose3d_dir,
+        final_kinematics_dir,
+    )
+
+    assert (final_pose3d_dir / "정면_Sports2D_m_person00.trc").exists()
+    assert (final_pose3d_dir / "정면_Sports2D_m_person00_LSTM.trc").exists()
+    assert (final_kinematics_dir / "정면_Sports2D_m_person00.osim").exists()
+    assert (final_kinematics_dir / "정면_Sports2D_m_person00.mot").exists()
+    assert source_trc.exists()
+
+
+def test_build_body_with_feet_opensim_bridge_trc_data_uses_original_22_marker_order():
+    """
+    Verify body_with_feet OpenSim bridge TRCs match the original 22-marker contract.
+    """
+
+    from Sports2D.process import (
+        BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS,
+        _build_body_with_feet_opensim_bridge_trc_data,
+    )
+
+    current_markers = [
+        "Nose",
+        "LEye",
+        "REye",
+        "LEar",
+        "REar",
+        "LShoulder",
+        "RShoulder",
+        "LElbow",
+        "RElbow",
+        "LWrist",
+        "RWrist",
+        "LHip",
+        "RHip",
+        "LKnee",
+        "RKnee",
+        "LAnkle",
+        "RAnkle",
+        "Head",
+        "Neck",
+        "Hip",
+        "LBigToe",
+        "RBigToe",
+        "LSmallToe",
+        "RSmallToe",
+        "LHeel",
+        "RHeel",
+    ]
+    data = {"time": [0.0, 0.1]}
+    for marker_idx, marker_name in enumerate(current_markers):
+        data[f"{marker_name}_{marker_idx}_x"] = [marker_idx + 0.0, marker_idx + 0.5]
+        data[f"{marker_name}_{marker_idx}_y"] = [marker_idx + 1.0, marker_idx + 1.5]
+        data[f"{marker_name}_{marker_idx}_z"] = [marker_idx + 2.0, marker_idx + 2.5]
+    trc_data = pd.DataFrame(data)
+    trc_data.columns = ["time"] + [marker for marker in current_markers for _ in range(3)]
+
+    bridge_trc = _build_body_with_feet_opensim_bridge_trc_data(trc_data)
+
+    assert bridge_trc.columns.tolist() == ["time"] + [
+        marker_name
+        for marker_name in BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS
+        for _ in range(3)
+    ]
+
+
+def test_resolve_meter_conversion_trc_data_uses_original_22_marker_order_for_body_with_feet():
+    """
+    Verify body_with_feet meter conversion reuses the original sparse 22-marker schema.
+    """
+
+    from Sports2D.process import (
+        BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS,
+        _resolve_meter_conversion_trc_data,
+    )
+
+    current_markers = [
+        "Nose",
+        "LEye",
+        "REye",
+        "LEar",
+        "REar",
+        "LShoulder",
+        "RShoulder",
+        "LElbow",
+        "RElbow",
+        "LWrist",
+        "RWrist",
+        "LHip",
+        "RHip",
+        "LKnee",
+        "RKnee",
+        "LAnkle",
+        "RAnkle",
+        "Head",
+        "Neck",
+        "Hip",
+        "LBigToe",
+        "RBigToe",
+        "LSmallToe",
+        "RSmallToe",
+        "LHeel",
+        "RHeel",
+    ]
+    trc_data = pd.DataFrame({"time": [0.0]})
+    trc_data = pd.concat(
+        [
+            trc_data,
+            pd.DataFrame(
+                np.arange(len(current_markers) * 3, dtype=float).reshape(1, -1),
+                columns=[marker_name for marker_name in current_markers for _ in range(3)],
+            ),
+        ],
+        axis=1,
+    )
+
+    resolved = _resolve_meter_conversion_trc_data("body_with_feet", trc_data)
+
+    assert resolved.columns.tolist() == ["time"] + [
+        marker_name
+        for marker_name in BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS
+        for _ in range(3)
+    ]
+
+
+def test_select_pose_keypoint_columns_reorders_dense_metadata_to_sparse_schema():
+    """
+    Verify dense body_with_feet metadata can be reordered to the sparse 22-marker schema.
+    """
+
+    from Sports2D.process import (
+        BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS,
+        _select_pose_keypoint_columns,
+    )
+
+    dense_names = [
+        "Nose",
+        "LEye",
+        "REye",
+        "LEar",
+        "REar",
+        "LShoulder",
+        "RShoulder",
+        "LElbow",
+        "RElbow",
+        "LWrist",
+        "RWrist",
+        "LHip",
+        "RHip",
+        "LKnee",
+        "RKnee",
+        "LAnkle",
+        "RAnkle",
+        "Head",
+        "Neck",
+        "Hip",
+        "LBigToe",
+        "RBigToe",
+        "LSmallToe",
+        "RSmallToe",
+        "LHeel",
+        "RHeel",
+    ]
+    dense_values = np.arange(len(dense_names), dtype=int)
+
+    sparse_values = _select_pose_keypoint_columns(
+        dense_values,
+        dense_names,
+        BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS,
+    )
+
+    expected = np.array(
+        [dense_names.index(marker_name) for marker_name in BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS],
+        dtype=int,
+    )
+    assert np.array_equal(sparse_values, expected)
+
+
+def test_resolve_meter_conversion_trc_data_leaves_non_body_with_feet_unchanged():
+    """
+    Verify non-body_with_feet meter conversion keeps the original TRC schema.
+    """
+
+    from Sports2D.process import _resolve_meter_conversion_trc_data
+
+    trc_data = pd.DataFrame(
+        {
+            "time": [0.0],
+            "Nose": [1.0],
+            "Nose.1": [2.0],
+            "Nose.2": [3.0],
+            "LEye": [4.0],
+            "LEye.1": [5.0],
+            "LEye.2": [6.0],
+        }
+    )
+    trc_data.columns = ["time", "Nose", "Nose", "Nose", "LEye", "LEye", "LEye"]
+
+    resolved = _resolve_meter_conversion_trc_data("whole_body", trc_data)
+
+    assert resolved.equals(trc_data)
+
+
+def test_build_body_with_feet_opensim_bridge_trc_data_raises_on_missing_marker():
+    """
+    Verify the body_with_feet bridge helper fails loudly when a required marker is absent.
+    """
+
+    from Sports2D.process import _build_body_with_feet_opensim_bridge_trc_data
+
+    trc_data = pd.DataFrame(
+        {
+            "time": [0.0],
+            "Hip": [1.0],
+            "Hip.1": [2.0],
+            "Hip.2": [3.0],
+        }
+    )
+    trc_data.columns = ["time", "Hip", "Hip", "Hip"]
+
+    with pytest.raises(ValueError, match="missing required markers"):
+        _build_body_with_feet_opensim_bridge_trc_data(trc_data)
+
+
+def test_resolve_opensim_bridge_trc_data_leaves_non_body_with_feet_unchanged():
+    """
+    Verify non-body_with_feet OpenSim bridge paths keep the original TRC schema.
+    """
+
+    from Sports2D.process import _resolve_opensim_bridge_trc_data
+
+    trc_data = pd.DataFrame(
+        {
+            "time": [0.0],
+            "Nose": [1.0],
+            "Nose.1": [2.0],
+            "Nose.2": [3.0],
+            "LEye": [4.0],
+            "LEye.1": [5.0],
+            "LEye.2": [6.0],
+        }
+    )
+    trc_data.columns = ["time", "Nose", "Nose", "Nose", "LEye", "LEye", "LEye"]
+
+    resolved = _resolve_opensim_bridge_trc_data("whole_body", trc_data)
+
+    assert resolved.equals(trc_data)
+
+
+def test_ascii_safe_opensim_workspace_uses_body_with_feet_bridge_trc_when_provided(
+    tmp_path,
+):
+    """
+    Verify the staged OpenSim input TRC can differ from the public TRC schema.
+    """
+
+    from Sports2D.process import (
+        BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS,
+        _create_ascii_safe_opensim_workspace,
+    )
+
+    output_dir = tmp_path / "측면_Sports2D"
+    output_dir.mkdir()
+    source_trc = output_dir / "측면_Sports2D_m_person00.trc"
+    source_trc.write_text("public trc", encoding="utf-8")
+
+    bridge_trc = pd.DataFrame(
+        {
+            "time": [0.0],
+            "Hip": [1.0],
+            "Hip.1": [2.0],
+            "Hip.2": [3.0],
+            "RHip": [4.0],
+            "RHip.1": [5.0],
+            "RHip.2": [6.0],
+            "RKnee": [7.0],
+            "RKnee.1": [8.0],
+            "RKnee.2": [9.0],
+            "RAnkle": [10.0],
+            "RAnkle.1": [11.0],
+            "RAnkle.2": [12.0],
+            "RBigToe": [13.0],
+            "RBigToe.1": [14.0],
+            "RBigToe.2": [15.0],
+            "RSmallToe": [16.0],
+            "RSmallToe.1": [17.0],
+            "RSmallToe.2": [18.0],
+            "RHeel": [19.0],
+            "RHeel.1": [20.0],
+            "RHeel.2": [21.0],
+            "LHip": [22.0],
+            "LHip.1": [23.0],
+            "LHip.2": [24.0],
+            "LKnee": [25.0],
+            "LKnee.1": [26.0],
+            "LKnee.2": [27.0],
+            "LAnkle": [28.0],
+            "LAnkle.1": [29.0],
+            "LAnkle.2": [30.0],
+            "LBigToe": [31.0],
+            "LBigToe.1": [32.0],
+            "LBigToe.2": [33.0],
+            "LSmallToe": [34.0],
+            "LSmallToe.1": [35.0],
+            "LSmallToe.2": [36.0],
+            "LHeel": [37.0],
+            "LHeel.1": [38.0],
+            "LHeel.2": [39.0],
+            "Neck": [40.0],
+            "Neck.1": [41.0],
+            "Neck.2": [42.0],
+            "Head": [43.0],
+            "Head.1": [44.0],
+            "Head.2": [45.0],
+            "Nose": [46.0],
+            "Nose.1": [47.0],
+            "Nose.2": [48.0],
+            "RShoulder": [49.0],
+            "RShoulder.1": [50.0],
+            "RShoulder.2": [51.0],
+            "RElbow": [52.0],
+            "RElbow.1": [53.0],
+            "RElbow.2": [54.0],
+            "RWrist": [55.0],
+            "RWrist.1": [56.0],
+            "RWrist.2": [57.0],
+            "LShoulder": [58.0],
+            "LShoulder.1": [59.0],
+            "LShoulder.2": [60.0],
+            "LElbow": [61.0],
+            "LElbow.1": [62.0],
+            "LElbow.2": [63.0],
+            "LWrist": [64.0],
+            "LWrist.1": [65.0],
+            "LWrist.2": [66.0],
+        }
+    )
+    bridge_trc.columns = ["time"] + [col.split(".")[0].split("_")[0] for col in bridge_trc.columns[1:]]
+
+    workspace_info = _create_ascii_safe_opensim_workspace(
+        [source_trc],
+        bridge_trc_data_by_name={source_trc.name: bridge_trc},
+        fps=60,
+    )
+
+    staged_trc = next(workspace_info["pose3d_dir"].glob("*.trc"))
+    lines = staged_trc.read_bytes().splitlines()
+    assert lines[2].decode("latin1", "replace").split("\t")[3] == "22"
+    staged_markers = [
+        marker_name
+        for marker_name in lines[3].decode("latin1", "replace").split("\t")[2::3]
+        if marker_name.strip()
+    ]
+    assert staged_markers == BODY_WITH_FEET_OPENSIM_BRIDGE_MARKERS
+
+
 def test_build_public_meter_trc_data_preserves_full_length_and_time_axis():
     """
     Verify final public meter TRCs keep the original sample count and time axis.
@@ -4140,7 +4586,7 @@ def test_build_pose_issue_list_reports_derived_points_as_read_only():
 
 def test_augment_pose_arrays_with_derived_keypoints_appends_review_markers():
     """
-    Verify hybrid review augments raw pose arrays with derived Hip/Neck markers.
+    Verify hybrid review augments raw pose arrays with derived Hip/Neck/Head markers.
     """
 
     from Sports2D.Utilities.hybrid_editor import (
@@ -4149,20 +4595,206 @@ def test_augment_pose_arrays_with_derived_keypoints_appends_review_markers():
 
     augmented_x, augmented_y, augmented_scores, keypoint_names = (
         augment_pose_arrays_with_derived_keypoints(
-            person_x_raw=np.array([[10.0, 30.0, 50.0, 70.0]], dtype=float),
-            person_y_raw=np.array([[100.0, 120.0, 140.0, 160.0]], dtype=float),
-            person_scores_raw=np.array([[0.8, 0.6, 0.9, 0.7]], dtype=float),
-            keypoint_names=["LHip", "RHip", "LShoulder", "RShoulder"],
+            person_x_raw=np.array([[10.0, 30.0, 50.0, 70.0, 90.0, 110.0]], dtype=float),
+            person_y_raw=np.array([[100.0, 120.0, 140.0, 160.0, 40.0, 40.0]], dtype=float),
+            person_scores_raw=np.array([[0.8, 0.6, 0.9, 0.7, 0.95, 0.85]], dtype=float),
+            keypoint_names=["LHip", "RHip", "LShoulder", "RShoulder", "LEye", "REye"],
         )
     )
 
-    assert keypoint_names == ["LHip", "RHip", "LShoulder", "RShoulder", "Hip", "Neck"]
-    assert augmented_x[0, 4] == pytest.approx(20.0)
-    assert augmented_y[0, 4] == pytest.approx(110.0)
-    assert augmented_scores[0, 4] == pytest.approx(0.7)
-    assert augmented_x[0, 5] == pytest.approx(60.0)
-    assert augmented_y[0, 5] == pytest.approx(150.0)
-    assert augmented_scores[0, 5] == pytest.approx(0.8)
+    assert keypoint_names == [
+        "LHip",
+        "RHip",
+        "LShoulder",
+        "RShoulder",
+        "LEye",
+        "REye",
+        "Hip",
+        "Neck",
+        "Head",
+    ]
+    assert augmented_x[0, 6] == pytest.approx(20.0)
+    assert augmented_y[0, 6] == pytest.approx(110.0)
+    assert augmented_scores[0, 6] == pytest.approx(0.7)
+    assert augmented_x[0, 7] == pytest.approx(60.0)
+    assert augmented_y[0, 7] == pytest.approx(150.0)
+    assert augmented_scores[0, 7] == pytest.approx(0.8)
+    assert augmented_x[0, 8] == pytest.approx(100.0)
+    assert augmented_y[0, 8] == pytest.approx(24.0)
+    assert augmented_scores[0, 8] == pytest.approx(0.9)
+
+
+def test_upsert_derived_pose_keypoint_builds_head_from_eye_midpoint():
+    """
+    Verify process-time derived Head uses the eye midpoint with an upward offset.
+    """
+
+    from Sports2D.process import _upsert_derived_pose_keypoint
+
+    person_x, person_y, person_scores, keypoint_names = _upsert_derived_pose_keypoint(
+        "Head",
+        np.array([90.0, 110.0, 100.0], dtype=float),
+        np.array([40.0, 40.0, 52.0], dtype=float),
+        np.array([0.95, 0.85, 0.7], dtype=float),
+        ["LEye", "REye", "Nose"],
+    )
+
+    assert keypoint_names == ["LEye", "REye", "Nose", "Head"]
+    assert person_x[-1] == pytest.approx(100.0)
+    assert person_y[-1] == pytest.approx(24.0)
+    assert person_scores[-1] == pytest.approx(0.9)
+
+
+def test_upsert_derived_pose_keypoint_pads_arrays_when_name_already_exists():
+    """
+    Verify derived-marker upsert tolerates keypoint names that already include the target marker.
+    """
+
+    from Sports2D.process import _upsert_derived_pose_keypoint
+
+    person_x, person_y, person_scores, keypoint_names = _upsert_derived_pose_keypoint(
+        "Head",
+        np.array([90.0, 110.0, 100.0], dtype=float),
+        np.array([40.0, 40.0, 52.0], dtype=float),
+        np.array([0.95, 0.85, 0.7], dtype=float),
+        ["LEye", "REye", "Nose", "Head"],
+    )
+
+    assert keypoint_names == ["LEye", "REye", "Nose", "Head"]
+    assert person_x.shape == (4,)
+    assert person_y.shape == (4,)
+    assert person_scores.shape == (4,)
+    assert person_x[-1] == pytest.approx(100.0)
+    assert person_y[-1] == pytest.approx(24.0)
+    assert person_scores[-1] == pytest.approx(0.9)
+
+
+def test_recompute_pose_frame_from_raw_preserves_native_head_marker():
+    """
+    Verify models that already provide Head keep that native marker during recompute.
+    """
+
+    from Sports2D.process import _recompute_pose_frame_from_raw
+
+    (
+        person_x,
+        person_y,
+        person_scores,
+        _person_x_flipped,
+        _person_angles,
+        keypoint_names,
+    ) = _recompute_pose_frame_from_raw(
+        raw_person_X=np.array([90.0, 110.0, 80.0, 70.0, 130.0], dtype=float),
+        raw_person_Y=np.array([40.0, 40.0, -10.0, 100.0, 100.0], dtype=float),
+        raw_person_scores=np.array([0.95, 0.85, 0.99, 0.9, 0.9], dtype=float),
+        raw_keypoint_names=["LEye", "REye", "Head", "LShoulder", "RShoulder"],
+        keypoint_likelihood_threshold=0.0,
+        average_likelihood_threshold=0.0,
+        keypoint_number_threshold=0.0,
+        flip_left_right=False,
+        L_R_direction_idx=None,
+        angle_names=[],
+        calculate_angles=False,
+    )
+
+    head_idx = keypoint_names.index("Head")
+    assert person_x[head_idx] == pytest.approx(80.0)
+    assert person_y[head_idx] == pytest.approx(-10.0)
+    assert person_scores[head_idx] == pytest.approx(0.99)
+
+
+def test_resolve_person_visible_side_frame_auto_uses_toe_heel_orientation():
+    """
+    Verify auto visible-side resolution matches the upstream toe/heel orientation rule.
+    """
+
+    from Sports2D.process import _resolve_person_visible_side_frame
+
+    assert (
+        _resolve_person_visible_side_frame(
+            np.array([0.0, 10.0, 20.0, 10.0], dtype=float),
+            "auto",
+            True,
+            [0, 1, 2, 3],
+        )
+        == "right"
+    )
+    assert (
+        _resolve_person_visible_side_frame(
+            np.array([10.0, 0.0, 0.0, 20.0], dtype=float),
+            "auto",
+            True,
+            [0, 1, 2, 3],
+        )
+        == "left"
+    )
+
+
+def test_apply_visible_side_whole_body_flip_matches_upstream_front_back_rules():
+    """
+    Verify visible-side whole-body flipping matches the original Sports2D semantics.
+    """
+
+    from Sports2D.process import _apply_visible_side_whole_body_flip
+
+    person_x = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=float)
+    keypoint_names = ["LHip", "RHip", "Hip", "LShoulder", "RShoulder"]
+    keypoint_ids = list(range(len(keypoint_names)))
+
+    assert np.allclose(
+        _apply_visible_side_whole_body_flip(
+            person_x, "left", keypoint_names, keypoint_ids
+        ),
+        np.array([-1.0, -2.0, -3.0, -4.0, -5.0], dtype=float),
+    )
+    assert np.allclose(
+        _apply_visible_side_whole_body_flip(
+            person_x, "front", keypoint_names, keypoint_ids
+        ),
+        np.array([1.0, -2.0, 3.0, 4.0, -5.0], dtype=float),
+    )
+    assert np.allclose(
+        _apply_visible_side_whole_body_flip(
+            person_x, "back", keypoint_names, keypoint_ids
+        ),
+        np.array([-1.0, 2.0, 3.0, -4.0, 5.0], dtype=float),
+    )
+
+
+def test_recompute_pose_frame_from_raw_uses_visible_side_whole_body_flip_when_enabled():
+    """
+    Verify recompute path applies the upstream visible-side whole-body flip rule.
+    """
+
+    from Sports2D.process import _recompute_pose_frame_from_raw
+
+    (
+        _person_x,
+        _person_y,
+        _person_scores,
+        person_x_flipped,
+        person_angles,
+        keypoint_names,
+    ) = _recompute_pose_frame_from_raw(
+        raw_person_X=np.array([10.0, 20.0, 30.0, 40.0], dtype=float),
+        raw_person_Y=np.array([100.0, 120.0, 140.0, 160.0], dtype=float),
+        raw_person_scores=np.array([0.9, 0.8, 0.95, 0.85], dtype=float),
+        raw_keypoint_names=["LHip", "RHip", "LShoulder", "RShoulder"],
+        keypoint_likelihood_threshold=0.0,
+        average_likelihood_threshold=0.0,
+        keypoint_number_threshold=0.0,
+        flip_left_right=True,
+        L_R_direction_idx=None,
+        angle_names=[],
+        calculate_angles=False,
+        visible_side_person="front",
+        use_visible_side_whole_body_flip=True,
+        has_toe_heel=False,
+    )
+
+    assert keypoint_names == ["LHip", "RHip", "LShoulder", "RShoulder", "Hip", "Neck", "Head"]
+    assert np.allclose(person_x_flipped[:4], np.array([10.0, -20.0, 30.0, -40.0]))
+    assert person_angles.size == 0
 
 
 def test_build_ball_issue_list_reports_missing_low_confidence_and_manual_override():

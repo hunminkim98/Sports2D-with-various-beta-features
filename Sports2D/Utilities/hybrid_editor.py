@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 
-DERIVED_KEYPOINT_SEQUENCE = ("Hip", "Neck")
+DERIVED_KEYPOINT_SEQUENCE = ("Hip", "Neck", "Head")
 DERIVED_KEYPOINT_NAMES = set(DERIVED_KEYPOINT_SEQUENCE)
 DERIVED_KEYPOINT_SOURCES = {
     "Hip": ("LHip", "RHip"),
@@ -47,6 +47,56 @@ def _rowwise_nanmean(values):
     return result
 
 
+def _derive_head_rows(person_x_raw, person_y_raw, person_scores_raw, keypoint_names):
+    """
+    Derive a HALPE-style Head marker from eye landmarks, with Nose fallback.
+    """
+
+    keypoint_names = list(keypoint_names or [])
+    head_x = np.full((person_x_raw.shape[0],), np.nan, dtype=float)
+    head_y = np.full((person_y_raw.shape[0],), np.nan, dtype=float)
+    head_scores = np.full((person_scores_raw.shape[0],), np.nan, dtype=float)
+
+    if "LEye" in keypoint_names and "REye" in keypoint_names:
+        left_eye_idx = keypoint_names.index("LEye")
+        right_eye_idx = keypoint_names.index("REye")
+        left_eye_x = person_x_raw[:, left_eye_idx]
+        right_eye_x = person_x_raw[:, right_eye_idx]
+        left_eye_y = person_y_raw[:, left_eye_idx]
+        right_eye_y = person_y_raw[:, right_eye_idx]
+        eye_mask = (
+            np.isfinite(left_eye_x)
+            & np.isfinite(right_eye_x)
+            & np.isfinite(left_eye_y)
+            & np.isfinite(right_eye_y)
+        )
+        if np.any(eye_mask):
+            eye_center_x = (left_eye_x + right_eye_x) * 0.5
+            eye_center_y = (left_eye_y + right_eye_y) * 0.5
+            eye_distance = np.sqrt(
+                np.square(left_eye_x - right_eye_x) + np.square(left_eye_y - right_eye_y)
+            )
+            head_x[eye_mask] = eye_center_x[eye_mask]
+            head_y[eye_mask] = eye_center_y[eye_mask] - eye_distance[eye_mask] * 0.8
+            left_eye_score = person_scores_raw[:, left_eye_idx]
+            right_eye_score = person_scores_raw[:, right_eye_idx]
+            head_scores[eye_mask] = (
+                left_eye_score[eye_mask] + right_eye_score[eye_mask]
+            ) * 0.5
+
+    if "Nose" in keypoint_names:
+        nose_idx = keypoint_names.index("Nose")
+        nose_x = person_x_raw[:, nose_idx]
+        nose_y = person_y_raw[:, nose_idx]
+        nose_scores = person_scores_raw[:, nose_idx]
+        nose_mask = np.isfinite(nose_x) & np.isfinite(nose_y) & ~np.isfinite(head_x)
+        head_x[nose_mask] = nose_x[nose_mask]
+        head_y[nose_mask] = nose_y[nose_mask]
+        head_scores[nose_mask] = nose_scores[nose_mask]
+
+    return head_x, head_y, head_scores
+
+
 def refresh_pose_derived_keypoints(person_x_raw, person_y_raw, person_scores_raw, keypoint_names: Sequence[str]):
     """
     Recompute read-only derived markers such as Hip/Neck from their source keypoints.
@@ -68,6 +118,15 @@ def refresh_pose_derived_keypoints(person_x_raw, person_y_raw, person_scores_raw
             continue
 
         derived_idx = keypoint_names.index(derived_name)
+        if derived_name == "Head":
+            head_x, head_y, head_scores = _derive_head_rows(
+                person_x_raw, person_y_raw, person_scores_raw, keypoint_names
+            )
+            person_x_raw[:, derived_idx] = head_x
+            person_y_raw[:, derived_idx] = head_y
+            person_scores_raw[:, derived_idx] = head_scores
+            continue
+
         source_names = DERIVED_KEYPOINT_SOURCES.get(derived_name, ())
         if not source_names or not all(source_name in keypoint_names for source_name in source_names):
             person_x_raw[:, derived_idx] = np.nan
