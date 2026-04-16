@@ -1,26 +1,26 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-'''
-    ##################################################
-    ## Pose Estimation Backend Abstraction Layer    ##
-    ##################################################
+"""
+##################################################
+## Pose Estimation Backend Abstraction Layer    ##
+##################################################
 
-    Unified interface for pose estimation backends (RTMLib, SynthPose).
+Unified interface for pose estimation backends (RTMLib, SynthPose).
 
-    This module provides:
-    - PoseBackend: Abstract base class defining the interface
-    - RTMLibBackend: ONNX-based pose estimation via Pose2Sim/rtmlib
-    - SynthPoseBackend: PyTorch-based VitPose estimation
-    - create_pose_backend(): Factory function for backend creation
+This module provides:
+- PoseBackend: Abstract base class defining the interface
+- RTMLibBackend: ONNX-based pose estimation via Pose2Sim/rtmlib
+- SynthPoseBackend: PyTorch-based VitPose estimation
+- create_pose_backend(): Factory function for backend creation
 
-    Usage:
-        from Sports2D.Utilities.pose_backend import create_pose_backend
+Usage:
+    from Sports2D.Utilities.pose_backend import create_pose_backend
 
-        config = {'pose': {'pose_model': 'synthpose', 'device': 'auto', ...}}
-        backend = create_pose_backend(config)
-        keypoints, scores = backend(frame)
-'''
+    config = {'pose': {'pose_model': 'synthpose', 'device': 'auto', ...}}
+    backend = create_pose_backend(config)
+    keypoints, scores = backend(frame)
+"""
 
 from abc import ABC, abstractmethod
 from typing import Tuple, List, Dict, Optional, Sequence
@@ -36,6 +36,7 @@ from Sports2D.Utilities.manual_roi import (
     offset_xyxy_boxes_to_full_frame,
     roi_from_boxes_xyxy,
 )
+from Sports2D.Utilities.synthpose_skeleton import HALPE26_KEYPOINT_NAMES
 
 
 # Retry delay for tracker initialization (multi-threading conflicts)
@@ -73,13 +74,44 @@ def _keypoint_names_in_output_order(skeleton_tree) -> List[str]:
     indexed_names.sort(key=lambda item: item[0])
     ordered_ids = [item[0] for item in indexed_names]
     expected_ids = list(range(len(indexed_names)))
+    if ordered_ids == [
+        0,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+    ]:
+        return list(HALPE26_KEYPOINT_NAMES)
+
     if ordered_ids != expected_ids:
         logging.warning(
             "Skeleton keypoint ids are not contiguous: %s. "
-            "Output-order keypoint names may be ambiguous.",
+            "Falling back to placeholder names for missing dense output slots.",
             ordered_ids,
         )
-    return [item[1] for item in indexed_names]
+
+    name_by_id = {idx: name for idx, name in indexed_names}
+    max_id = max(ordered_ids)
+    return [
+        name_by_id.get(idx, f"__unused_keypoint_{idx:02d}") for idx in range(max_id + 1)
+    ]
 
 
 class PoseBackend(ABC):
@@ -172,7 +204,9 @@ class PoseBackend(ABC):
         """
         return {}
 
-    def prepare_video_context(self, video_file_path=None, frame_range=None, input_kind='video') -> None:
+    def prepare_video_context(
+        self, video_file_path=None, frame_range=None, input_kind="video"
+    ) -> None:
         """Optional hook for backends that need file-video context."""
         return None
 
@@ -189,17 +223,19 @@ class _StaticPersonROITracker:
         if self._roi_released:
             return self._pose_tracker(frame)
 
-        keypoints, scores = self._pose_tracker(crop_frame_to_roi(frame, self._person_roi))
+        keypoints, scores = self._pose_tracker(
+            crop_frame_to_roi(frame, self._person_roi)
+        )
         keypoints = offset_keypoints_to_full_frame(keypoints, self._person_roi)
         if np.isfinite(np.asarray(keypoints, dtype=np.float32)).any():
             self._roi_released = True
-            if hasattr(self._pose_tracker, 'reset'):
+            if hasattr(self._pose_tracker, "reset"):
                 self._pose_tracker.reset()
         return keypoints, scores
 
     def reset(self) -> None:
         self._roi_released = False
-        if hasattr(self._pose_tracker, 'reset'):
+        if hasattr(self._pose_tracker, "reset"):
             self._pose_tracker.reset()
 
 
@@ -243,22 +279,26 @@ class _AdaptivePersonROITracker:
             return False
         if self._last_full_frame_reacquire_frame is None:
             return True
-        return (self._frame_count - self._last_full_frame_reacquire_frame) >= self._reacquire_frequency
+        return (
+            self._frame_count - self._last_full_frame_reacquire_frame
+        ) >= self._reacquire_frequency
 
     def _tracker_uses_detection_cadence(self) -> bool:
-        return hasattr(self._pose_tracker, 'frame_cnt') and hasattr(self._pose_tracker, 'det_frequency')
+        return hasattr(self._pose_tracker, "frame_cnt") and hasattr(
+            self._pose_tracker, "det_frequency"
+        )
 
     def _tracker_will_run_detection(self) -> bool:
         if not self._tracker_uses_detection_cadence():
             return True
-        det_frequency = max(1, int(getattr(self._pose_tracker, 'det_frequency', 1)))
-        frame_cnt = int(getattr(self._pose_tracker, 'frame_cnt', 0))
+        det_frequency = max(1, int(getattr(self._pose_tracker, "det_frequency", 1)))
+        frame_cnt = int(getattr(self._pose_tracker, "frame_cnt", 0))
         return frame_cnt % det_frequency == 0
 
     def _clear_tracker_local_state(self) -> None:
-        if hasattr(self._pose_tracker, 'bboxes_last_frame'):
+        if hasattr(self._pose_tracker, "bboxes_last_frame"):
             self._pose_tracker.bboxes_last_frame = []
-        if hasattr(self._pose_tracker, 'track_ids_last_frame'):
+        if hasattr(self._pose_tracker, "track_ids_last_frame"):
             self._pose_tracker.track_ids_last_frame = []
 
     def _schedule_next_roi(self, roi) -> None:
@@ -282,13 +322,21 @@ class _AdaptivePersonROITracker:
         tracker_runs_detection = self._tracker_will_run_detection()
         if tracker_runs_detection:
             self._apply_pending_roi_if_needed()
-        force_full_frame = tracker_runs_detection and self._should_force_full_frame_reacquire()
+        force_full_frame = (
+            tracker_runs_detection and self._should_force_full_frame_reacquire()
+        )
         if tracker_runs_detection:
-            inference_roi = None if force_full_frame else roi_from_boxes_xyxy(
-                [self._active_person_roi],
-                frame_shape,
-                padding_px=0,
-            ) if self._active_person_roi is not None else None
+            inference_roi = (
+                None
+                if force_full_frame
+                else roi_from_boxes_xyxy(
+                    [self._active_person_roi],
+                    frame_shape,
+                    padding_px=0,
+                )
+                if self._active_person_roi is not None
+                else None
+            )
         else:
             inference_roi = self._last_inference_roi
 
@@ -332,7 +380,7 @@ class _AdaptivePersonROITracker:
         self._last_full_frame_reacquire_frame = None
         self._last_inference_roi = None
         self._frame_count = 0
-        if hasattr(self._pose_tracker, 'reset'):
+        if hasattr(self._pose_tracker, "reset"):
             self._pose_tracker.reset()
 
 
@@ -343,16 +391,16 @@ class _RTMLibBallAwareTracker:
     """
 
     MODE_TO_COCO_SIZE = {
-        'performance': 'x',
-        'balanced': 'm',
-        'lightweight': 's',
+        "performance": "x",
+        "balanced": "m",
+        "lightweight": "s",
     }
 
     COCO_YOLOX_MODELS = {
-        's': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx',
-        'm': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_m.onnx',
-        'l': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_l.onnx',
-        'x': 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_x.onnx',
+        "s": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.onnx",
+        "m": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_m.onnx",
+        "l": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_l.onnx",
+        "x": "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_x.onnx",
     }
 
     def __init__(
@@ -376,28 +424,32 @@ class _RTMLibBallAwareTracker:
         self._det_frequency = max(1, int(det_frequency))
         self._frame_count = 0
         self._ball_class_ids = set(ball_class_ids or [SPORTS_BALL_CLASS_ID])
-        self._ball_roi = tuple(int(v) for v in ball_roi) if ball_roi is not None else None
+        self._ball_roi = (
+            tuple(int(v) for v in ball_roi) if ball_roi is not None else None
+        )
         self._ball_ignore_zones = self._normalize_runtime_rois(ball_ignore_zones)
         self._ball_roi_released = False
         self.last_detections: Dict[str, np.ndarray] = self._empty_detections()
 
-        requested_size = self.MODE_TO_COCO_SIZE.get(str(mode).lower(), 'm')
-        detector_url = self.COCO_YOLOX_MODELS.get(requested_size, self.COCO_YOLOX_MODELS['m'])
-        detector_backend = backend if backend != 'auto' else 'onnxruntime'
-        detector_device = 'cuda' if device == 'cuda' else 'cpu'
+        requested_size = self.MODE_TO_COCO_SIZE.get(str(mode).lower(), "m")
+        detector_url = self.COCO_YOLOX_MODELS.get(
+            requested_size, self.COCO_YOLOX_MODELS["m"]
+        )
+        detector_backend = backend if backend != "auto" else "onnxruntime"
+        detector_device = "cuda" if device == "cuda" else "cpu"
 
         self._ball_detector = YOLOX(
             onnx_model=detector_url,
             model_input_size=(640, 640),
-            mode='multiclass',
+            mode="multiclass",
             nms_thr=float(np.clip(ball_nms_score_threshold, 0.01, 0.9)),
             score_thr=float(np.clip(ball_detection_threshold, 0.01, 0.9)),
             backend=detector_backend,
             device=detector_device,
         )
         logging.info(
-            'RTMLib ball detector initialized (weights=coco/%s, backend=%s, device=%s, '
-            'score_thr=%s, nms_thr=%s)',
+            "RTMLib ball detector initialized (weights=coco/%s, backend=%s, device=%s, "
+            "score_thr=%s, nms_thr=%s)",
             requested_size,
             detector_backend,
             detector_device,
@@ -408,12 +460,12 @@ class _RTMLibBallAwareTracker:
     @staticmethod
     def _empty_detections() -> Dict[str, np.ndarray]:
         return {
-            'boxes': np.empty((0, 4), dtype=np.float32),
-            'classes': np.empty((0,), dtype=np.int32),
-            'scores': np.empty((0,), dtype=np.float32),
-            'person_boxes': np.empty((0, 4), dtype=np.float32),
-            'ball_boxes': np.empty((0, 4), dtype=np.float32),
-            'ball_scores': np.empty((0,), dtype=np.float32),
+            "boxes": np.empty((0, 4), dtype=np.float32),
+            "classes": np.empty((0,), dtype=np.int32),
+            "scores": np.empty((0,), dtype=np.float32),
+            "person_boxes": np.empty((0, 4), dtype=np.float32),
+            "ball_boxes": np.empty((0, 4), dtype=np.float32),
+            "ball_scores": np.empty((0,), dtype=np.float32),
         }
 
     @staticmethod
@@ -445,7 +497,7 @@ class _RTMLibBallAwareTracker:
         boxes = self._ensure_xyxy(boxes)
         classes = np.asarray(classes, dtype=np.int32).reshape(-1)
         scores = np.asarray(scores, dtype=np.float32).reshape(-1)
-        ignore_zones = getattr(self, '_ball_ignore_zones', None) or []
+        ignore_zones = getattr(self, "_ball_ignore_zones", None) or []
         if len(ignore_zones) == 0 or len(boxes) == 0:
             return boxes, classes, scores
         if len(classes) != len(boxes):
@@ -478,10 +530,11 @@ class _RTMLibBallAwareTracker:
             return np.empty((0, 4), dtype=np.float32)
         return np.asarray(person_boxes, dtype=np.float32)
 
-    def _run_ball_detection(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _run_ball_detection(
+        self, frame: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         run_detection = (
-            self._frame_count % self._det_frequency == 0
-            or self._frame_count == 0
+            self._frame_count % self._det_frequency == 0 or self._frame_count == 0
         )
         if not run_detection:
             return (
@@ -491,10 +544,16 @@ class _RTMLibBallAwareTracker:
             )
 
         try:
-            active_ball_roi = None if getattr(self, '_ball_roi_released', False) else self._ball_roi
-            detector_outputs = self._ball_detector(crop_frame_to_roi(frame, active_ball_roi))
+            active_ball_roi = (
+                None if getattr(self, "_ball_roi_released", False) else self._ball_roi
+            )
+            detector_outputs = self._ball_detector(
+                crop_frame_to_roi(frame, active_ball_roi)
+            )
         except Exception as e:
-            logging.debug('RTMLib ball detector failed on frame %s: %s', self._frame_count, e)
+            logging.debug(
+                "RTMLib ball detector failed on frame %s: %s", self._frame_count, e
+            )
             return (
                 np.empty((0, 4), dtype=np.float32),
                 np.empty((0,), dtype=np.int32),
@@ -526,14 +585,22 @@ class _RTMLibBallAwareTracker:
             scores = np.empty((0,), dtype=np.float32)
         if len(scores) != len(boxes):
             scores = np.full((len(boxes),), np.nan, dtype=np.float32)
-        if not getattr(self, '_ball_roi_released', False) and self._ball_roi is not None and len(boxes) > 0:
+        if (
+            not getattr(self, "_ball_roi_released", False)
+            and self._ball_roi is not None
+            and len(boxes) > 0
+        ):
             boxes = offset_xyxy_boxes_to_full_frame(boxes, self._ball_roi)
         boxes, classes, scores = self._filter_ignored_ball_detections(
             boxes,
             classes,
             scores,
         )
-        if not getattr(self, '_ball_roi_released', False) and self._ball_roi is not None and len(boxes) > 0:
+        if (
+            not getattr(self, "_ball_roi_released", False)
+            and self._ball_roi is not None
+            and len(boxes) > 0
+        ):
             self._ball_roi_released = True
         return boxes, classes, scores
 
@@ -545,18 +612,22 @@ class _RTMLibBallAwareTracker:
         if len(classes) > 0 and len(boxes) > 0:
             ball_mask = np.isin(classes, list(self._ball_class_ids))
             ball_boxes = boxes[ball_mask]
-            ball_scores = det_scores[ball_mask] if len(det_scores) == len(boxes) else np.full((len(ball_boxes),), np.nan, dtype=np.float32)
+            ball_scores = (
+                det_scores[ball_mask]
+                if len(det_scores) == len(boxes)
+                else np.full((len(ball_boxes),), np.nan, dtype=np.float32)
+            )
         else:
             ball_boxes = np.empty((0, 4), dtype=np.float32)
             ball_scores = np.empty((0,), dtype=np.float32)
 
         self.last_detections = {
-            'boxes': boxes,
-            'classes': classes,
-            'scores': det_scores,
-            'person_boxes': person_boxes,
-            'ball_boxes': ball_boxes,
-            'ball_scores': ball_scores,
+            "boxes": boxes,
+            "classes": classes,
+            "scores": det_scores,
+            "person_boxes": person_boxes,
+            "ball_boxes": ball_boxes,
+            "ball_scores": ball_scores,
         }
         self._frame_count += 1
         return keypoints, scores
@@ -564,7 +635,7 @@ class _RTMLibBallAwareTracker:
     def reset(self) -> None:
         self._frame_count = 0
         self._ball_roi_released = False
-        if hasattr(self._pose_tracker, 'reset'):
+        if hasattr(self._pose_tracker, "reset"):
             self._pose_tracker.reset()
         self.last_detections = self._empty_detections()
 
@@ -599,54 +670,56 @@ class RTMLibBackend(PoseBackend):
         Raises:
             ValueError: If pose_model or mode is invalid
         """
-        from Pose2Sim.poseEstimation import setup_model_class_mode, setup_backend_device, setup_pose_tracker
+        from Pose2Sim.poseEstimation import (
+            setup_model_class_mode,
+            setup_backend_device,
+            setup_pose_tracker,
+        )
 
-        pose_config = config_dict.get('pose', {})
+        pose_config = config_dict.get("pose", {})
 
         # 1. Model and mode setup
-        pose_model_name = pose_config.get('pose_model', 'body_with_feet')
-        mode = pose_config.get('mode', 'balanced')
+        pose_model_name = pose_config.get("pose_model", "body_with_feet")
+        mode = pose_config.get("mode", "balanced")
 
         self._pose_model, self._ModelClass, self._mode = setup_model_class_mode(
-            pose_model_name,
-            mode,
-            config_dict
+            pose_model_name, mode, config_dict
         )
 
         # 2. Backend and device setup (ONNX providers)
-        backend = pose_config.get('backend', 'auto')
-        device = pose_config.get('device', 'auto')
+        backend = pose_config.get("backend", "auto")
+        device = pose_config.get("device", "auto")
         self._backend, self._device = setup_backend_device(backend, device)
 
-        det_frequency = pose_config.get('det_frequency', 4)
-        detect_ball = bool(pose_config.get('detect_ball', False))
-        manual_person_roi = pose_config.get('_manual_person_roi')
-        manual_ball_roi = pose_config.get('_manual_ball_roi') or manual_person_roi
+        det_frequency = pose_config.get("det_frequency", 4)
+        detect_ball = bool(pose_config.get("detect_ball", False))
+        manual_person_roi = pose_config.get("_manual_person_roi")
+        manual_ball_roi = pose_config.get("_manual_ball_roi") or manual_person_roi
         manual_roi_mode = normalize_manual_roi_mode(
-            pose_config.get('manual_roi_mode', 'bootstrap'),
+            pose_config.get("manual_roi_mode", "bootstrap"),
         )
         manual_roi_tracking_margin_px = max(
             0,
-            int(pose_config.get('manual_roi_tracking_margin_px', 48)),
+            int(pose_config.get("manual_roi_tracking_margin_px", 48)),
         )
         manual_roi_reacquire_patience = max(
             1,
-            int(pose_config.get('manual_roi_reacquire_patience', 6)),
+            int(pose_config.get("manual_roi_reacquire_patience", 6)),
         )
         manual_roi_reacquire_frequency = max(
             1,
-            int(pose_config.get('manual_roi_reacquire_frequency', 15)),
+            int(pose_config.get("manual_roi_reacquire_frequency", 15)),
         )
         manual_ball_ignore_zones = _RTMLibBallAwareTracker._normalize_runtime_rois(
-            pose_config.get('_manual_ball_ignore_zones'),
+            pose_config.get("_manual_ball_ignore_zones"),
         )
-        ball_class_ids = pose_config.get('ball_class_ids', [SPORTS_BALL_CLASS_ID])
+        ball_class_ids = pose_config.get("ball_class_ids", [SPORTS_BALL_CLASS_ID])
         ball_detection_threshold = pose_config.get(
-            'ball_detection_threshold',
+            "ball_detection_threshold",
             0.1,
         )
         ball_nms_score_threshold = pose_config.get(
-            'ball_nms_score_threshold',
+            "ball_nms_score_threshold",
             0.2,
         )
         if isinstance(ball_class_ids, int):
@@ -657,11 +730,11 @@ class RTMLibBackend(PoseBackend):
             except Exception:
                 ball_class_ids = [SPORTS_BALL_CLASS_ID]
 
-        if manual_roi_mode == 'adaptive_person' and manual_person_roi is None:
+        if manual_roi_mode == "adaptive_person" and manual_person_roi is None:
             logging.warning(
                 "manual_roi_mode='adaptive_person' requires a manual person ROI. Falling back to bootstrap."
             )
-            manual_roi_mode = 'bootstrap'
+            manual_roi_mode = "bootstrap"
 
         # Cache keypoint names and count
         self._keypoint_names = _keypoint_names_in_output_order(self._pose_model)
@@ -673,23 +746,35 @@ class RTMLibBackend(PoseBackend):
         def _init_default_tracker():
             try:
                 return setup_pose_tracker(
-                    self._ModelClass, det_frequency, self._mode,
-                    False, self._backend, self._device
+                    self._ModelClass,
+                    det_frequency,
+                    self._mode,
+                    False,
+                    self._backend,
+                    self._device,
                 )
             except RuntimeError as e:
                 # Retry once for multi-threading initialization issues
                 import time
-                logging.warning(f'RTMLib tracker init retry due to: {e}')
+
+                logging.warning(f"RTMLib tracker init retry due to: {e}")
                 time.sleep(TRACKER_INIT_RETRY_DELAY)
                 return setup_pose_tracker(
-                    self._ModelClass, det_frequency, self._mode,
-                    False, self._backend, self._device
+                    self._ModelClass,
+                    det_frequency,
+                    self._mode,
+                    False,
+                    self._backend,
+                    self._device,
                 )
 
         if detect_ball:
             try:
                 default_tracker = _init_default_tracker()
-                if manual_person_roi is not None and manual_roi_mode == 'adaptive_person':
+                if (
+                    manual_person_roi is not None
+                    and manual_roi_mode == "adaptive_person"
+                ):
                     default_tracker = _AdaptivePersonROITracker(
                         pose_tracker=default_tracker,
                         person_roi=manual_person_roi,
@@ -718,11 +803,14 @@ class RTMLibBackend(PoseBackend):
                 self._supports_ball_detection = True
             except Exception as e:
                 logging.warning(
-                    f'Ball detection requested but ball-aware tracker init failed: {e}. '
-                    'Falling back to standard RTMLib tracker.'
+                    f"Ball detection requested but ball-aware tracker init failed: {e}. "
+                    "Falling back to standard RTMLib tracker."
                 )
                 default_tracker = _init_default_tracker()
-                if manual_person_roi is not None and manual_roi_mode == 'adaptive_person':
+                if (
+                    manual_person_roi is not None
+                    and manual_roi_mode == "adaptive_person"
+                ):
                     default_tracker = _AdaptivePersonROITracker(
                         pose_tracker=default_tracker,
                         person_roi=manual_person_roi,
@@ -738,7 +826,7 @@ class RTMLibBackend(PoseBackend):
                 self._tracker = default_tracker
         else:
             default_tracker = _init_default_tracker()
-            if manual_person_roi is not None and manual_roi_mode == 'adaptive_person':
+            if manual_person_roi is not None and manual_roi_mode == "adaptive_person":
                 default_tracker = _AdaptivePersonROITracker(
                     pose_tracker=default_tracker,
                     person_roi=manual_person_roi,
@@ -753,9 +841,11 @@ class RTMLibBackend(PoseBackend):
                 )
             self._tracker = default_tracker
 
-        logging.info(f'RTMLibBackend initialized: model={pose_model_name}, mode={self._mode}, '
-                     f'backend={self._backend}, device={self._device}, keypoints={self._num_keypoints}, '
-                     f'ball_detection={self._supports_ball_detection}')
+        logging.info(
+            f"RTMLibBackend initialized: model={pose_model_name}, mode={self._mode}, "
+            f"backend={self._backend}, device={self._device}, keypoints={self._num_keypoints}, "
+            f"ball_detection={self._supports_ball_detection}"
+        )
 
     def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Run pose estimation. Returns (keypoints, scores)."""
@@ -765,8 +855,8 @@ class RTMLibBackend(PoseBackend):
         else:
             keypoints, scores = outputs
 
-        if self._supports_ball_detection and hasattr(self._tracker, 'last_detections'):
-            self._last_detections = getattr(self._tracker, 'last_detections', {}) or {}
+        if self._supports_ball_detection and hasattr(self._tracker, "last_detections"):
+            self._last_detections = getattr(self._tracker, "last_detections", {}) or {}
         else:
             self._last_detections = {}
 
@@ -774,7 +864,7 @@ class RTMLibBackend(PoseBackend):
 
     def reset(self) -> None:
         """Reset tracker state."""
-        if hasattr(self._tracker, 'reset'):
+        if hasattr(self._tracker, "reset"):
             self._tracker.reset()
         self._last_detections = {}
 
@@ -790,7 +880,7 @@ class RTMLibBackend(PoseBackend):
 
     @property
     def backend_name(self) -> str:
-        return 'rtmlib'
+        return "rtmlib"
 
     @property
     def keypoint_names(self) -> List[str]:
@@ -840,17 +930,17 @@ class SynthPoseBackend(PoseBackend):
 
     # Mode to VitPose model mapping (RTMLib compatibility)
     MODE_TO_VITPOSE = {
-        'performance': 'huge',   # VitPose-huge (most accurate)
-        'balanced': 'base',      # VitPose-base (balanced)
-        'lightweight': 'base',   # Fallback to base (lightweight not supported)
+        "performance": "huge",  # VitPose-huge (most accurate)
+        "balanced": "base",  # VitPose-base (balanced)
+        "lightweight": "base",  # Fallback to base (lightweight not supported)
     }
     # Explicit SynthPose model-size override mapping
     SYNTHPOSE_MODEL_SIZE_TO_VITPOSE = {
-        'performance': 'huge',
-        'balanced': 'base',
-        'lightweight': 'base',   # lightweight not available in HF model family
-        'huge': 'huge',
-        'base': 'base',
+        "performance": "huge",
+        "balanced": "base",
+        "lightweight": "base",  # lightweight not available in HF model family
+        "huge": "huge",
+        "base": "base",
     }
 
     def __init__(self, config_dict: dict):
@@ -883,21 +973,25 @@ class SynthPoseBackend(PoseBackend):
         from Sports2D.Utilities.synthpose_tracker import SynthPosePoseTracker
         from Sports2D.Utilities.synthpose_skeleton import (
             create_synthpose_skeleton,
-            SYNTHPOSE_KEYPOINT_NAMES
+            SYNTHPOSE_KEYPOINT_NAMES,
         )
 
-        pose_config = config_dict.get('pose', {})
-        pose_model = pose_config.get('pose_model', 'synthpose').lower()
-        mode = pose_config.get('mode', 'balanced').lower()
-        synthpose_model_size = pose_config.get('synthpose_model_size', '')
-        if synthpose_model_size in [None, '', 'auto', 'none']:
-            synthpose_model_size = pose_config.get('synthpose_detector_size', '')
-            if synthpose_model_size not in [None, '', 'auto', 'none']:
+        pose_config = config_dict.get("pose", {})
+        pose_model = pose_config.get("pose_model", "synthpose").lower()
+        mode = pose_config.get("mode", "balanced").lower()
+        synthpose_model_size = pose_config.get("synthpose_model_size", "")
+        if synthpose_model_size in [None, "", "auto", "none"]:
+            synthpose_model_size = pose_config.get("synthpose_detector_size", "")
+            if synthpose_model_size not in [None, "", "auto", "none"]:
                 logging.warning(
                     "`synthpose_detector_size` is deprecated. "
                     "Use `synthpose_model_size` to control VitPose model size."
                 )
-        synthpose_model_size = str(synthpose_model_size).lower() if synthpose_model_size not in [None, ''] else ''
+        synthpose_model_size = (
+            str(synthpose_model_size).lower()
+            if synthpose_model_size not in [None, ""]
+            else ""
+        )
 
         # Determine VitPose size:
         # 1) explicit synthpose_model_size override
@@ -911,89 +1005,103 @@ class SynthPoseBackend(PoseBackend):
                     f"Unknown synthpose_model_size '{synthpose_model_size}'. "
                     "Falling back to pose_model/mode selection."
                 )
-                synthpose_model_size = ''
+                synthpose_model_size = ""
 
         if not synthpose_model_size:
-            if pose_model == 'synthpose_base':
+            if pose_model == "synthpose_base":
                 # Explicit base model requested
-                self._mode = 'base'
-            elif pose_model == 'synthpose':
+                self._mode = "base"
+            elif pose_model == "synthpose":
                 # Generic synthpose - use mode parameter for model selection
-                if mode == 'lightweight':
+                if mode == "lightweight":
                     logging.warning(
                         "SynthPose does not support 'lightweight' mode. "
                         "VitPose-base (balanced) will be used instead. "
                         "For maximum accuracy, use mode='performance' (VitPose-huge)."
                     )
-                    self._mode = 'base'
-                elif mode == 'performance':
-                    self._mode = 'huge'
+                    self._mode = "base"
+                elif mode == "performance":
+                    self._mode = "huge"
                 else:
                     # balanced or any other value defaults to base
-                    self._mode = self.MODE_TO_VITPOSE.get(mode, 'base')
+                    self._mode = self.MODE_TO_VITPOSE.get(mode, "base")
             else:
                 # Unknown pose_model, default to huge
-                self._mode = 'huge'
+                self._mode = "huge"
 
         # Detectors must depend on mode parameter
-        detector_mode = mode if mode in ['performance', 'balanced', 'lightweight'] else 'balanced'
+        detector_mode = (
+            mode if mode in ["performance", "balanced", "lightweight"] else "balanced"
+        )
         if detector_mode != mode:
-            logging.warning(f"Unsupported mode '{mode}' for SynthPose detector. Using 'balanced'.")
+            logging.warning(
+                f"Unsupported mode '{mode}' for SynthPose detector. Using 'balanced'."
+            )
 
-        if synthpose_model_size == 'lightweight':
+        if synthpose_model_size == "lightweight":
             logging.warning(
                 "synthpose_model_size='lightweight' maps to VitPose-base "
                 "because no lightweight HF VitPose is available."
             )
 
         # Device selection (config takes priority, 'auto' triggers detection in tracker)
-        device = pose_config.get('device', 'auto')
+        device = pose_config.get("device", "auto")
         detector_threshold = pose_config.get(
-            'person_detection_threshold',
-            pose_config.get('keypoint_likelihood_threshold', 0.3),
+            "person_detection_threshold",
+            pose_config.get("keypoint_likelihood_threshold", 0.3),
         )
-        ball_detection_threshold = pose_config.get('ball_detection_threshold', 0.1)
+        ball_detection_threshold = pose_config.get("ball_detection_threshold", 0.1)
         show_realtime_sam3_masks = bool(
-            config_dict.get('base', {}).get('show_realtime_results', False)
-            and pose_config.get('sam3_show_realtime_masks', False)
+            config_dict.get("base", {}).get("show_realtime_results", False)
+            and pose_config.get("sam3_show_realtime_masks", False)
         )
 
         # Initialize tracker
         self._tracker = SynthPosePoseTracker(
             mode=self._mode,
             device=device,
-            det_frequency=pose_config.get('det_frequency', 4),
+            det_frequency=pose_config.get("det_frequency", 4),
             person_threshold=detector_threshold,
-            backend=pose_config.get('backend', 'auto'),
-            detector=pose_config.get('synthpose_detector', 'yolox'),
-            detect_ball=bool(pose_config.get('detect_ball', False)),
-            ball_class_ids=pose_config.get('ball_class_ids', [SPORTS_BALL_CLASS_ID]),
+            backend=pose_config.get("backend", "auto"),
+            detector=pose_config.get("synthpose_detector", "yolox"),
+            detect_ball=bool(pose_config.get("detect_ball", False)),
+            ball_class_ids=pose_config.get("ball_class_ids", [SPORTS_BALL_CLASS_ID]),
             ball_detection_threshold=ball_detection_threshold,
             # Detector size is controlled by mode parameter.
             detector_size=detector_mode,
-            ball_nms_score_threshold=pose_config.get('ball_nms_score_threshold', 0.2),
-            sam3_target=pose_config.get('sam3_target', 'ball'),
-            sam3_model_path=pose_config.get('sam3_model_path', ''),
-            sam3_processor_path=pose_config.get('sam3_processor_path', ''),
-            sam3_runtime=pose_config.get('sam3_runtime', 'transformers'),
-            sam3_store_masks=bool(pose_config.get('sam3_store_masks', False)),
+            ball_nms_score_threshold=pose_config.get("ball_nms_score_threshold", 0.2),
+            sam3_target=pose_config.get("sam3_target", "ball"),
+            sam3_model_path=pose_config.get("sam3_model_path", ""),
+            sam3_processor_path=pose_config.get("sam3_processor_path", ""),
+            sam3_runtime=pose_config.get("sam3_runtime", "transformers"),
+            sam3_store_masks=bool(pose_config.get("sam3_store_masks", False)),
             sam3_show_realtime_masks=show_realtime_sam3_masks,
             sam3_save_ball_masks=False,
-            sam3_inference_mode=pose_config.get('sam3_inference_mode', 'image'),
-            sam3_bootstrap_frames=pose_config.get('sam3_bootstrap_frames', 12),
-            sam3_video_refresh_frequency=pose_config.get('sam3_video_refresh_frequency', pose_config.get('det_frequency', 4)),
-            sam3_video_reseed_on_loss=bool(pose_config.get('sam3_video_reseed_on_loss', True)),
-            sam3_video_loss_patience=pose_config.get('sam3_video_loss_patience', 3),
-            ball_detector_backend=pose_config.get('ball_detector_backend', 'same'),
-            manual_person_roi=pose_config.get('_manual_person_roi'),
-            manual_ball_roi=pose_config.get('_manual_ball_roi'),
-            manual_ball_ignore_zones=_RTMLibBallAwareTracker._normalize_runtime_rois(
-                pose_config.get('_manual_ball_ignore_zones'),
+            sam3_inference_mode=pose_config.get("sam3_inference_mode", "image"),
+            sam3_bootstrap_frames=pose_config.get("sam3_bootstrap_frames", 12),
+            sam3_video_refresh_frequency=pose_config.get(
+                "sam3_video_refresh_frequency", pose_config.get("det_frequency", 4)
             ),
-            manual_roi_mode=pose_config.get('manual_roi_mode', 'bootstrap'),
-            manual_roi_tracking_margin_px=pose_config.get('manual_roi_tracking_margin_px', 48),
-            manual_roi_reacquire_patience=pose_config.get('manual_roi_reacquire_patience', 6),
-            manual_roi_reacquire_frequency=pose_config.get('manual_roi_reacquire_frequency', 15),
+            sam3_video_reseed_on_loss=bool(
+                pose_config.get("sam3_video_reseed_on_loss", True)
+            ),
+            sam3_video_loss_patience=pose_config.get("sam3_video_loss_patience", 3),
+            ball_detector_backend=pose_config.get("ball_detector_backend", "same"),
+            manual_person_roi=pose_config.get("_manual_person_roi"),
+            manual_ball_roi=pose_config.get("_manual_ball_roi"),
+            manual_ball_ignore_zones=_RTMLibBallAwareTracker._normalize_runtime_rois(
+                pose_config.get("_manual_ball_ignore_zones"),
+            ),
+            manual_roi_mode=pose_config.get("manual_roi_mode", "bootstrap"),
+            manual_roi_tracking_margin_px=pose_config.get(
+                "manual_roi_tracking_margin_px", 48
+            ),
+            manual_roi_reacquire_patience=pose_config.get(
+                "manual_roi_reacquire_patience", 6
+            ),
+            manual_roi_reacquire_frequency=pose_config.get(
+                "manual_roi_reacquire_frequency", 15
+            ),
         )
 
         # Store skeleton tree and keypoint names
@@ -1006,28 +1114,32 @@ class SynthPoseBackend(PoseBackend):
         if synthpose_model_size:
             mode_info += f", synthpose_model_size='{synthpose_model_size}'"
         mode_info += f" → vitpose='{self._mode}'"
-        logging.info(f'SynthPoseBackend initialized: {mode_info}, '
-                     f'detector={pose_config.get("synthpose_detector", "yolox")}, '
-                     f'device={self._tracker.device}, keypoints=52')
+        logging.info(
+            f"SynthPoseBackend initialized: {mode_info}, "
+            f"detector={pose_config.get('synthpose_detector', 'yolox')}, "
+            f"device={self._tracker.device}, keypoints=52"
+        )
 
     def __call__(self, frame: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Run pose estimation. Returns (keypoints, scores)."""
         keypoints, scores = self._tracker(frame)
-        self._last_detections = getattr(self._tracker, 'last_detections', {}) or {}
+        self._last_detections = getattr(self._tracker, "last_detections", {}) or {}
         return keypoints, scores
 
     def reset(self) -> None:
         """Reset tracker state."""
-        if hasattr(self._tracker, 'reset'):
+        if hasattr(self._tracker, "reset"):
             self._tracker.reset()
         else:
             self._tracker.frame_count = 0
             self._tracker.prev_boxes = None
         self._last_detections = {}
 
-    def prepare_video_context(self, video_file_path=None, frame_range=None, input_kind='video') -> None:
+    def prepare_video_context(
+        self, video_file_path=None, frame_range=None, input_kind="video"
+    ) -> None:
         """Forward file-video context to the tracker when supported."""
-        if hasattr(self._tracker, 'prepare_video_context'):
+        if hasattr(self._tracker, "prepare_video_context"):
             self._tracker.prepare_video_context(
                 video_file_path=video_file_path,
                 frame_range=frame_range,
@@ -1046,7 +1158,7 @@ class SynthPoseBackend(PoseBackend):
 
     @property
     def backend_name(self) -> str:
-        return 'synthpose'
+        return "synthpose"
 
     @property
     def keypoint_names(self) -> List[str]:
@@ -1098,15 +1210,15 @@ def create_pose_backend(config_dict: dict) -> PoseBackend:
         config = {'pose': {'pose_model': 'synthpose_base', 'device': 'cuda'}}
         backend = create_pose_backend(config)  # Uses VitPose-base
     """
-    pose_config = config_dict.get('pose', {})
-    pose_model = pose_config.get('pose_model', 'body_with_feet').lower()
+    pose_config = config_dict.get("pose", {})
+    pose_model = pose_config.get("pose_model", "body_with_feet").lower()
 
-    if pose_model in ['synthpose', 'synthpose_base']:
+    if pose_model in ["synthpose", "synthpose_base"]:
         try:
             return SynthPoseBackend(config_dict)
         except ImportError as e:
             message = str(e)
-            if message.startswith('Raw SAM3 checkpoints (.pt/.pth) require'):
+            if message.startswith("Raw SAM3 checkpoints (.pt/.pth) require"):
                 raise ImportError(
                     f"SynthPose requires additional dependencies: {message}\n"
                     "Raw SAM3 checkpoint mode is separate from sports2d[synthpose].\n"
@@ -1115,13 +1227,15 @@ def create_pose_backend(config_dict: dict) -> PoseBackend:
                     "Official SAM3 install docs currently target Python 3.12+, "
                     "PyTorch 2.7+, and CUDA 12.6 for the raw-checkpoint runtime."
                 ) from e
-            if message.startswith("Ultralytics YOLO detectors require the 'ultralytics' package."):
+            if message.startswith(
+                "Ultralytics YOLO detectors require the 'ultralytics' package."
+            ):
                 raise ImportError(
                     f"SynthPose requires additional dependencies: {message}\n"
                     "Install with: pip install sports2d[synthpose,yolo26]\n"
                     "Or: pip install torch transformers ultralytics"
                 ) from e
-            if message.startswith('Hugging Face SAM3 runtime requires'):
+            if message.startswith("Hugging Face SAM3 runtime requires"):
                 raise ImportError(
                     f"SynthPose requires additional dependencies: {message}\n"
                     "This means the current transformers install in this environment is too old for SAM3.\n"
