@@ -115,17 +115,48 @@ def _available_support_marker_names(marker_names):
 def _support_side_point_px(person_x, person_y, keypoint_names, side_prefix):
     keypoint_names = list(keypoint_names)
     side_prefix = str(side_prefix).strip().upper()
-    toe_names = (f"{side_prefix}BigToe", f"{side_prefix}Toe")
+    big_toe_name = f"{side_prefix}BigToe"
+    lateral_forefoot_names = (f"{side_prefix}SmallToe", f"{side_prefix}5Meta")
+    toe_tip_name = f"{side_prefix}Toe"
     heel_names = (f"{side_prefix}Heel",)
     ankle_names = (f"{side_prefix}Ankle",)
 
-    toe_point = _point_from_name_or_pair(
+    big_toe_point = _point_from_name_or_pair(
         person_x,
         person_y,
         keypoint_names,
-        marker_name=toe_names[0],
-        pair_names=toe_names,
+        marker_name=big_toe_name,
+        pair_names=(big_toe_name,),
     )
+    lateral_forefoot_point = None
+    for marker_name in lateral_forefoot_names:
+        lateral_forefoot_point = _point_from_name_or_pair(
+            person_x,
+            person_y,
+            keypoint_names,
+            marker_name=marker_name,
+            pair_names=(marker_name,),
+        )
+        if lateral_forefoot_point is not None:
+            break
+    toe_tip_point = _point_from_name_or_pair(
+        person_x,
+        person_y,
+        keypoint_names,
+        marker_name=toe_tip_name,
+        pair_names=(toe_tip_name,),
+    )
+
+    if big_toe_point is not None and lateral_forefoot_point is not None:
+        forefoot_point = 0.5 * (big_toe_point + lateral_forefoot_point)
+    elif big_toe_point is not None and toe_tip_point is not None:
+        forefoot_point = 0.5 * (big_toe_point + toe_tip_point)
+    elif big_toe_point is not None:
+        forefoot_point = big_toe_point
+    elif lateral_forefoot_point is not None:
+        forefoot_point = lateral_forefoot_point
+    else:
+        forefoot_point = toe_tip_point
     heel_point = _point_from_name_or_pair(
         person_x,
         person_y,
@@ -133,10 +164,13 @@ def _support_side_point_px(person_x, person_y, keypoint_names, side_prefix):
         marker_name=heel_names[0],
         pair_names=heel_names,
     )
-    if toe_point is not None and heel_point is not None:
-        return 0.5 * (toe_point + heel_point)
-    if toe_point is not None:
-        return toe_point
+
+    # Anchor the GRF arrow at the midpoint of each foot by blending the heel
+    # with the forefoot center (big toe + small toe when both exist).
+    if forefoot_point is not None and heel_point is not None:
+        return 0.5 * (forefoot_point + heel_point)
+    if forefoot_point is not None:
+        return forefoot_point
     if heel_point is not None:
         return heel_point
     ankle_point = _point_from_name_or_pair(
@@ -451,14 +485,10 @@ def estimate_grf_arrow_anchor_px(
     if len(support_points) == 0:
         return None
     support_points = np.asarray(support_points, dtype=float)
-    anchor_x = float(np.nanmean(support_points[:, 0]))
-    support_y = float(np.nanmax(support_points[:, 1]))
-    if floor_y_origin is None or not np.isfinite(float(floor_y_origin)):
-        anchor_y = support_y
-    else:
-        floor_y = float(floor_y_origin) - np.tan(float(floor_angle)) * (anchor_x - float(floor_x_origin))
-        anchor_y = max(support_y, float(floor_y))
-    return tuple(np.round([anchor_x, anchor_y]).astype(int).tolist())
+    anchor_point = np.nanmean(support_points, axis=0)
+    if not np.all(np.isfinite(anchor_point)):
+        return None
+    return tuple(np.round(anchor_point).astype(int).tolist())
 
 
 def resolve_vgrf_arrow_base_length_px(frame_height, min_length_px=120.0, height_ratio=(1.0 / 6.0)):

@@ -2093,9 +2093,9 @@ def test_analyze_vertical_jump_trial_returns_bodyweight_for_static_com():
     assert result["metrics"]["peak_vgrf_bw"] == pytest.approx(1.0)
 
 
-def test_estimate_grf_arrow_anchor_px_projects_to_floor_line():
+def test_estimate_grf_arrow_anchor_px_stays_at_support_midpoint():
     """
-    Verify GRF arrows anchor at the support midpoint and floor line.
+    Verify GRF arrows anchor at the averaged support midpoint.
     """
 
     from Sports2D.Utilities.motion import estimate_grf_arrow_anchor_px
@@ -2109,7 +2109,42 @@ def test_estimate_grf_arrow_anchor_px_projects_to_floor_line():
         floor_angle=0.0,
     )
 
-    assert anchor == (110, 520)
+    assert anchor == (110, 511)
+
+
+def test_estimate_grf_arrow_anchor_px_uses_forefoot_midpoint_when_smalltoes_exist():
+    """
+    Verify GRF arrows anchor at the heel-to-forefoot midpoint for each foot.
+    """
+
+    from Sports2D.Utilities.motion import estimate_grf_arrow_anchor_px
+
+    anchor = estimate_grf_arrow_anchor_px(
+        np.array(
+            [100.0, 120.0, 200.0, 80.0, 140.0, 160.0, 240.0, 120.0, 30.0],
+            dtype=float,
+        ),
+        np.array(
+            [510.0, 506.0, 500.0, 514.0, 508.0, 504.0, 498.0, 512.0, 60.0],
+            dtype=float,
+        ),
+        [
+            "LBigToe",
+            "LSmallToe",
+            "LToe",
+            "LHeel",
+            "RBigToe",
+            "RSmallToe",
+            "RToe",
+            "RHeel",
+            "Hip",
+        ],
+        floor_x_origin=0.0,
+        floor_y_origin=520.0,
+        floor_angle=0.0,
+    )
+
+    assert anchor == (115, 510)
 
 
 def test_resolve_vgrf_arrow_base_length_px_scales_with_frame_height():
