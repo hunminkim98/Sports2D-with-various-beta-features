@@ -119,12 +119,18 @@ from Sports2D.Utilities.sam3_detector import (
 )
 from Sports2D.Utilities.motion import (
     analyze_vertical_jump_trial,
+    build_external_loads_mot_data,
+    calculate_joint_contribution_from_id_storage,
+    calculate_sagittal_joint_contribution_from_id_storage,
     draw_com_proxy_overlay,
     draw_vgrf_arrow_overlay,
     estimate_grf_arrow_anchor_px,
     estimate_pelvis_trunk_com_xy_px,
+    estimate_shared_cop_series_m,
+    read_opensim_storage_file,
     write_grf_metrics_json,
     write_grf_trc,
+    write_opensim_mot,
 )
 
 from Sports2D.Utilities.common import *
@@ -1068,6 +1074,214 @@ def _configure_pose2sim_kinematics_bridge(
     return resolved_pose_model_name
 
 
+ESTIMATED_GRF_BODY_NAMES = {
+    "l": "calcn_l",
+    "r": "calcn_r",
+}
+
+
+def _resolve_inverse_dynamics_requested(kinematics_cfg):
+    kinematics_cfg = dict(kinematics_cfg or {})
+    if "inverse_dynamics" in kinematics_cfg:
+        return bool(kinematics_cfg.get("inverse_dynamics"))
+    if "Inverse_Dynamics" in kinematics_cfg:
+        return bool(kinematics_cfg.get("Inverse_Dynamics"))
+    return False
+
+
+def _resolve_inverse_dynamics_gate(
+    inverse_dynamics_requested,
+    do_ik,
+    vertical_jump_requested,
+    vertical_jump_enabled,
+    to_meters,
+    save_angles,
+    calculate_angles,
+):
+    if not inverse_dynamics_requested:
+        return False, None
+    if not do_ik:
+        return False, "kinematics.inverse_dynamics=true requires kinematics.do_ik=true. Skipping inverse dynamics."
+    if not to_meters:
+        return False, "kinematics.inverse_dynamics=true requires px_to_meters_conversion.to_meters=true. Skipping inverse dynamics."
+    if not vertical_jump_requested:
+        return False, "kinematics.inverse_dynamics=true requires motion.vertical_jump=true. Skipping inverse dynamics."
+    if not vertical_jump_enabled:
+        return False, "kinematics.inverse_dynamics=true could not use the GRF estimator for this run. Skipping inverse dynamics."
+    if not save_angles or not calculate_angles:
+        return False, "kinematics.inverse_dynamics=true requires save_angles=true and calculate_angles=true so inverse kinematics produces a motion file. Skipping inverse dynamics."
+    return True, None
+
+
+def _resolve_inverse_dynamics_cop_series(trc_data_m_export_i, inverse_dynamics_enabled):
+    if not inverse_dynamics_enabled:
+        return None
+    return estimate_shared_cop_series_m(trc_data_m_export_i)
+
+
+def _resolve_inverse_dynamics_artifact_paths(ik_mot_path):
+    ik_mot_path = Path(ik_mot_path)
+    if ik_mot_path.name.endswith("_ik.mot"):
+        base_stem = ik_mot_path.stem[:-3]
+    else:
+        base_stem = ik_mot_path.stem
+    return {
+        "grf_mot": ik_mot_path.parent / f"{base_stem}_grf.mot",
+        "external_loads_xml": ik_mot_path.parent / f"{base_stem}_ExternalLoads.xml",
+        "inverse_dynamics_sto": ik_mot_path.parent / f"{base_stem}_id.sto",
+        "metadata_json": ik_mot_path.parent / f"{base_stem}_id_metadata.json",
+    }
+
+
+def _resolve_inverse_dynamics_workspace_stem(trc_name, opensim_workspace_info):
+    original_stem = Path(trc_name).stem
+    if opensim_workspace_info is None:
+        return original_stem
+
+    staged_stem_map = dict(opensim_workspace_info.get("staged_stem_map", {}))
+    for staged_stem, restored_stem in staged_stem_map.items():
+        if restored_stem == original_stem:
+            return staged_stem
+    return original_stem
+
+
+def _serialize_inverse_dynamics_cop_series(cop_xyz_m):
+    if cop_xyz_m is None:
+        return None
+    cop_xyz_m = np.asarray(cop_xyz_m, dtype=float)
+    if cop_xyz_m.ndim != 2 or cop_xyz_m.shape[1] < 3:
+        return None
+    cop_xyz_m = cop_xyz_m[:, :3].copy()
+    if not np.all(np.isfinite(cop_xyz_m)):
+        return None
+    return cop_xyz_m
+
+
+def _build_inverse_dynamics_metadata_payload(
+    *,
+    trc_name,
+    ik_motion_file,
+    scaled_model_file,
+    external_loads_mot_file,
+    external_loads_xml_file,
+    inverse_dynamics_file,
+    metrics,
+    success,
+    error=None,
+):
+    metadata = {
+        "source": "estimated_vertical_grf",
+        "assumptions": {
+            "vertical_axis": "y",
+            "bilateral_force_split": "50:50",
+            "shared_cop_proxy": True,
+            "horizontal_forces_zero": True,
+            "free_torques_zero": True,
+        },
+        "trc_name": trc_name,
+        "ik_motion_file": ik_motion_file,
+        "scaled_model_file": scaled_model_file,
+        "external_loads_mot_file": external_loads_mot_file,
+        "external_loads_xml_file": external_loads_xml_file,
+        "inverse_dynamics_file": inverse_dynamics_file,
+        "metrics": metrics,
+        "success": bool(success),
+    }
+    if error:
+        metadata["error"] = str(error)
+    return metadata
+
+
+def _populate_joint_contribution_metadata(
+    metadata,
+    id_storage_df,
+    *,
+    start_frame,
+    end_frame,
+    frame_rate,
+):
+    try:
+        metadata["joint_contribution"] = calculate_joint_contribution_from_id_storage(
+            id_storage_df,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            frame_rate=frame_rate,
+        )
+    except Exception as joint_contribution_exc:
+        metadata["joint_contribution"] = {
+            "success": False,
+            "error": str(joint_contribution_exc),
+        }
+
+    try:
+        metadata["joint_contribution_sagittal"] = (
+            calculate_sagittal_joint_contribution_from_id_storage(
+                id_storage_df,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                frame_rate=frame_rate,
+            )
+        )
+    except Exception as sagittal_exc:
+        metadata["joint_contribution_sagittal"] = {
+            "success": False,
+            "definition": "sagittal_only",
+            "error": str(sagittal_exc),
+        }
+
+    return metadata
+
+
+def _write_estimated_grf_external_loads_xml(osim, xml_path, grf_mot_path):
+    xml_path = Path(xml_path)
+    grf_mot_path = Path(grf_mot_path)
+
+    external_loads = osim.ExternalLoads()
+    external_loads.setName("estimated_vertical_grf")
+    external_loads.setDataFileName(grf_mot_path.name)
+
+    for side in ["l", "r"]:
+        external_force = osim.ExternalForce()
+        external_force.setName(f"EstimatedGRF_{side.upper()}")
+        external_force.setAppliedToBodyName(ESTIMATED_GRF_BODY_NAMES[side])
+        external_force.setForceExpressedInBodyName("ground")
+        external_force.setPointExpressedInBodyName("ground")
+        external_force.setForceIdentifier(f"ground_force_{side}_v")
+        external_force.setPointIdentifier(f"ground_force_{side}_p")
+        external_force.setTorqueIdentifier(f"ground_torque_{side}_")
+        external_force.set_appliesForce(True)
+        external_loads.cloneAndAppend(external_force)
+
+    external_loads.printToXML(str(xml_path))
+    return xml_path
+
+
+def _run_estimated_grf_inverse_dynamics(
+    osim,
+    model_path,
+    ik_mot_path,
+    external_loads_xml_path,
+    output_sto_path,
+    start_time,
+    end_time,
+):
+    model_path = Path(model_path)
+    ik_mot_path = Path(ik_mot_path)
+    external_loads_xml_path = Path(external_loads_xml_path)
+    output_sto_path = Path(output_sto_path)
+
+    id_tool = osim.InverseDynamicsTool()
+    id_tool.setModelFileName(str(model_path))
+    id_tool.setCoordinatesFileName(str(ik_mot_path))
+    id_tool.setExternalLoadsFileName(str(external_loads_xml_path))
+    id_tool.setStartTime(float(start_time))
+    id_tool.setEndTime(float(end_time))
+    id_tool.setResultsDir(str(output_sto_path.parent))
+    id_tool.setOutputGenForceFileName(output_sto_path.name)
+    id_tool.run()
+    return output_sto_path
+
+
 def _contains_non_ascii_path(path_like):
     """
     Return True when the provided path contains non-ASCII characters.
@@ -1226,7 +1440,18 @@ def _move_ascii_safe_opensim_outputs(
             destination_path = destination_dir / restored_name
             if destination_path.exists():
                 os.remove(destination_path)
-            shutil.move(str(file_path), destination_path)
+            if file_path.suffix.lower() == ".xml":
+                xml_text = file_path.read_text(encoding="utf-8")
+                for staged_stem, original_stem in sorted(
+                    staged_stem_map.items(),
+                    key=lambda item: len(item[0]),
+                    reverse=True,
+                ):
+                    xml_text = xml_text.replace(staged_stem, original_stem)
+                destination_path.write_text(xml_text, encoding="utf-8")
+                os.remove(file_path)
+            else:
+                shutil.move(str(file_path), destination_path)
 
     shutil.rmtree(workspace_info["root_dir"], ignore_errors=True)
 
@@ -5358,7 +5583,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         )
     )
     motion_cfg = config_dict.get("motion", {}) or {}
-    vertical_jump = bool(motion_cfg.get("vertical_jump", False))
+    vertical_jump_requested = bool(motion_cfg.get("vertical_jump", False))
 
     # Pixel to meters conversion
     to_meters = config_dict.get("px_to_meters_conversion").get("to_meters")
@@ -5498,6 +5723,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     # Inverse kinematics settings
     do_ik = config_dict.get("kinematics").get("do_ik")
     use_augmentation = config_dict.get("kinematics").get("use_augmentation")
+    inverse_dynamics_requested = _resolve_inverse_dynamics_requested(
+        config_dict.get("kinematics")
+    )
     participant_masses = config_dict.get("kinematics").get("participant_mass")
     participant_masses = (
         participant_masses
@@ -5514,13 +5742,24 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     )
     close_to_zero_speed_px = config_dict.get("kinematics").get("close_to_zero_speed_px")
     close_to_zero_speed_m = config_dict.get("kinematics").get("close_to_zero_speed_m")
-    vertical_jump_enabled = bool(vertical_jump)
+    vertical_jump_enabled = bool(vertical_jump_requested)
     if vertical_jump_enabled and not to_meters:
         logging.warning(
             "motion.vertical_jump=true requires px_to_meters_conversion.to_meters=true. "
             "Skipping vertical jump estimation and overlays."
         )
         vertical_jump_enabled = False
+    inverse_dynamics_enabled, inverse_dynamics_skip_reason = _resolve_inverse_dynamics_gate(
+        inverse_dynamics_requested=inverse_dynamics_requested,
+        do_ik=do_ik,
+        vertical_jump_requested=vertical_jump_requested,
+        vertical_jump_enabled=vertical_jump_enabled,
+        to_meters=to_meters,
+        save_angles=save_angles,
+        calculate_angles=calculate_angles,
+    )
+    if inverse_dynamics_skip_reason is not None:
+        logging.warning(inverse_dynamics_skip_reason)
     write_meter_pose = bool(save_pose or do_ik or use_augmentation)
     need_floor_corrected_angles = bool(
         to_meters
@@ -7419,6 +7658,11 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     "full_vgrf_n": np.full(
                         (len(all_frames_time),), np.nan, dtype=float
                     ),
+                    "time_s": None,
+                    "vgrf_n": None,
+                    "cop_xyz_m": None,
+                    "metrics": None,
+                    "trc_name": None,
                 }
                 if not np.array(meter_trc_data_i.iloc[:, 1:] == 0).all():
                     # Automatically determine visible side
@@ -7600,6 +7844,19 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                                 exc,
                             )
                         else:
+                            cop_xyz_m = None
+                            if inverse_dynamics_enabled:
+                                try:
+                                    cop_xyz_m = _resolve_inverse_dynamics_cop_series(
+                                        trc_data_m_export_i,
+                                        inverse_dynamics_enabled,
+                                    )
+                                except ValueError as exc:
+                                    logging.warning(
+                                        "Skipping inverse dynamics CoP proxy for person %s: %s",
+                                        i,
+                                        exc,
+                                    )
                             full_vgrf_n = np.full(
                                 (len(all_frames_time),), np.nan, dtype=float
                             )
@@ -7609,6 +7866,15 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             jump_overlay_result = {
                                 "body_weight_n": float(jump_result["body_weight_n"]),
                                 "full_vgrf_n": full_vgrf_n,
+                                "time_s": np.asarray(
+                                    jump_result["time_s"], dtype=float
+                                ).copy(),
+                                "vgrf_n": np.asarray(
+                                    jump_result["vgrf_n"], dtype=float
+                                ).copy(),
+                                "cop_xyz_m": _serialize_inverse_dynamics_cop_series(cop_xyz_m),
+                                "metrics": copy.deepcopy(jump_result["metrics"]),
+                                "trc_name": None,
                             }
                             grf_stem = (
                                 "GRF"
@@ -7637,6 +7903,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     pose_path_person_m_i = pose_output_path.parent / (
                         pose_output_path_m.stem + f"_person{i:02d}.trc"
                     )
+                    if vertical_jump_enabled:
+                        jump_overlay_result["trc_name"] = pose_path_person_m_i.name
                     if ball_pose_export_enabled:
                         ball_trc_m_i = convert_px_to_meters(
                             ball_trc_px.reindex(trc_data_m_public_i.index),
@@ -8336,6 +8604,169 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                             f".osim model and .mot motion file results saved to {opensim_kinematics_dir.resolve().parent}.\n"
                         )
 
+                    if inverse_dynamics_enabled:
+                        logging.info("Running inverse dynamics from estimated vertical GRF...")
+                        for person_slot, jump_result in enumerate(vertical_jump_results):
+                            if person_slot >= len(selected_persons):
+                                continue
+                            if not isinstance(jump_result, dict):
+                                continue
+                            time_s = jump_result.get("time_s")
+                            total_vgrf_n = jump_result.get("vgrf_n")
+                            cop_xyz_m = jump_result.get("cop_xyz_m")
+                            trc_name = jump_result.get("trc_name")
+                            if not trc_name:
+                                logging.warning(
+                                    "Skipping inverse dynamics for person %s because the meter TRC name is unavailable.",
+                                    person_slot,
+                                )
+                                continue
+
+                            workspace_stem = _resolve_inverse_dynamics_workspace_stem(
+                                trc_name,
+                                opensim_workspace_info,
+                            )
+                            ik_mot_path = opensim_kinematics_dir / f"{workspace_stem}_ik.mot"
+                            model_path = opensim_kinematics_dir / f"{workspace_stem}.osim"
+                            artifact_paths = _resolve_inverse_dynamics_artifact_paths(
+                                ik_mot_path
+                            )
+                            metadata = _build_inverse_dynamics_metadata_payload(
+                                trc_name=trc_name,
+                                ik_motion_file=ik_mot_path.name,
+                                scaled_model_file=model_path.name,
+                                external_loads_mot_file=artifact_paths["grf_mot"].name,
+                                external_loads_xml_file=artifact_paths["external_loads_xml"].name,
+                                inverse_dynamics_file=artifact_paths["inverse_dynamics_sto"].name,
+                                metrics=jump_result.get("metrics"),
+                                success=False,
+                            )
+                            if time_s is None or total_vgrf_n is None:
+                                metadata["error"] = "Estimated vertical GRF export is unavailable."
+                                write_grf_metrics_json(
+                                    metadata,
+                                    artifact_paths["metadata_json"],
+                                )
+                                logging.warning(
+                                    "Skipping inverse dynamics for person %s because no estimated GRF export is available.",
+                                    person_slot,
+                                )
+                                continue
+                            if cop_xyz_m is None:
+                                metadata["error"] = "Estimated CoP proxy is unavailable for inverse dynamics."
+                                write_grf_metrics_json(
+                                    metadata,
+                                    artifact_paths["metadata_json"],
+                                )
+                                logging.warning(
+                                    "Skipping inverse dynamics for person %s because no CoP proxy is available.",
+                                    person_slot,
+                                )
+                                continue
+
+                            if not ik_mot_path.exists() or not model_path.exists():
+                                metadata["error"] = (
+                                    f"IK artifacts are missing ({model_path.name}, {ik_mot_path.name})."
+                                )
+                                write_grf_metrics_json(
+                                    metadata,
+                                    artifact_paths["metadata_json"],
+                                )
+                                logging.warning(
+                                    "Skipping inverse dynamics for person %s because IK artifacts are missing (%s, %s).",
+                                    person_slot,
+                                    model_path.name,
+                                    ik_mot_path.name,
+                                )
+                                continue
+
+                            try:
+                                external_loads_df = build_external_loads_mot_data(
+                                    time_s,
+                                    total_vgrf_n,
+                                    cop_xyz_m,
+                                )
+                                ik_storage = read_opensim_storage_file(ik_mot_path)
+                                if "time" not in ik_storage.columns:
+                                    raise ValueError(
+                                        f"Inverse kinematics file {ik_mot_path.name} does not expose a time column."
+                                    )
+                                ik_time_s = np.asarray(
+                                    ik_storage["time"], dtype=float
+                                ).reshape(-1)
+                                force_time_s = np.asarray(
+                                    external_loads_df["time"], dtype=float
+                                ).reshape(-1)
+                                if len(ik_time_s) != len(force_time_s) or not np.allclose(
+                                    ik_time_s,
+                                    force_time_s,
+                                    atol=1e-6,
+                                    rtol=0.0,
+                                ):
+                                    raise ValueError(
+                                        "Inverse dynamics requires the external-load timebase to match the IK motion file exactly."
+                                    )
+
+                                write_opensim_mot(
+                                    external_loads_df,
+                                    artifact_paths["grf_mot"],
+                                    name="GroundReactionForces",
+                                    in_degrees=False,
+                                )
+                                _write_estimated_grf_external_loads_xml(
+                                    osim,
+                                    artifact_paths["external_loads_xml"],
+                                    artifact_paths["grf_mot"],
+                                )
+                                _run_estimated_grf_inverse_dynamics(
+                                    osim,
+                                    model_path=model_path,
+                                    ik_mot_path=ik_mot_path,
+                                    external_loads_xml_path=artifact_paths["external_loads_xml"],
+                                    output_sto_path=artifact_paths["inverse_dynamics_sto"],
+                                    start_time=float(force_time_s[0]),
+                                    end_time=float(force_time_s[-1]),
+                                )
+                                metadata["success"] = True
+                            except Exception as exc:
+                                metadata["error"] = str(exc)
+                                logging.warning(
+                                    "Inverse dynamics failed for person %s: %s",
+                                    person_slot,
+                                    exc,
+                                )
+
+                            if metadata.get("success"):
+                                _populate_joint_contribution_metadata(
+                                    metadata,
+                                    read_opensim_storage_file(
+                                        artifact_paths["inverse_dynamics_sto"]
+                                    ),
+                                    start_frame=int(
+                                        jump_result.get("metrics", {}).get(
+                                            "lowest_com_frame", 0
+                                        )
+                                    ),
+                                    end_frame=int(
+                                        jump_result.get("metrics", {}).get(
+                                            "takeoff_frame", 0
+                                        )
+                                    ),
+                                    frame_rate=float(fps),
+                                )
+
+                            write_grf_metrics_json(
+                                metadata,
+                                artifact_paths["metadata_json"],
+                            )
+                            if metadata.get("success"):
+                                logging.info(
+                                    "Inverse dynamics artifacts saved to %s, %s, %s, and %s.",
+                                    artifact_paths["grf_mot"].resolve(),
+                                    artifact_paths["external_loads_xml"].resolve(),
+                                    artifact_paths["inverse_dynamics_sto"].resolve(),
+                                    artifact_paths["metadata_json"].resolve(),
+                                )
             # Restore or preserve final pose-3d / kinematics layout.
             osim.Logger.removeFileSink()
             if opensim_workspace_info is not None:

@@ -1967,6 +1967,43 @@ def test_ascii_safe_opensim_workspace_restores_original_artifact_names(tmp_path)
     assert source_trc.exists()
 
 
+def test_ascii_safe_opensim_workspace_rewrites_external_load_xml_references(tmp_path):
+    """
+    Verify restored ExternalLoads XML files reference the original stem after ASCII staging.
+    """
+
+    from Sports2D.process import (
+        _create_ascii_safe_opensim_workspace,
+        _move_ascii_safe_opensim_outputs,
+    )
+
+    output_dir = tmp_path / "측면_Sports2D"
+    output_dir.mkdir()
+    final_pose3d_dir = output_dir / "pose-3d"
+    final_kinematics_dir = output_dir / "kinematics"
+    source_trc = output_dir / "측면_Sports2D_m_person00.trc"
+    source_trc.write_text("dummy trc", encoding="utf-8")
+
+    workspace_info = _create_ascii_safe_opensim_workspace([source_trc])
+    staged_stem = next(iter(workspace_info["staged_stem_map"].keys()))
+    (workspace_info["kinematics_dir"] / f"{staged_stem}_grf.mot").write_text(
+        "forces", encoding="utf-8"
+    )
+    (workspace_info["kinematics_dir"] / f"{staged_stem}_ExternalLoads.xml").write_text(
+        f"<datafile>{staged_stem}_grf.mot</datafile>", encoding="utf-8"
+    )
+
+    _move_ascii_safe_opensim_outputs(
+        workspace_info,
+        final_pose3d_dir,
+        final_kinematics_dir,
+    )
+
+    restored_xml = final_kinematics_dir / "측면_Sports2D_m_person00_ExternalLoads.xml"
+    assert restored_xml.exists()
+    assert "측면_Sports2D_m_person00_grf.mot" in restored_xml.read_text(encoding="utf-8")
+
+
 def test_build_body_with_feet_opensim_bridge_trc_data_uses_original_22_marker_order():
     """
     Verify body_with_feet OpenSim bridge TRCs match the original 22-marker contract.
@@ -2539,6 +2576,118 @@ def test_analyze_vertical_jump_trial_returns_bodyweight_for_static_com():
     assert result["metrics"]["peak_vgrf_bw"] == pytest.approx(1.0)
 
 
+def test_estimate_shared_cop_series_m_uses_support_midpoint():
+    """
+    Verify the shared CoP proxy uses the averaged heel-to-forefoot midpoint.
+    """
+
+    from Sports2D.Utilities.motion import estimate_shared_cop_series_m
+
+    trc_data = pd.DataFrame(
+        {
+            "time": [0.0, 0.1],
+            "LBigToe": [0.2, 0.3],
+            "LBigToe.1": [0.0, 0.0],
+            "LBigToe.2": [0.0, 0.0],
+            "LSmallToe": [0.4, 0.5],
+            "LSmallToe.1": [0.0, 0.0],
+            "LSmallToe.2": [0.0, 0.0],
+            "LHeel": [0.0, 0.1],
+            "LHeel.1": [0.0, 0.0],
+            "LHeel.2": [0.0, 0.0],
+            "RBigToe": [1.2, 1.3],
+            "RBigToe.1": [0.0, 0.0],
+            "RBigToe.2": [0.0, 0.0],
+            "RSmallToe": [1.4, 1.5],
+            "RSmallToe.1": [0.0, 0.0],
+            "RSmallToe.2": [0.0, 0.0],
+            "RHeel": [1.0, 1.1],
+            "RHeel.1": [0.0, 0.0],
+            "RHeel.2": [0.0, 0.0],
+        }
+    )
+    trc_data.columns = [
+        "time",
+        "LBigToe", "LBigToe", "LBigToe",
+        "LSmallToe", "LSmallToe", "LSmallToe",
+        "LHeel", "LHeel", "LHeel",
+        "RBigToe", "RBigToe", "RBigToe",
+        "RSmallToe", "RSmallToe", "RSmallToe",
+        "RHeel", "RHeel", "RHeel",
+    ]
+
+    cop_series = estimate_shared_cop_series_m(trc_data)
+
+    assert cop_series[:, 0].tolist() == pytest.approx([0.65, 0.75])
+    assert cop_series[:, 1].tolist() == pytest.approx([0.0, 0.0])
+    assert cop_series[:, 2].tolist() == pytest.approx([0.0, 0.0])
+
+
+def test_build_external_loads_mot_data_splits_total_force_and_uses_shared_cop():
+    """
+    Verify external loads split total vGRF evenly and reuse one shared CoP proxy.
+    """
+
+    from Sports2D.Utilities.motion import build_external_loads_mot_data
+
+    loads = build_external_loads_mot_data(
+        np.array([0.0, 0.1], dtype=float),
+        np.array([100.0, 200.0], dtype=float),
+        np.array([[0.6, 0.3, 0.0], [0.8, 0.4, 0.1]], dtype=float),
+    )
+
+    assert loads["ground_force_l_vy"].tolist() == pytest.approx([50.0, 100.0])
+    assert loads["ground_force_r_vy"].tolist() == pytest.approx([50.0, 100.0])
+    assert (loads["ground_force_l_vx"] + loads["ground_force_r_vx"]).tolist() == pytest.approx([0.0, 0.0])
+    assert loads["ground_force_l_px"].tolist() == pytest.approx([0.6, 0.8])
+    assert loads["ground_force_l_py"].tolist() == pytest.approx([0.0, 0.0])
+    assert loads["ground_force_r_pz"].tolist() == pytest.approx([0.0, 0.1])
+
+
+def test_write_opensim_mot_roundtrip_reads_back_time_and_force_columns(tmp_path):
+    """
+    Verify the OpenSim MOT helper round-trips through the storage reader.
+    """
+
+    from Sports2D.Utilities.motion import read_opensim_storage_file, write_opensim_mot
+
+    mot_path = tmp_path / "forces.mot"
+    source = pd.DataFrame(
+        {
+            "time": [0.0, 0.1],
+            "ground_force_l_vx": [0.0, 0.0],
+            "ground_force_l_vy": [50.0, 100.0],
+        }
+    )
+    write_opensim_mot(source, mot_path, name="GroundReactionForces", in_degrees=False)
+    restored = read_opensim_storage_file(mot_path)
+
+    assert restored.columns.tolist() == ["time", "ground_force_l_vx", "ground_force_l_vy"]
+    assert restored["time"].tolist() == pytest.approx([0.0, 0.1])
+    assert restored["ground_force_l_vy"].tolist() == pytest.approx([50.0, 100.0])
+
+
+def test_write_opensim_mot_header_counts_include_time_column(tmp_path):
+    """
+    Verify OpenSim force-file headers advertise the full column count including time.
+    """
+
+    from Sports2D.Utilities.motion import write_opensim_mot
+
+    mot_path = tmp_path / "forces_header.mot"
+    source = pd.DataFrame(
+        {
+            "time": [0.0, 0.1],
+            "ground_force_l_vx": [0.0, 0.0],
+            "ground_force_l_vy": [50.0, 100.0],
+        }
+    )
+    write_opensim_mot(source, mot_path, name="GroundReactionForces", in_degrees=False)
+
+    contents = mot_path.read_text(encoding="utf-8")
+    assert "nColumns=3" in contents
+
+
 def test_estimate_grf_arrow_anchor_px_stays_at_support_midpoint():
     """
     Verify GRF arrows anchor at the averaged support midpoint.
@@ -2649,6 +2798,49 @@ def test_lowpass_signal_requires_scipy_backend(monkeypatch):
 
     with pytest.raises(RuntimeError, match="requires scipy.signal"):
         motion.lowpass_signal(np.array([1.0, 1.0, 1.0], dtype=float), fps=30.0)
+
+
+def _load_demo_side_meter_trc():
+    trc_path = Path(__file__).resolve().parents[1] / "Demo" / "side_Sports2D" / "side_Sports2D_m_person00.trc"
+    with open(trc_path, "r", encoding="utf-8") as trc_i:
+        lines = trc_i.readlines()
+
+    marker_names = [
+        name.strip()
+        for name in lines[3].rstrip("\n").split("	")[2:]
+        if name.strip()
+    ]
+    expanded_names = [marker_name for marker_name in marker_names for _ in range(3)]
+    rows = []
+    for line in lines[5:]:
+        if not line.strip():
+            continue
+        parts = line.rstrip("\n").split("	")
+        rows.append(
+            [float(parts[1])]
+            + [
+                float(value) if value != "" else np.nan
+                for value in parts[2 : 2 + len(expanded_names)]
+            ]
+        )
+    return pd.DataFrame(rows, columns=["time"] + expanded_names)
+
+
+def test_analyze_vertical_jump_trial_preserves_demo_event_frames_and_removes_grounded_negative_pocket():
+    """
+    Verify the side demo keeps the known flight interval while removing the grounded negative raw-vGRF pocket.
+    """
+
+    from Sports2D.Utilities.motion import analyze_vertical_jump_trial
+
+    trc_data = _load_demo_side_meter_trc()
+
+    result = analyze_vertical_jump_trial(trc_data, mass_kg=80.0, fps=60.0)
+
+    assert result['takeoff_frame'] == 153
+    assert result['landing_frame'] == 184
+    assert float(np.min(result['raw_vgrf_n'][107:112])) >= 0.0
+    assert result['vgrf_n'][153:184].tolist() == pytest.approx([0.0] * 31)
 
 
 def test_detect_vertical_jump_events_fallback_waits_for_propulsive_phase():
@@ -3741,6 +3933,396 @@ def test_default_config_exposes_vertical_jump_motion_mode():
 
     assert DEFAULT_CONFIG["motion"]["vertical_jump"] is False
     assert "vertical_jump" in CONFIG_HELP
+
+
+def test_default_config_exposes_inverse_dynamics_setting():
+    """
+    Verify the default config and help expose the inverse dynamics flag.
+    """
+
+    from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
+
+    assert DEFAULT_CONFIG["kinematics"]["inverse_dynamics"] is False
+    assert "inverse_dynamics" in CONFIG_HELP
+
+
+def test_resolve_inverse_dynamics_requested_accepts_legacy_alias():
+    """
+    Verify inverse dynamics can be requested via the canonical or legacy config key.
+    """
+
+    from Sports2D.process import _resolve_inverse_dynamics_requested
+
+    assert _resolve_inverse_dynamics_requested({"inverse_dynamics": True}) is True
+    assert _resolve_inverse_dynamics_requested({"Inverse_Dynamics": True}) is True
+    assert _resolve_inverse_dynamics_requested({}) is False
+
+
+def test_resolve_inverse_dynamics_gate_requires_prerequisites():
+    """
+    Verify inverse dynamics refuses partial prerequisite combinations.
+    """
+
+    from Sports2D.process import _resolve_inverse_dynamics_gate
+
+    enabled, reason = _resolve_inverse_dynamics_gate(
+        inverse_dynamics_requested=True,
+        do_ik=False,
+        vertical_jump_requested=True,
+        vertical_jump_enabled=True,
+        to_meters=True,
+        save_angles=True,
+        calculate_angles=True,
+    )
+    assert enabled is False
+    assert "do_ik" in reason
+
+    enabled, reason = _resolve_inverse_dynamics_gate(
+        inverse_dynamics_requested=True,
+        do_ik=True,
+        vertical_jump_requested=True,
+        vertical_jump_enabled=True,
+        to_meters=True,
+        save_angles=True,
+        calculate_angles=True,
+    )
+    assert enabled is True
+    assert reason is None
+
+
+def test_resolve_inverse_dynamics_cop_series_skips_when_disabled(monkeypatch):
+    """
+    Verify CoP estimation is never invoked when inverse dynamics is disabled.
+    """
+
+    from Sports2D import process as process_module
+
+    def fail_cop(_trc_data):
+        raise AssertionError("CoP estimation should not run when inverse dynamics is disabled.")
+
+    monkeypatch.setattr(process_module, "estimate_shared_cop_series_m", fail_cop)
+
+    assert process_module._resolve_inverse_dynamics_cop_series(
+        pd.DataFrame({"time": [0.0]}),
+        inverse_dynamics_enabled=False,
+    ) is None
+
+
+
+def test_select_joint_contribution_columns_uses_legacy_matching_order():
+    """
+    Verify joint contribution column selection matches the legacy broad hip/knee rules.
+    """
+
+    from Sports2D.Utilities.motion import select_joint_contribution_columns
+
+    columns = [
+        'time',
+        'pelvis_tilt_moment',
+        'hip_flexion_r_moment',
+        'hip_adduction_r_moment',
+        'hip_rotation_r_moment',
+        'knee_angle_r_moment',
+        'hip_flexion_l_moment',
+        'hip_adduction_l_moment',
+        'hip_rotation_l_moment',
+        'knee_angle_l_moment',
+    ]
+
+    hip_cols, knee_cols = select_joint_contribution_columns(columns)
+
+    assert hip_cols == [
+        'hip_flexion_r_moment',
+        'hip_adduction_r_moment',
+        'hip_rotation_r_moment',
+        'hip_flexion_l_moment',
+        'hip_adduction_l_moment',
+        'hip_rotation_l_moment',
+    ]
+    assert knee_cols == ['knee_angle_r_moment', 'knee_angle_l_moment']
+
+
+
+def test_calculate_joint_contribution_from_id_storage_matches_legacy_percentages():
+    """
+    Verify joint contribution integration reproduces the expected bilateral hip/knee shares.
+    """
+
+    from Sports2D.Utilities.motion import calculate_joint_contribution_from_id_storage
+
+    id_df = pd.DataFrame(
+        {
+            'time': [0.0, 0.1, 0.2, 0.3],
+            'hip_flexion_r_moment': [10.0, 10.0, 10.0, 10.0],
+            'hip_adduction_r_moment': [5.0, 5.0, 5.0, 5.0],
+            'hip_rotation_r_moment': [0.0, 0.0, 0.0, 0.0],
+            'hip_flexion_l_moment': [10.0, 10.0, 10.0, 10.0],
+            'hip_adduction_l_moment': [5.0, 5.0, 5.0, 5.0],
+            'hip_rotation_l_moment': [0.0, 0.0, 0.0, 0.0],
+            'knee_angle_r_moment': [10.0, 10.0, 10.0, 10.0],
+            'knee_angle_l_moment': [10.0, 10.0, 10.0, 10.0],
+        }
+    )
+
+    result = calculate_joint_contribution_from_id_storage(
+        id_df,
+        start_frame=0,
+        end_frame=3,
+        frame_rate=10.0,
+    )
+
+    assert result['success'] is True
+    assert result['hip_moment_integral_Nms'] == pytest.approx(9.0)
+    assert result['knee_moment_integral_Nms'] == pytest.approx(6.0)
+    assert result['hip_contribution_pct'] == pytest.approx(60.0)
+    assert result['knee_contribution_pct'] == pytest.approx(40.0)
+    assert result['dominant_strategy'] == 'Hip Dominant'
+
+
+
+def test_calculate_joint_contribution_from_id_storage_falls_back_when_window_is_empty():
+    """
+    Verify legacy fallback uses the full signal when the time window collapses.
+    """
+
+    from Sports2D.Utilities.motion import calculate_joint_contribution_from_id_storage
+
+    id_df = pd.DataFrame(
+        {
+            'time': [0.0, 0.1, 0.2],
+            'hip_flexion_r_moment': [5.0, 5.0, 5.0],
+            'hip_flexion_l_moment': [5.0, 5.0, 5.0],
+            'knee_angle_r_moment': [10.0, 10.0, 10.0],
+            'knee_angle_l_moment': [10.0, 10.0, 10.0],
+        }
+    )
+
+    result = calculate_joint_contribution_from_id_storage(
+        id_df,
+        start_frame=100,
+        end_frame=101,
+        frame_rate=10.0,
+    )
+
+    assert result['success'] is True
+    assert result['hip_contribution_pct'] == pytest.approx(33.3)
+    assert result['knee_contribution_pct'] == pytest.approx(66.7)
+
+
+
+def test_calculate_joint_contribution_from_id_storage_raises_when_no_joint_columns_exist():
+    """
+    Verify joint contribution extraction fails explicitly when hip/knee columns are absent.
+    """
+
+    from Sports2D.Utilities.motion import calculate_joint_contribution_from_id_storage
+
+    id_df = pd.DataFrame({'time': [0.0, 0.1], 'pelvis_tilt_moment': [1.0, 2.0]})
+
+    with pytest.raises(ValueError, match='Could not find hip/knee columns'):
+        calculate_joint_contribution_from_id_storage(
+            id_df,
+            start_frame=0,
+            end_frame=1,
+            frame_rate=10.0,
+        )
+
+
+
+def test_select_sagittal_joint_contribution_columns_uses_only_flexion_and_knee_angle_columns():
+    """
+    Verify sagittal-only selection ignores non-sagittal hip columns while preserving storage order.
+    """
+
+    from Sports2D.Utilities.motion import select_sagittal_joint_contribution_columns
+
+    columns = [
+        'time',
+        'hip_adduction_r_moment',
+        'hip_flexion_r_moment',
+        'knee_angle_r_moment',
+        'hip_rotation_r_moment',
+        'hip_flexion_l_moment',
+        'knee_angle_l_moment',
+        'hip_adduction_l_moment',
+    ]
+
+    hip_cols, knee_cols = select_sagittal_joint_contribution_columns(columns)
+
+    assert hip_cols == ['hip_flexion_r_moment', 'hip_flexion_l_moment']
+    assert knee_cols == ['knee_angle_r_moment', 'knee_angle_l_moment']
+
+
+
+def test_calculate_sagittal_joint_contribution_from_id_storage_uses_only_sagittal_moments():
+    """
+    Verify sagittal-only joint contribution ignores adduction/rotation and returns its own definition tag.
+    """
+
+    from Sports2D.Utilities.motion import calculate_sagittal_joint_contribution_from_id_storage
+
+    id_df = pd.DataFrame(
+        {
+            'time': [0.0, 0.1, 0.2, 0.3],
+            'hip_flexion_r_moment': [10.0, 10.0, 10.0, 10.0],
+            'hip_adduction_r_moment': [50.0, 50.0, 50.0, 50.0],
+            'hip_rotation_r_moment': [50.0, 50.0, 50.0, 50.0],
+            'hip_flexion_l_moment': [10.0, 10.0, 10.0, 10.0],
+            'hip_adduction_l_moment': [50.0, 50.0, 50.0, 50.0],
+            'hip_rotation_l_moment': [50.0, 50.0, 50.0, 50.0],
+            'knee_angle_r_moment': [20.0, 20.0, 20.0, 20.0],
+            'knee_angle_l_moment': [20.0, 20.0, 20.0, 20.0],
+        }
+    )
+
+    result = calculate_sagittal_joint_contribution_from_id_storage(
+        id_df,
+        start_frame=0,
+        end_frame=3,
+        frame_rate=10.0,
+    )
+
+    assert result['success'] is True
+    assert result['definition'] == 'sagittal_only'
+    assert result['hip_columns'] == ['hip_flexion_r_moment', 'hip_flexion_l_moment']
+    assert result['knee_columns'] == ['knee_angle_r_moment', 'knee_angle_l_moment']
+    assert result['hip_moment_integral_Nms'] == pytest.approx(6.0)
+    assert result['knee_moment_integral_Nms'] == pytest.approx(12.0)
+    assert result['hip_contribution_pct'] == pytest.approx(33.3)
+    assert result['knee_contribution_pct'] == pytest.approx(66.7)
+    assert result['dominant_strategy'] == 'Knee Dominant'
+
+
+
+def test_calculate_sagittal_joint_contribution_from_id_storage_raises_when_required_columns_are_missing():
+    """
+    Verify sagittal-only joint contribution fails explicitly when one of the required columns is absent.
+    """
+
+    from Sports2D.Utilities.motion import calculate_sagittal_joint_contribution_from_id_storage
+
+    id_df = pd.DataFrame(
+        {
+            'time': [0.0, 0.1],
+            'hip_flexion_r_moment': [1.0, 1.0],
+            'hip_flexion_l_moment': [1.0, 1.0],
+            'knee_angle_r_moment': [1.0, 1.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match='Sagittal joint contribution requires columns'):
+        calculate_sagittal_joint_contribution_from_id_storage(
+            id_df,
+            start_frame=0,
+            end_frame=1,
+            frame_rate=10.0,
+        )
+
+
+
+def test_serialize_inverse_dynamics_cop_series_returns_none_for_missing_or_invalid_inputs():
+    """
+    Verify inverse-dynamics CoP serialization drops missing or non-finite data.
+    """
+
+    from Sports2D.process import _serialize_inverse_dynamics_cop_series
+
+    assert _serialize_inverse_dynamics_cop_series(None) is None
+    assert _serialize_inverse_dynamics_cop_series(np.array([np.nan])) is None
+    assert _serialize_inverse_dynamics_cop_series(np.array([[1.0, 2.0]])) is None
+    valid = _serialize_inverse_dynamics_cop_series(np.array([[1.0, 2.0, 3.0, 4.0]]))
+    assert valid.tolist() == [[1.0, 2.0, 3.0]]
+
+
+
+def test_build_inverse_dynamics_metadata_payload_preserves_success_and_error_fields():
+    """
+    Verify inverse-dynamics metadata payload can represent both success and failure states.
+    """
+
+    from Sports2D.process import _build_inverse_dynamics_metadata_payload
+
+    success_payload = _build_inverse_dynamics_metadata_payload(
+        trc_name='demo.trc',
+        ik_motion_file='demo_ik.mot',
+        scaled_model_file='demo.osim',
+        external_loads_mot_file='demo_grf.mot',
+        external_loads_xml_file='demo_ExternalLoads.xml',
+        inverse_dynamics_file='demo_id.sto',
+        metrics={'takeoff_frame': 10},
+        success=True,
+    )
+    assert success_payload['success'] is True
+    assert 'error' not in success_payload
+
+    failed_payload = _build_inverse_dynamics_metadata_payload(
+        trc_name='demo.trc',
+        ik_motion_file='demo_ik.mot',
+        scaled_model_file='demo.osim',
+        external_loads_mot_file='demo_grf.mot',
+        external_loads_xml_file='demo_ExternalLoads.xml',
+        inverse_dynamics_file='demo_id.sto',
+        metrics={'takeoff_frame': 10},
+        success=False,
+        error='boom',
+    )
+    assert failed_payload['success'] is False
+    assert failed_payload['error'] == 'boom'
+
+
+
+def test_populate_joint_contribution_metadata_preserves_legacy_when_sagittal_fails():
+    """
+    Verify legacy contribution still writes when the sagittal-only metric cannot be computed.
+    """
+
+    from Sports2D.process import _populate_joint_contribution_metadata
+
+    metadata = {}
+    id_df = pd.DataFrame(
+        {
+            'time': [0.0, 0.1, 0.2],
+            'hip_flexion_r_moment': [5.0, 5.0, 5.0],
+            'hip_adduction_r_moment': [1.0, 1.0, 1.0],
+            'hip_adduction_l_moment': [1.0, 1.0, 1.0],
+            'knee_angle_r_moment': [10.0, 10.0, 10.0],
+            'knee_angle_l_moment': [10.0, 10.0, 10.0],
+        }
+    )
+
+    _populate_joint_contribution_metadata(
+        metadata,
+        id_df,
+        start_frame=0,
+        end_frame=2,
+        frame_rate=10.0,
+    )
+
+    assert metadata['joint_contribution']['success'] is True
+    assert metadata['joint_contribution_sagittal']['success'] is False
+    assert metadata['joint_contribution_sagittal']['definition'] == 'sagittal_only'
+
+
+
+def test_resolve_inverse_dynamics_workspace_stem_uses_ascii_stage_map():
+    """
+    Verify inverse dynamics finds IK artifacts by the staged ASCII stem when needed.
+    """
+
+    from Sports2D.process import _resolve_inverse_dynamics_workspace_stem
+
+    workspace_info = {
+        "staged_stem_map": {"Sports2D_m_person00": "측면_Sports2D_m_person00"}
+    }
+
+    assert _resolve_inverse_dynamics_workspace_stem(
+        "측면_Sports2D_m_person00.trc",
+        workspace_info,
+    ) == "Sports2D_m_person00"
+    assert _resolve_inverse_dynamics_workspace_stem(
+        "demo_m_person00.trc",
+        None,
+    ) == "demo_m_person00"
 
 
 def test_default_config_exposes_hybrid_review_settings():

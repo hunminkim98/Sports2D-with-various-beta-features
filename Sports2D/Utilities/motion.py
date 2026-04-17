@@ -9,16 +9,19 @@ import numpy as np
 import pandas as pd
 
 try:
-    from scipy.signal import butter, filtfilt
+    from scipy.signal import butter, filtfilt, savgol_filter
 except ImportError:  # pragma: no cover - Pose2Sim normally provides scipy
     butter = None
     filtfilt = None
+    savgol_filter = None
 
 
 GRAVITY_MPS2 = 9.81
 PELVIS_TRUNK_ALPHA = 0.20
 GRF_FILTER_CUTOFF_HZ = 6.0
 GRF_FILTER_ORDER = 4
+GRF_DERIVATIVE_WINDOW_SECONDS = 0.28
+GRF_DERIVATIVE_POLYORDER = 2
 MIN_FLIGHT_TIME_S = 0.08
 FOOT_CONTACT_HEIGHT_M = 0.03
 CONTACT_VELOCITY_THRESHOLD_MPS = 0.50
@@ -235,6 +238,66 @@ def lowpass_signal(values, fps, cutoff_hz=GRF_FILTER_CUTOFF_HZ, order=GRF_FILTER
     return filtfilt(b, a, values)
 
 
+def _resolve_derivative_window_length(num_samples, fps, window_seconds=GRF_DERIVATIVE_WINDOW_SECONDS):
+    num_samples = int(num_samples)
+    if num_samples < 5:
+        return None
+    if fps is None or fps <= 0:
+        target = 5
+    else:
+        target = int(round(float(window_seconds) * float(fps)))
+    target = max(5, target)
+    if target % 2 == 0:
+        target += 1
+    max_window = num_samples if num_samples % 2 == 1 else num_samples - 1
+    if max_window < 5:
+        return None
+    return min(target, max_window)
+
+
+def estimate_com_derivatives(
+    com_y_filtered,
+    dt,
+    fps,
+    window_seconds=GRF_DERIVATIVE_WINDOW_SECONDS,
+    polyorder=GRF_DERIVATIVE_POLYORDER,
+):
+    com_y_filtered = np.asarray(com_y_filtered, dtype=float)
+    if len(com_y_filtered) <= 1 or dt <= 0:
+        zeros = np.zeros_like(com_y_filtered)
+        return zeros, zeros
+
+    window_length = _resolve_derivative_window_length(
+        len(com_y_filtered), fps, window_seconds=window_seconds
+    )
+    if (
+        savgol_filter is None
+        or window_length is None
+        or window_length <= int(polyorder)
+    ):
+        velocity_y = np.gradient(com_y_filtered, dt)
+        acceleration_y = np.gradient(velocity_y, dt)
+        return velocity_y, acceleration_y
+
+    velocity_y = savgol_filter(
+        com_y_filtered,
+        window_length=window_length,
+        polyorder=int(polyorder),
+        deriv=1,
+        delta=float(dt),
+        mode="interp",
+    )
+    acceleration_y = savgol_filter(
+        com_y_filtered,
+        window_length=window_length,
+        polyorder=int(polyorder),
+        deriv=2,
+        delta=float(dt),
+        mode="interp",
+    )
+    return velocity_y, acceleration_y
+
+
 def detect_vertical_jump_events(
     trc_data_m,
     com_velocity_y,
@@ -328,6 +391,116 @@ def _json_safe_value(value):
     return value
 
 
+def _marker_triplet_array(trc_data, marker_name):
+    marker_data = _marker_triplet(trc_data, marker_name)
+    if marker_data is None:
+        return None
+    return marker_data.to_numpy(dtype=float, copy=True)
+
+
+def _point_series_from_name_or_pair(trc_data, marker_name, pair_names):
+    if marker_name in trc_data.columns:
+        return _marker_triplet_array(trc_data, marker_name)
+
+    point_arrays = []
+    for name in pair_names:
+        point_array = _marker_triplet_array(trc_data, name)
+        if point_array is not None:
+            point_arrays.append(point_array)
+    if len(point_arrays) == 0:
+        return None
+    if len(point_arrays) == 1:
+        return point_arrays[0]
+    return np.nanmean(np.stack(point_arrays, axis=0), axis=0)
+
+
+def _support_side_point_series_m(trc_data_m, side_prefix):
+    side_prefix = str(side_prefix).strip().upper()
+    big_toe_name = f"{side_prefix}BigToe"
+    lateral_forefoot_names = (f"{side_prefix}SmallToe", f"{side_prefix}5Meta")
+    toe_tip_name = f"{side_prefix}Toe"
+    heel_name = f"{side_prefix}Heel"
+    ankle_name = f"{side_prefix}Ankle"
+
+    big_toe_series = _point_series_from_name_or_pair(
+        trc_data_m,
+        marker_name=big_toe_name,
+        pair_names=(big_toe_name,),
+    )
+    lateral_forefoot_series = None
+    for marker_name in lateral_forefoot_names:
+        lateral_forefoot_series = _point_series_from_name_or_pair(
+            trc_data_m,
+            marker_name=marker_name,
+            pair_names=(marker_name,),
+        )
+        if lateral_forefoot_series is not None:
+            break
+    toe_tip_series = _point_series_from_name_or_pair(
+        trc_data_m,
+        marker_name=toe_tip_name,
+        pair_names=(toe_tip_name,),
+    )
+
+    if big_toe_series is not None and lateral_forefoot_series is not None:
+        forefoot_series = 0.5 * (big_toe_series + lateral_forefoot_series)
+    elif big_toe_series is not None and toe_tip_series is not None:
+        forefoot_series = 0.5 * (big_toe_series + toe_tip_series)
+    elif big_toe_series is not None:
+        forefoot_series = big_toe_series
+    elif lateral_forefoot_series is not None:
+        forefoot_series = lateral_forefoot_series
+    else:
+        forefoot_series = toe_tip_series
+
+    heel_series = _point_series_from_name_or_pair(
+        trc_data_m,
+        marker_name=heel_name,
+        pair_names=(heel_name,),
+    )
+    if forefoot_series is not None and heel_series is not None:
+        return 0.5 * (forefoot_series + heel_series)
+    if forefoot_series is not None:
+        return forefoot_series
+    if heel_series is not None:
+        return heel_series
+    return _point_series_from_name_or_pair(
+        trc_data_m,
+        marker_name=ankle_name,
+        pair_names=(ankle_name,),
+    )
+
+
+def estimate_shared_cop_series_m(trc_data_m):
+    trc_data_m = pd.DataFrame(trc_data_m).copy()
+    left_series = _support_side_point_series_m(trc_data_m, "L")
+    right_series = _support_side_point_series_m(trc_data_m, "R")
+
+    point_series = [series for series in [left_series, right_series] if series is not None]
+    if len(point_series) == 0:
+        raise ValueError(
+            "Inverse dynamics requires support markers (toe/heel or ankle) to estimate CoP."
+        )
+
+    if len(point_series) == 1:
+        cop_series = np.asarray(point_series[0], dtype=float)
+    else:
+        cop_series = np.nanmean(np.stack(point_series, axis=0), axis=0)
+
+    cop_series = np.asarray(cop_series, dtype=float)
+    if cop_series.ndim != 2 or cop_series.shape[1] < 3:
+        raise ValueError("Estimated CoP proxy must resolve to an Nx3 meter-space series.")
+
+    cop_series = cop_series[:, :3].copy()
+    for axis_idx in range(cop_series.shape[1]):
+        cop_series[:, axis_idx] = _interpolate_nan_series(cop_series[:, axis_idx])
+
+    if not np.all(np.isfinite(cop_series)):
+        raise ValueError("Inverse dynamics CoP proxy contains unresolved non-finite values.")
+
+    return cop_series
+
+
 def analyze_vertical_jump_trial(
     trc_data_m,
     mass_kg,
@@ -357,8 +530,11 @@ def analyze_vertical_jump_trial(
         cutoff_hz=cutoff_hz,
         order=filter_order,
     )
-    velocity_y = np.gradient(com_y_filtered, dt) if len(com_y_filtered) > 1 and dt > 0 else np.zeros_like(com_y_filtered)
-    acceleration_y = np.gradient(velocity_y, dt) if len(velocity_y) > 1 and dt > 0 else np.zeros_like(velocity_y)
+    velocity_y, acceleration_y = estimate_com_derivatives(
+        com_y_filtered,
+        dt=dt,
+        fps=effective_fps,
+    )
     body_weight_n = float(mass_kg) * GRAVITY_MPS2
     raw_vgrf_n = float(mass_kg) * acceleration_y + body_weight_n
 
@@ -426,6 +602,292 @@ def analyze_vertical_jump_trial(
         "lowest_com_frame": lowest_com_frame,
         "metrics": metrics,
     }
+
+
+def build_external_loads_mot_data(time_s, total_vgrf_n, cop_xyz_m):
+    time_s = np.asarray(time_s, dtype=float).reshape(-1)
+    total_vgrf_n = np.asarray(total_vgrf_n, dtype=float).reshape(-1)
+    cop_xyz_m = np.asarray(cop_xyz_m, dtype=float)
+
+    if len(time_s) == 0:
+        raise ValueError("Inverse dynamics requires a non-empty GRF time series.")
+    if len(total_vgrf_n) != len(time_s):
+        raise ValueError("Inverse dynamics GRF length must match the provided time series.")
+    if cop_xyz_m.ndim != 2 or cop_xyz_m.shape[0] != len(time_s) or cop_xyz_m.shape[1] < 3:
+        raise ValueError("Inverse dynamics CoP proxy must be an Nx3 array aligned with time.")
+    if not np.all(np.isfinite(time_s)):
+        raise ValueError("Inverse dynamics time series contains non-finite values.")
+    if not np.all(np.isfinite(total_vgrf_n)):
+        raise ValueError("Inverse dynamics GRF contains non-finite values.")
+    if not np.all(np.isfinite(cop_xyz_m[:, :3])):
+        raise ValueError("Inverse dynamics CoP proxy contains non-finite values.")
+
+    half_force_n = 0.5 * total_vgrf_n
+    cop_x = cop_xyz_m[:, 0]
+    # ExternalLoads points are expressed in the ground frame, so clamp the
+    # vertical coordinate onto the ground plane instead of applying the force
+    # at the floating support-midpoint height.
+    cop_y = np.zeros_like(total_vgrf_n)
+    cop_z = cop_xyz_m[:, 2]
+    zeros = np.zeros_like(total_vgrf_n)
+
+    return pd.DataFrame(
+        {
+            "time": time_s,
+            "ground_force_l_vx": zeros,
+            "ground_force_l_vy": half_force_n,
+            "ground_force_l_vz": zeros,
+            "ground_force_l_px": cop_x,
+            "ground_force_l_py": cop_y,
+            "ground_force_l_pz": cop_z,
+            "ground_torque_l_x": zeros,
+            "ground_torque_l_y": zeros,
+            "ground_torque_l_z": zeros,
+            "ground_force_r_vx": zeros,
+            "ground_force_r_vy": half_force_n,
+            "ground_force_r_vz": zeros,
+            "ground_force_r_px": cop_x,
+            "ground_force_r_py": cop_y,
+            "ground_force_r_pz": cop_z,
+            "ground_torque_r_x": zeros,
+            "ground_torque_r_y": zeros,
+            "ground_torque_r_z": zeros,
+        }
+    )
+
+
+def write_opensim_mot(data, mot_path, name="OpenSimData", in_degrees=False):
+    data = pd.DataFrame(data).copy()
+    if "time" not in data.columns:
+        raise ValueError("OpenSim MOT export requires a leading 'time' column.")
+
+    mot_path = Path(mot_path)
+    n_rows = len(data)
+    n_columns = data.shape[1]
+    header_mot = [
+        str(name),
+        "version=1",
+        f"nRows={n_rows}",
+        f"nColumns={n_columns}",
+        f"inDegrees={'yes' if in_degrees else 'no'}",
+        "",
+        "Units are S.I. units (second, meters, Newtons, ...)",
+        "If the header above contains a line with 'inDegrees', this indicates whether rotational values are in degrees (yes) or radians (no).",
+        "",
+        "endheader",
+        "	".join(map(str, data.columns.tolist())),
+    ]
+
+    with open(mot_path, "w", encoding="utf-8") as mot_o:
+        for line in header_mot:
+            mot_o.write(line + "\n")
+        data.to_csv(mot_o, sep="\t", index=False, header=None, lineterminator="\n")
+
+    return data
+
+
+def read_opensim_storage_file(storage_path):
+    storage_path = Path(storage_path)
+    with open(storage_path, "r", encoding="utf-8") as storage_i:
+        lines = storage_i.readlines()
+
+    header_end_idx = None
+    for idx, line in enumerate(lines):
+        if line.strip().lower() == "endheader":
+            header_end_idx = idx
+            break
+    if header_end_idx is None or header_end_idx + 1 >= len(lines):
+        raise ValueError(f"Could not parse OpenSim storage header from {storage_path}.")
+
+    header_line_idx = header_end_idx + 1
+    data_lines = [line for line in lines[header_line_idx:] if line.strip()]
+    if len(data_lines) == 0:
+        return pd.DataFrame()
+
+    column_names = data_lines[0].strip().split()
+    rows = [line.strip().split() for line in data_lines[1:]]
+    if len(rows) == 0:
+        return pd.DataFrame(columns=column_names)
+    return pd.DataFrame(rows, columns=column_names).apply(pd.to_numeric, errors="coerce")
+
+
+def select_joint_contribution_columns(id_columns):
+    columns = list(id_columns) if id_columns is not None else []
+    hip_columns = []
+    knee_columns = []
+
+    for column_name in columns:
+        col_lower = str(column_name).lower()
+        if "hip" in col_lower and ("flexion" in col_lower or "moment" in col_lower):
+            hip_columns.append(column_name)
+        if "knee" in col_lower and (
+            "angle" in col_lower or "flexion" in col_lower or "moment" in col_lower
+        ):
+            knee_columns.append(column_name)
+
+    if len(hip_columns) == 0:
+        hip_columns = [column_name for column_name in columns if "hip" in str(column_name).lower()]
+    if len(knee_columns) == 0:
+        knee_columns = [column_name for column_name in columns if "knee" in str(column_name).lower()]
+
+    return hip_columns, knee_columns
+
+
+def select_sagittal_joint_contribution_columns(id_columns):
+    columns = list(id_columns) if id_columns is not None else []
+    column_lookup = {str(column_name).lower(): column_name for column_name in columns}
+
+    hip_required = [
+        "hip_flexion_r_moment",
+        "hip_flexion_l_moment",
+    ]
+    knee_required = [
+        "knee_angle_r_moment",
+        "knee_angle_l_moment",
+    ]
+
+    hip_columns = [
+        column_lookup[column_name]
+        for column_name in hip_required
+        if column_name in column_lookup
+    ]
+    knee_columns = [
+        column_lookup[column_name]
+        for column_name in knee_required
+        if column_name in column_lookup
+    ]
+
+    return hip_columns, knee_columns
+
+
+def _calculate_joint_contribution_from_selected_columns(
+    id_df,
+    hip_columns,
+    knee_columns,
+    start_frame,
+    end_frame,
+    frame_rate,
+    definition=None,
+):
+    id_df = pd.DataFrame(id_df).copy()
+    if "time" not in id_df.columns:
+        raise ValueError("Joint contribution calculation requires a time column in the ID storage.")
+    if frame_rate is None or float(frame_rate) <= 0:
+        raise ValueError("Joint contribution calculation requires a positive frame_rate.")
+    if len(hip_columns) == 0 or len(knee_columns) == 0:
+        raise ValueError(
+            f"Could not find hip/knee columns. Available: {list(id_df.columns)}"
+        )
+
+    times = np.asarray(id_df["time"], dtype=float)
+    if len(times) == 0:
+        raise ValueError("Joint contribution calculation requires non-empty ID data.")
+
+    dt = 1.0 / float(frame_rate)
+    start_time = float(start_frame) * dt
+    end_time = float(end_frame) * dt
+    start_idx = int(np.searchsorted(times, start_time))
+    end_idx = int(np.searchsorted(times, end_time))
+    if end_idx <= start_idx:
+        end_idx = len(times)
+
+    hip_moments_sum = np.zeros(len(times), dtype=float)
+    for column_name in hip_columns:
+        hip_moments_sum += np.abs(np.asarray(id_df[column_name], dtype=float))
+
+    knee_moments_sum = np.zeros(len(times), dtype=float)
+    for column_name in knee_columns:
+        knee_moments_sum += np.abs(np.asarray(id_df[column_name], dtype=float))
+
+    phase_times = times[start_idx:end_idx]
+    hip_contraction = hip_moments_sum[start_idx:end_idx]
+    knee_contraction = knee_moments_sum[start_idx:end_idx]
+    if len(phase_times) == 0:
+        phase_times = times
+        hip_contraction = hip_moments_sum
+        knee_contraction = knee_moments_sum
+
+    hip_integral = float(np.trapz(hip_contraction, x=phase_times))
+    knee_integral = float(np.trapz(knee_contraction, x=phase_times))
+    total_integral = hip_integral + knee_integral
+
+    if total_integral > 0:
+        hip_pct = (hip_integral / total_integral) * 100.0
+        knee_pct = (knee_integral / total_integral) * 100.0
+    else:
+        hip_pct = 50.0
+        knee_pct = 50.0
+
+    dominant_strategy = "Hip Dominant" if hip_pct > knee_pct else "Knee Dominant"
+
+    result = {
+        "success": True,
+        "hip_columns": hip_columns,
+        "knee_columns": knee_columns,
+        "hip_moment_integral_Nms": hip_integral,
+        "knee_moment_integral_Nms": knee_integral,
+        "hip_contribution_pct": round(hip_pct, 1),
+        "knee_contribution_pct": round(knee_pct, 1),
+        "dominant_strategy": dominant_strategy,
+        "contraction_start_frame": int(start_frame),
+        "contraction_end_frame": int(end_frame),
+        "frame_rate_hz": float(frame_rate),
+    }
+    if definition is not None:
+        result["definition"] = definition
+    return result
+
+
+def calculate_joint_contribution_from_id_storage(
+    id_df,
+    start_frame,
+    end_frame,
+    frame_rate,
+):
+    hip_columns, knee_columns = select_joint_contribution_columns(id_df.columns)
+    return _calculate_joint_contribution_from_selected_columns(
+        id_df,
+        hip_columns,
+        knee_columns,
+        start_frame,
+        end_frame,
+        frame_rate,
+    )
+
+
+def calculate_sagittal_joint_contribution_from_id_storage(
+    id_df,
+    start_frame,
+    end_frame,
+    frame_rate,
+):
+    columns = list(pd.DataFrame(id_df).columns)
+    column_lookup = {str(column_name).lower(): column_name for column_name in columns}
+    required_columns = [
+        "hip_flexion_r_moment",
+        "hip_flexion_l_moment",
+        "knee_angle_r_moment",
+        "knee_angle_l_moment",
+    ]
+    missing_columns = [
+        column_name for column_name in required_columns if column_name not in column_lookup
+    ]
+    if missing_columns:
+        raise ValueError(
+            "Sagittal joint contribution requires columns: "
+            + ", ".join(missing_columns)
+        )
+
+    hip_columns, knee_columns = select_sagittal_joint_contribution_columns(columns)
+    return _calculate_joint_contribution_from_selected_columns(
+        id_df,
+        hip_columns,
+        knee_columns,
+        start_frame,
+        end_frame,
+        frame_rate,
+        definition="sagittal_only",
+    )
 
 
 def write_grf_trc(time_s, vgrf_n, trc_path, fps=30):

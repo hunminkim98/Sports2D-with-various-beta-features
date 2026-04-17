@@ -530,6 +530,7 @@ sports2d --help
 'perspective_unit': ["", "'distance_m', 'f_px', 'fov_deg', 'fov_rad', or 'from_calib'"],
 'do_ik': ["", "do inverse kinematics. false if not specified"],
 'use_augmentation': ["", "Use LSTM marker augmentation. false if not specified"],
+'inverse_dynamics': ["", "run OpenSim inverse dynamics from the estimated vertical GRF. Requires do_ik=true, motion.vertical_jump=true, and px_to_meters_conversion.to_meters=true. Uses a bilateral 50:50 force split, shared CoP proxy, and zero horizontal forces. false if not specified"],
 'load_trc_px': ["", "load trc file to avaid running pose estimation again. false if not specified"],
 'compare': ["", "visually compare motion with trc file. false if not specified"],
 'video_dir': ["d", "current directory if not specified"],
