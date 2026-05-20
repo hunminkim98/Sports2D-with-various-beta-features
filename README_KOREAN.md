@@ -629,6 +629,7 @@ sports2d --help
                     자세한 정보: https://github.com/levan92/deep_sort_realtime/blob/master/deep_sort_realtime/deepsort_tracker.py#L51'],
 'input_size': ["", "width, height. 지정하지 않으면 1280, 720. 낮은 해상도는 빠르지만 정밀도가 떨어짐"],
 'keypoint_likelihood_threshold': ["", "검출된 키포인트는 likelihood가 이 임계값 미만이면 유지되지 않음. 지정하지 않으면 0.3"],
+'draw_person_bounding_boxes': ["", "true 또는 false. realtime/saved overlay에서 사람 bounding box와 track ID를 그림. 지정하지 않으면 true"],
 'average_likelihood_threshold': ["", "검출된 사람은 평균 키포인트 likelihood가 이 임계값 미만이면 유지되지 않음. 지정하지 않으면 0.5"],
 'keypoint_number_threshold': ["", "검출된 사람은 검출된 키포인트 수가 이 임계값 미만이면 유지되지 않음. 지정하지 않으면 0.3, 즉 30 퍼센트"],
 'max_distance': ["", "사람이 이전 프레임의 위치에서 max_distance보다 멀리 검출되면 새로운 사람으로 간주. px 또는 None, 기본값 100."],

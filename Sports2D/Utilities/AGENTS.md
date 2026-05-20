@@ -31,6 +31,7 @@ Shared utility layer for the Sports2D runtime. This folder contains backend abst
 | File | Description |
 |------|-------------|
 | `pose_backend.py` | Defines the `PoseBackend` abstraction plus RTMLib and SynthPose backend factories/adapters. |
+| `sapiens2_backend.py` | Optional Sapiens2 308-keypoint pose backend with configurable HALPE_26 mapping or native 308-keypoint output. |
 | `sam3_detector.py` | SAM3 runtime adapter supporting Hugging Face bundles and raw-checkpoint Meta runtime resolution for promptable detection. |
 | `synthpose_tracker.py` | SynthPose tracker integration, detector selection, and optional RT-DETR/RT-DETRv4 handling. |
 | `synthpose_skeleton.py` | 52-keypoint SynthPose skeleton definition and related constants. |

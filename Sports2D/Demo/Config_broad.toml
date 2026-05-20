@@ -12,7 +12,7 @@
 
 
 [base]
-video_input = '제멀'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
+video_input = '일산맥스.MOV'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
@@ -211,6 +211,7 @@ tracking_mode = 'sports2d' # 'sports2d' or 'deepsort'. 'deepsort' is slower, har
 keypoint_likelihood_threshold = 0.3 # Keypoints whose likelihood is lower will not be taken into account
 draw_keypoint_likelihood_threshold = 0.5 # Display-only threshold for keypoint markers after pose filtering
 draw_skeleton_likelihood_threshold = 0.6 # Display-only threshold for skeleton lines; raise this to hide uncertain long links
+draw_person_bounding_boxes = true # Draw person bounding boxes and track IDs on realtime/saved overlays
 person_detection_threshold = 0.3    # Object detector threshold (person/ball)
 average_likelihood_threshold = 0.3  # Person will be ignored if average likelihood of good keypoints is lower than this value
 keypoint_number_threshold = 0.3     # Person will be ignored if the number of good keypoints (above keypoint_likelihood_threshold) is less than this fraction
@@ -267,8 +268,8 @@ calib_file = ''      # Calibration file in the Pose2Sim toml format, or '' if no
 
 
 [angles]
-display_angle_values_on = ['body', 'list'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
-fontSize = 0.8
+display_angle_values_on = ['body'] # 'body', 'list', ['body', 'list'], 'none'. Display angle values on the body, as a list in the upper left of the image, both, or do not display them.
+fontSize = 0.5
 
 # Select joint angles among
 # ['Right ankle', 'Left ankle', 'Right knee', 'Left knee', 'Right hip', 'Left hip', 'Right shoulder', 'Left shoulder', 'Right elbow', 'Left elbow', 'Right wrist', 'Left wrist']

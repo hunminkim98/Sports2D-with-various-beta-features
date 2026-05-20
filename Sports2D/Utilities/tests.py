@@ -1866,15 +1866,16 @@ def test_append_trc_marker_aliases_preserves_existing_small_toe_triplets():
     assert aliased.equals(trc_data)
 
 
-def test_resolve_pose2sim_pose_model_name_maps_synthpose_to_halpe26():
+def test_resolve_pose2sim_pose_model_name_maps_optional_backends_to_halpe26():
     """
-    Verify the OpenSim bridge normalizes SynthPose runtime names to HALPE_26.
+    Verify the OpenSim bridge normalizes optional runtime names to HALPE_26.
     """
 
     from Sports2D.process import _resolve_pose2sim_pose_model_name
 
     assert _resolve_pose2sim_pose_model_name("synthpose") == "HALPE_26"
     assert _resolve_pose2sim_pose_model_name("synthpose_base") == "HALPE_26"
+    assert _resolve_pose2sim_pose_model_name("sapiens2") == "HALPE_26"
     assert _resolve_pose2sim_pose_model_name("body_with_feet") == "HALPE_26"
     assert _resolve_pose2sim_pose_model_name("whole_body_wrist") == "COCO_133_WRIST"
     assert _resolve_pose2sim_pose_model_name("body") == "COCO_17"
@@ -3486,6 +3487,36 @@ def test_default_config_exposes_video_codec():
     assert "video_codec" in CONFIG_HELP
 
 
+def test_cli_config_only_keys_pass_through(monkeypatch, tmp_path):
+    """
+    Verify TOML keys without a matching CLI flag do not crash config loading.
+    """
+
+    from Sports2D import Sports2D as cli_module
+
+    config_path = tmp_path / "config_only.toml"
+    config_path.write_text(
+        toml.dumps({"pose": {"future_backend_key": "kept"}}),
+        encoding="utf-8",
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["sports2d", "--config", str(config_path)],
+    )
+    monkeypatch.setattr(
+        cli_module.Sports2D,
+        "process",
+        lambda config: captured.setdefault("config", config),
+    )
+
+    cli_module.main()
+
+    assert captured["config"]["pose"]["future_backend_key"] == "kept"
+
+
 def test_default_config_exposes_ball_ordering_method():
     """
     Verify ball ordering config is exposed in defaults and help text.
@@ -3549,6 +3580,24 @@ def test_default_config_exposes_sam3_settings():
     assert "sam3_video_loss_patience" in CONFIG_HELP
     assert "sam3_show_realtime_masks" in CONFIG_HELP
     assert "sam3_realtime_mask_alpha" in CONFIG_HELP
+
+
+def test_default_config_exposes_sapiens2_runtime_settings():
+    """
+    Verify Sapiens2 runtime knobs are available from defaults and CLI help.
+    """
+
+    from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
+
+    assert DEFAULT_CONFIG["pose"]["sapiens2_bbox_source"] == "detector"
+    assert DEFAULT_CONFIG["pose"]["sapiens2_yolox_model_size"] == "m"
+    assert DEFAULT_CONFIG["pose"]["sapiens2_inference_dtype"] == "float32"
+    assert DEFAULT_CONFIG["pose"]["sapiens2_flip_test"] == ""
+    assert "sapiens2_bbox_source" in CONFIG_HELP
+    assert "yolox" in CONFIG_HELP["sapiens2_bbox_source"][1]
+    assert "sapiens2_yolox_model_size" in CONFIG_HELP
+    assert "sapiens2_inference_dtype" in CONFIG_HELP
+    assert "sapiens2_flip_test" in CONFIG_HELP
 
 
 def test_sam3_video_detector_prepare_video_context_downgrades_webcam(monkeypatch):
@@ -3897,13 +3946,15 @@ def test_default_config_exposes_manual_roi_settings():
 
 def test_default_config_draw_thresholds_defer_to_pose_threshold():
     """
-    Verify display-only draw thresholds stay unset by default so pose threshold fallback still works.
+    Verify display-only draw thresholds stay unset by default so pose threshold
+    fallback still works, while person boxes remain opt-out for compatibility.
     """
 
     from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
 
     assert DEFAULT_CONFIG["pose"]["draw_keypoint_likelihood_threshold"] == ""
     assert DEFAULT_CONFIG["pose"]["draw_skeleton_likelihood_threshold"] == ""
+    assert DEFAULT_CONFIG["pose"]["draw_person_bounding_boxes"] is True
     assert (
         "Falls back to keypoint_likelihood_threshold"
         in CONFIG_HELP["draw_keypoint_likelihood_threshold"][1]
@@ -3912,6 +3963,7 @@ def test_default_config_draw_thresholds_defer_to_pose_threshold():
         "Falls back to draw_keypoint_likelihood_threshold"
         in CONFIG_HELP["draw_skeleton_likelihood_threshold"][1]
     )
+    assert "bounding boxes" in CONFIG_HELP["draw_person_bounding_boxes"][1]
 
 
 def test_config_help_mentions_yolo26_detector():
@@ -5102,6 +5154,39 @@ def test_draw_pose_supports_stricter_skeleton_display_threshold(monkeypatch):
     assert int(hidden.sum()) == 0
 
 
+def test_draw_pose_supports_sapiens2_custom_skeleton_links(monkeypatch):
+    """
+    Verify native Sapiens2 skeleton links are drawn through root.skeleton_links.
+    """
+
+    from anytree import Node
+
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[2] / ".omx" / "test_stubs")
+    )
+    from Sports2D.process import draw_pose
+
+    pose_root = Node("SAPIENS2_308", id=None)
+    Node("nose", parent=pose_root, id=0)
+    Node("left_shoulder", parent=pose_root, id=1)
+    pose_root.skeleton_links = [(0, 1)]
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    visible = draw_pose(
+        image.copy(),
+        [np.array([10.0, 50.0], dtype=float)],
+        [np.array([10.0, 50.0], dtype=float)],
+        [np.array([0.9, 0.9], dtype=float)],
+        pose_root,
+        keypoint_names=["nose", "left_shoulder"],
+        backend_name="sapiens2",
+        keypoint_draw_threshold=0.3,
+        skeleton_draw_threshold=0.3,
+    )
+
+    assert int(visible.sum()) > 0
+
+
 def test_build_pose_issue_list_reports_missing_low_confidence_and_manual_points():
     """
     Verify pose diagnostics surface missing, low-confidence, and manual statuses.
@@ -5512,6 +5597,267 @@ def test_create_pose_backend_surfaces_transformers_sam3_guidance(monkeypatch):
     )
     assert "git+https://github.com/huggingface/transformers" in message
     assert "Raw SAM3 checkpoint mode is separate" not in message
+
+
+def test_create_pose_backend_routes_sapiens2_to_lazy_backend(monkeypatch):
+    """
+    Verify pose_model='sapiens2' is routed through the optional Sapiens2 backend.
+    """
+
+    import types
+
+    from Sports2D.Utilities import pose_backend
+
+    captured = {}
+
+    class FakeSapiens2Backend:
+        def __init__(self, config):
+            captured.update(config)
+            self.backend_name = "sapiens2"
+
+    fake_module = types.SimpleNamespace(Sapiens2Backend=FakeSapiens2Backend)
+    monkeypatch.setitem(
+        sys.modules, "Sports2D.Utilities.sapiens2_backend", fake_module
+    )
+
+    backend = pose_backend.create_pose_backend(
+        {"pose": {"pose_model": "sapiens2", "sapiens2_model_size": "0.4b"}}
+    )
+
+    assert backend.backend_name == "sapiens2"
+    assert captured["pose"]["sapiens2_model_size"] == "0.4b"
+
+
+def test_sapiens2_pose_checkpoint_auto_downloads_to_default_path(
+    monkeypatch, tmp_path
+):
+    """
+    Verify missing Sapiens2 pose checkpoints auto-download from the size-specific HF repo.
+    """
+
+    from Sports2D.Utilities import sapiens2_backend
+
+    calls = []
+
+    def fake_download(repo_id, filename, target_path, description):
+        target_path = Path(target_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("fake checkpoint", encoding="utf-8")
+        calls.append(
+            {
+                "repo_id": repo_id,
+                "filename": filename,
+                "target_path": target_path,
+                "description": description,
+            }
+        )
+        return target_path
+
+    monkeypatch.setattr(sapiens2_backend, "_download_hf_checkpoint", fake_download)
+
+    path = sapiens2_backend._resolve_sapiens2_checkpoint_path({}, tmp_path, "0.4b")
+
+    assert path == tmp_path / "pose" / "sapiens2_0.4b_pose.safetensors"
+    assert path.exists()
+    assert calls == [
+        {
+            "repo_id": "facebook/sapiens2-pose-0.4b",
+            "filename": "sapiens2_0.4b_pose.safetensors",
+            "target_path": tmp_path / "pose" / "sapiens2_0.4b_pose.safetensors",
+            "description": "Sapiens2 pose checkpoint (0.4b)",
+        }
+    ]
+
+
+def test_sapiens2_detector_checkpoint_auto_downloads_to_default_path(
+    monkeypatch, tmp_path
+):
+    """
+    Verify missing Sapiens2 RTMDet checkpoints auto-download from the detector HF repo.
+    """
+
+    from Sports2D.Utilities import sapiens2_backend
+
+    calls = []
+
+    def fake_download(repo_id, filename, target_path, description):
+        target_path = Path(target_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text("fake checkpoint", encoding="utf-8")
+        calls.append((repo_id, filename, target_path, description))
+        return target_path
+
+    monkeypatch.setattr(sapiens2_backend, "_download_hf_checkpoint", fake_download)
+
+    path = sapiens2_backend._resolve_sapiens2_detector_checkpoint_path({}, tmp_path)
+
+    assert path == tmp_path / "detector" / "rtmdet_m.pth"
+    assert path.exists()
+    assert calls == [
+        (
+            "facebook/sapiens-pose-bbox-detector",
+            "rtmdet_m.pth",
+            tmp_path / "detector" / "rtmdet_m.pth",
+            "Sapiens2 RTMDet person detector checkpoint",
+        )
+    ]
+
+
+def test_sapiens2_checkpoint_missing_raises_when_auto_download_disabled(tmp_path):
+    """
+    Verify users can opt out, but the default path is automatic download.
+    """
+
+    from Sports2D.Utilities import sapiens2_backend
+
+    with pytest.raises(FileNotFoundError, match="Automatic download is disabled"):
+        sapiens2_backend._resolve_sapiens2_checkpoint_path(
+            {"sapiens2_auto_download": False}, tmp_path, "0.4b"
+        )
+
+
+def test_sapiens2_keypoint_schema_aliases_normalize():
+    """
+    Verify config aliases select either HALPE_26 mapping or native Sapiens2 output.
+    """
+
+    from Sports2D.Utilities.sapiens2_backend import (
+        _normalize_sapiens2_keypoint_schema,
+    )
+
+    assert _normalize_sapiens2_keypoint_schema("") == "halpe26"
+    assert _normalize_sapiens2_keypoint_schema("HALPE_26") == "halpe26"
+    assert _normalize_sapiens2_keypoint_schema("original") == "sapiens2_308"
+    assert _normalize_sapiens2_keypoint_schema("308") == "sapiens2_308"
+    with pytest.raises(ValueError, match="Unsupported sapiens2_keypoint_schema"):
+        _normalize_sapiens2_keypoint_schema("coco17")
+
+
+def test_sapiens2_original_skeleton_preserves_dense_names_and_links():
+    """
+    Verify the native Sapiens2 schema keeps all tensor names and drawable links.
+    """
+
+    from anytree import PreOrderIter
+    from Sports2D.Utilities.sapiens2_backend import (
+        _build_sapiens2_original_skeleton,
+    )
+
+    skeleton, keypoint_names = _build_sapiens2_original_skeleton(
+        {
+            "nose": 0,
+            "left_shoulder": 1,
+            "right_shoulder": 2,
+            "left_wrist": 5,
+        },
+        [
+            ("left_shoulder", "right_shoulder"),
+            ("left_shoulder", "left_wrist"),
+            ("missing", "nose"),
+        ],
+    )
+
+    assert keypoint_names == [
+        "nose",
+        "left_shoulder",
+        "right_shoulder",
+        "sapiens2_keypoint_003",
+        "sapiens2_keypoint_004",
+        "left_wrist",
+    ]
+    assert skeleton.keypoint_schema == "sapiens2_308"
+    assert skeleton.skeleton_links == [(1, 2), (1, 5)]
+    node_ids = {
+        node.name: node.id for node in PreOrderIter(skeleton) if node.id is not None
+    }
+    assert node_ids["left_wrist"] == 5
+
+
+def test_sapiens2_original_keypoint_formatter_keeps_raw_tensor_order():
+    """
+    Verify native Sapiens2 output is not reduced to HALPE_26.
+    """
+
+    from Sports2D.Utilities.sapiens2_backend import (
+        _format_sapiens2_original_keypoints,
+    )
+
+    keypoints, scores = _format_sapiens2_original_keypoints(
+        [np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)],
+        [np.asarray([0.9, 0.8], dtype=np.float32)],
+        ["nose", "left_eye", "right_eye"],
+    )
+
+    assert keypoints.shape == (1, 3, 2)
+    assert scores.shape == (1, 3)
+    assert keypoints[0, 0].tolist() == pytest.approx([1.0, 2.0])
+    assert keypoints[0, 1].tolist() == pytest.approx([3.0, 4.0])
+    assert np.isnan(keypoints[0, 2]).all()
+    assert scores[0].tolist()[:2] == pytest.approx([0.9, 0.8])
+    assert np.isnan(scores[0, 2])
+
+
+def test_sapiens2_keypoint_mapping_outputs_halpe26_with_derived_points():
+    """
+    Verify Sapiens2 308-keypoint names are mapped into the Sports2D HALPE_26 schema.
+    """
+
+    from Sports2D.Utilities.sapiens2_backend import (
+        _map_sapiens2_keypoints_to_halpe26,
+    )
+    from Sports2D.Utilities.synthpose_skeleton import HALPE26_KEYPOINT_NAMES
+
+    sapiens_names = [
+        "nose",
+        "left_eye",
+        "right_eye",
+        "left_shoulder",
+        "right_shoulder",
+        "left_hip",
+        "right_hip",
+        "left_big_toe",
+        "right_big_toe",
+        "left_small_toe",
+        "right_small_toe",
+        "left_heel",
+        "right_heel",
+    ]
+    name_to_id = {name: idx for idx, name in enumerate(sapiens_names)}
+    keypoints = np.full((1, len(sapiens_names), 2), np.nan, dtype=np.float32)
+    scores = np.full((1, len(sapiens_names)), 0.9, dtype=np.float32)
+    values = {
+        "nose": (50.0, 10.0),
+        "left_eye": (40.0, 20.0),
+        "right_eye": (60.0, 20.0),
+        "left_shoulder": (30.0, 80.0),
+        "right_shoulder": (70.0, 80.0),
+        "left_hip": (35.0, 160.0),
+        "right_hip": (65.0, 160.0),
+        "left_big_toe": (30.0, 250.0),
+        "right_big_toe": (70.0, 250.0),
+        "left_small_toe": (25.0, 252.0),
+        "right_small_toe": (75.0, 252.0),
+        "left_heel": (32.0, 230.0),
+        "right_heel": (68.0, 230.0),
+    }
+    for name, value in values.items():
+        keypoints[0, name_to_id[name]] = value
+
+    mapped_keypoints, mapped_scores = _map_sapiens2_keypoints_to_halpe26(
+        keypoints,
+        scores,
+        name_to_id,
+    )
+    idx = {name: i for i, name in enumerate(HALPE26_KEYPOINT_NAMES)}
+
+    assert mapped_keypoints.shape == (1, 26, 2)
+    assert mapped_scores.shape == (1, 26)
+    assert mapped_keypoints[0, idx["Nose"]].tolist() == pytest.approx([50.0, 10.0])
+    assert mapped_keypoints[0, idx["LBigToe"]].tolist() == pytest.approx([30.0, 250.0])
+    assert mapped_keypoints[0, idx["RSmallToe"]].tolist() == pytest.approx([75.0, 252.0])
+    assert mapped_keypoints[0, idx["Neck"]].tolist() == pytest.approx([50.0, 80.0])
+    assert mapped_keypoints[0, idx["Hip"]].tolist() == pytest.approx([50.0, 160.0])
+    assert mapped_keypoints[0, idx["Head"]].tolist() == pytest.approx([50.0, 4.0])
 
 
 def test_synthpose_backend_disables_saved_sam3_mask_collection_when_preview_is_off(

@@ -6,7 +6,7 @@
 ## Pose Estimation Backend Abstraction Layer    ##
 ##################################################
 
-Unified interface for pose estimation backends (RTMLib, SynthPose).
+Unified interface for pose estimation backends (RTMLib, SynthPose, Sapiens2).
 
 This module provides:
 - PoseBackend: Abstract base class defining the interface
@@ -1178,7 +1178,7 @@ def create_pose_backend(config_dict: dict) -> PoseBackend:
         config_dict: Full configuration dictionary with 'pose' section
 
     Returns:
-        PoseBackend: Configured backend instance (RTMLibBackend or SynthPoseBackend)
+        PoseBackend: Configured backend instance (RTMLibBackend, SynthPoseBackend, or Sapiens2Backend)
 
     Raises:
         ValueError: If pose_model is invalid
@@ -1213,6 +1213,19 @@ def create_pose_backend(config_dict: dict) -> PoseBackend:
     pose_config = config_dict.get("pose", {})
     pose_model = pose_config.get("pose_model", "body_with_feet").lower()
 
+    if pose_model == "sapiens2":
+        try:
+            from Sports2D.Utilities.sapiens2_backend import Sapiens2Backend
+
+            return Sapiens2Backend(config_dict)
+        except ImportError as e:
+            raise ImportError(
+                f"Sapiens2 requires additional dependencies: {e}\n"
+                "Install the local Sapiens2 checkout with: pip install -e ./sapiens2\n"
+                "Then download pose and detector checkpoints under $SAPIENS_CHECKPOINT_ROOT,\n"
+                "or set pose.sapiens2_root / pose.sapiens2_checkpoint / "
+                "pose.sapiens2_detector_checkpoint in the config."
+            ) from e
     if pose_model in ["synthpose", "synthpose_base"]:
         try:
             return SynthPoseBackend(config_dict)

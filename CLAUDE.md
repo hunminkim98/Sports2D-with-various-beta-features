@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Sports2D is a Python tool that computes 2D joint positions, joint angles, and segment angles from video or webcam input. It uses RTMLib or SynthPose for pose estimation and optionally integrates with OpenSim for inverse kinematics.
+Sports2D is a Python tool that computes 2D joint positions, joint angles, and segment angles from video or webcam input. It uses RTMLib, SynthPose, or Sapiens2 for pose estimation and optionally integrates with OpenSim for inverse kinematics.
 
 ## Build and Development Commands
 
@@ -24,6 +24,11 @@ pip install sports2d
 
 # Install with SynthPose support (VitPose models)
 pip install sports2d[synthpose]
+
+# Install local Sapiens2 support for pose_model='sapiens2'
+pip install -e ".[sapiens2]"
+pip install -e ./sapiens2
+# Missing Sapiens2 pose/detector checkpoints auto-download under $SAPIENS_CHECKPOINT_ROOT
 ```
 
 ### Running Tests
@@ -117,6 +122,13 @@ python -c 'import onnxruntime as ort; print(ort.get_available_providers())'
 - Files: `Utilities/pose_backend.py`, `Utilities/synthpose_tracker.py`, `Utilities/synthpose_skeleton.py`
 - RT-DETRv4 engine (inference-only): `Sports2D/models/RT-DETRv4/engine/`
 
+**Sapiens2 (optional, local nested checkout):**
+- Select with `pose_model = "sapiens2"` in `Sports2D/Demo/Config_demo.toml` or `--pose_model sapiens2`
+- Runs Sapiens2 308-keypoint top-down pose. `sapiens2_keypoint_schema="halpe26"` maps body/feet points to HALPE_26 for Sports2D tracking, angles, TRC export, and OpenSim bridging; `sapiens2_keypoint_schema="sapiens2_308"` keeps all native Sapiens2 keypoints for dense visualization/export.
+- Missing pose/detector checkpoints are downloaded automatically by default from Hugging Face into `$SAPIENS_CHECKPOINT_ROOT` or `~/sapiens2_host`
+- Config knobs: `sapiens2_root`, `sapiens2_checkpoint_root`, `sapiens2_auto_download`, `sapiens2_pose_repo`, `sapiens2_detector_repo`, `sapiens2_model_size`, `sapiens2_keypoint_schema`, `sapiens2_config`, `sapiens2_checkpoint`, `sapiens2_bbox_source`, `sapiens2_detector_config`, `sapiens2_detector_checkpoint`
+- Files: `Utilities/sapiens2_backend.py`, `Utilities/pose_backend.py`, `Demo/Config_demo.toml`, nested `sapiens2/`
+
 ### Configuration System
 The configuration uses TOML files (see `Demo/Config_demo.toml` for full reference):
 - `[base]`: Video input, person detection, output settings
@@ -137,6 +149,7 @@ The configuration uses TOML files (see `Demo/Config_demo.toml` for full referenc
 - `common.py`: Angle computation dictionaries (`angle_dict`), marker Z positions, helper functions
 - `tests.py`: Test workflow covering CLI and Python API
 - `pose_backend.py`: **Backend abstraction layer** - unified interface for pose estimation
+- `sapiens2_backend.py`: Optional Sapiens2 308-keypoint backend mapped to Sports2D/HALPE_26
 - `synthpose_tracker.py`: SynthPose person tracking with YOLOX/YOLO26/RT-DETR/RT-DETRv4 detectors
 - `synthpose_skeleton.py`: 52-keypoint skeleton definition and HALPE_26 mapping
 
@@ -151,13 +164,14 @@ class PoseBackend(ABC):
     def reset() -> None
     @property skeleton_tree -> anytree.Node
     @property num_keypoints -> int
-    @property backend_name -> str  # 'rtmlib' or 'synthpose'
+    @property backend_name -> str  # 'rtmlib', 'synthpose', or 'sapiens2'
     @property keypoint_names -> List[str]
 ```
 
 **Implementations**:
 - `RTMLibBackend`: ONNX-based pose estimation via Pose2Sim/rtmlib
 - `SynthPoseBackend`: PyTorch-based VitPose estimation
+- `Sapiens2Backend`: PyTorch-based Sapiens2 pose estimation from a local Sapiens2 checkout
 
 **Factory Function**:
 ```python

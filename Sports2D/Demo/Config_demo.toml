@@ -12,7 +12,7 @@
 
 
 [base]
-video_input = 'side.MOV'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
+video_input = 'handspring.mp4'  # 'webcam' or '<video_path.ext>' or '<video_folder_path>' or ['video1_path.mp4', 'video2_path.avi', ...]
                            # On Windows, replace '\' with '/'
                            # Beware that images won't be saved if paths contain non ASCII characters.
 
@@ -77,7 +77,15 @@ slowmo_factor = 1       # 1 for normal speed. For a video recorded at 240 fps an
 ##   Note: SynthPose outputs 52 anatomical keypoints including HALPE_26 + additional markers.
 ##   Models are automatically downloaded from HuggingFace on first use (~2GB).
 ##
-pose_model = 'body_with_feet'
+## Sapiens2 models (PyTorch-based, requires Python 3.12+, a local Sapiens2 checkout,
+## and 'pip install -e ".[sapiens2]" && pip install -e ./sapiens2'):
+##   - 'sapiens2': Sapiens2 308-keypoint top-down pose mapped to Sports2D HALPE_26
+##   Set pose_model = 'sapiens2' and choose sapiens2_model_size below.
+##   Missing checkpoints are downloaded automatically on first use to:
+##     $SAPIENS_CHECKPOINT_ROOT/pose/sapiens2_<size>_pose.safetensors
+##     $SAPIENS_CHECKPOINT_ROOT/detector/rtmdet_m.pth
+##
+pose_model = 'sapiens2'
 
 ## ============================================================
 ## SynthPose Person Detector Selection
@@ -110,6 +118,44 @@ synthpose_detector = 'yolox'
 ##   - or explicit: 'huge', 'base'
 ## Leave empty to use pose_model + mode logic.
 synthpose_model_size = 'huge'
+
+## ============================================================
+## Sapiens2 Model Selection
+## ============================================================
+## Only used when pose_model='sapiens2':
+##   - sapiens2_root: path to Sapiens2 repo. Empty auto-detects nested ./sapiens2
+##   - sapiens2_checkpoint_root: empty uses $SAPIENS_CHECKPOINT_ROOT or ~/sapiens2_host
+##   - sapiens2_auto_download: true downloads missing pose/detector checkpoints
+##   - sapiens2_pose_repo / sapiens2_detector_repo: optional HuggingFace repo overrides
+##   - sapiens2_model_size: '0.4b', '0.8b', '1b', or '5b'
+##   - sapiens2_keypoint_schema:
+##       'halpe26'      -> map Sapiens2 body/feet to Sports2D HALPE_26 (angles/OpenSim)
+##       'sapiens2_308' -> keep all native Sapiens2 308 keypoints (dense video/TRC)
+##   - sapiens2_bbox_source:
+##       'yolox'      -> RTMLib YOLOX person detector (no mmdet dependency)
+##       'detector'   -> RTMDet person detector (requires mmdet/mmcv/mmengine)
+##       'manual_roi' -> use the manual person ROI selected at startup
+##       'full_frame' -> single full-frame person crop (quick smoke/single-person fallback)
+##   - sapiens2_inference_dtype: 'float32', 'float16', or 'bfloat16'
+##   - sapiens2_flip_test: false is faster and matches the local comparison runs
+## Optional explicit config/checkpoint paths override the defaults derived from root/size.
+##
+sapiens2_root = ''
+sapiens2_checkpoint_root = ''
+sapiens2_auto_download = true
+sapiens2_pose_repo = ''
+sapiens2_detector_repo = ''
+sapiens2_model_size = '5b'
+sapiens2_keypoint_schema = 'halpe26'
+sapiens2_config = ''
+sapiens2_checkpoint = ''
+sapiens2_bbox_source = 'yolox'
+sapiens2_yolox_model_size = 'x'
+sapiens2_detector_config = ''
+sapiens2_detector_checkpoint = ''
+sapiens2_nms_threshold = 0.3
+sapiens2_inference_dtype = 'float32'
+sapiens2_flip_test = false
 
 ## ============================================================
 ## SAM3 Prompt Presets
@@ -211,6 +257,7 @@ tracking_mode = 'sports2d' # 'sports2d' or 'deepsort'. 'deepsort' is slower, har
 keypoint_likelihood_threshold = 0.3 # Keypoints whose likelihood is lower will not be taken into account
 draw_keypoint_likelihood_threshold = 0.5 # Display-only threshold for keypoint markers after pose filtering
 draw_skeleton_likelihood_threshold = 0.6 # Display-only threshold for skeleton lines; raise this to hide uncertain long links
+draw_person_bounding_boxes = true # Draw person bounding boxes and track IDs on realtime/saved overlays
 person_detection_threshold = 0.3    # Object detector threshold (person/ball)
 average_likelihood_threshold = 0.3  # Person will be ignored if average likelihood of good keypoints is lower than this value
 keypoint_number_threshold = 0.3     # Person will be ignored if the number of good keypoints (above keypoint_likelihood_threshold) is less than this fraction
@@ -237,8 +284,8 @@ ball_tracking_max_distance = 200 # Max px distance for frame-to-frame raw ID ass
 ball_track_max_missing_frames = 180 # Keep missing raw tracks for N frames before removing. Larger values help selected-ball stitching survive brief detector gaps
 ball_show_ids = true            # Draw raw 'ball {id}' labels on ball boxes. These can still differ from the stitched selected-ball timeline
 ball_color = [0, 0, 0]    # BGR (OpenCV), default black
-manual_roi = true              # Draw a static person ROI before inference starts; when detect_ball=true, also draw a ball ROI
-manual_roi_mode = 'adaptive_person'  # 'bootstrap' releases the ROI after initial acquisition; 'adaptive_person' keeps following accepted person detections
+manual_roi = false              # Draw a static person ROI before inference starts; when detect_ball=true, also draw a ball ROI
+manual_roi_mode = 'bootstrap'  # 'bootstrap' releases the ROI after initial acquisition; 'adaptive_person' keeps following accepted person detections
 manual_roi_padding_px = 5      # Extra pixels added around the selected ROI before crop/tracking
 manual_roi_tracking_margin_px = 48      # Extra pixels added when adaptive_person recenters or expands the person ROI
 manual_roi_reacquire_patience = 6       # Consecutive adaptive-person misses allowed before the next eligible detection frame forces a full-frame person reacquire
@@ -326,7 +373,7 @@ filter_type = 'butterworth'     # butterworth, kalman, gcv_spline, gaussian, loe
 
 
 [kinematics]
-do_ik = true # Do scaling and inverse kinematics?
+do_ik = false # Do scaling and inverse kinematics?
 use_augmentation = false  # true or false (lowercase) # Set to true if you want to use the model with augmented markers
 inverse_dynamics = true # true or false (lowercase) # Run OpenSim inverse dynamics from the estimated vertical GRF. Requires do_ik=true, motion.vertical_jump=true, and to_meters=true. Uses a bilateral 50:50 split, shared CoP proxy, and zero horizontal forces
 feet_on_floor = false # true or false (lowercase) # Set to false if you want to use the model with feet not on the floor (e.g. running, jumping, etc.)

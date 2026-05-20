@@ -8,5 +8,22 @@ dist/
 demo_Sports2D/**
 **/Demo/*.jpg
 **/Demo/*.mp4
+**/Demo/*.mov
+**/Demo/*.MOV
 **/*_Sports2D/
 *.pth
+*.pt
+
+# Local agent/runtime and virtualenv artifacts
+/.codex
+/.omc/
+/.omx/
+/.venv-codex/
+
+# Local generated comparison/smoke outputs
+/comparison_runs/
+sports2d_qt_hybrid_*/
+*.avi
+
+# Local heavyweight checkpoint stash
+/models/

@@ -1,0 +1,4 @@
+[submodule "sapiens2"]
+	path = sapiens2
+	url = https://github.com/facebookresearch/sapiens2.git
+	branch = main

@@ -71,6 +71,7 @@ import platform
 import time
 import tempfile
 import unicodedata
+import inspect
 from importlib.metadata import version
 from datetime import datetime
 import itertools as it
@@ -251,7 +252,7 @@ def draw_pose(
         skeleton_draw_threshold,
     )
 
-    if backend_name == "synthpose":
+    if backend_name in {"synthpose", "sapiens2"}:
         img = _draw_synthpose_keypoints(
             img,
             draw_X_keypoints,
@@ -1034,6 +1035,43 @@ def _resolve_meter_conversion_trc_data(pose_model_name, trc_data):
     return pd.DataFrame(trc_data).copy()
 
 
+def _compute_height_compat(
+    q_coords,
+    keypoint_names,
+    *,
+    fastest_frames_to_remove_percent,
+    close_to_zero_speed,
+    large_hip_knee_angles,
+    trimmed_extrema_percent,
+):
+    """
+    Call Pose2Sim.compute_height across supported Pose2Sim API variants.
+
+    Older Sports2D integration passed keypoint names and motion filters. Recent
+    Pose2Sim releases compute those internally and only accept angle/trim params.
+    """
+
+    parameters = inspect.signature(compute_height).parameters
+    if (
+        "fastest_frames_to_remove_percent" in parameters
+        or "close_to_zero_speed" in parameters
+    ):
+        return compute_height(
+            q_coords,
+            keypoint_names,
+            fastest_frames_to_remove_percent=fastest_frames_to_remove_percent,
+            close_to_zero_speed=close_to_zero_speed,
+            large_hip_knee_angles=large_hip_knee_angles,
+            trimmed_extrema_percent=trimmed_extrema_percent,
+        )
+
+    return compute_height(
+        q_coords,
+        large_hip_knee_angles=large_hip_knee_angles,
+        trimmed_extrema_percent=trimmed_extrema_percent,
+    )
+
+
 def _resolve_pose2sim_pose_model_name(pose_model_name):
     """
     Translate Sports2D runtime pose-model names to Pose2Sim/OpenSim bridge names.
@@ -1055,6 +1093,7 @@ def _resolve_pose2sim_pose_model_name(pose_model_name):
         "animal": "ANIMAL2D_17",
         "synthpose": "HALPE_26",
         "synthpose_base": "HALPE_26",
+        "sapiens2": "HALPE_26",
     }
     return pose2sim_model_names.get(
         normalized_name, str(pose_model_name or "BODY_WITH_FEET").strip().upper()
@@ -2703,6 +2742,31 @@ def _draw_synthpose_keypoints(
         SYNTHPOSE_KEYPOINT_NAMES,
     )
 
+    sapiens2_body_with_feet_names = {
+        "nose",
+        "left_eye",
+        "right_eye",
+        "left_ear",
+        "right_ear",
+        "left_shoulder",
+        "right_shoulder",
+        "left_elbow",
+        "right_elbow",
+        "left_wrist",
+        "right_wrist",
+        "left_hip",
+        "right_hip",
+        "left_knee",
+        "right_knee",
+        "left_ankle",
+        "right_ankle",
+        "left_big_toe",
+        "right_big_toe",
+        "left_small_toe",
+        "right_small_toe",
+        "left_heel",
+        "right_heel",
+    }
     radius = thickness + 4  # Same as default in Pose2Sim
 
     for person_id, (X, Y, scores) in enumerate(zip(all_X, all_Y, all_scores)):
@@ -2725,7 +2789,10 @@ def _draw_synthpose_keypoints(
             kp_name = None
             if keypoint_names is not None and kp_id < len(keypoint_names):
                 kp_name = keypoint_names[kp_id]
-                is_halpe26 = kp_name in SYNTHPOSE_HALPE26_BODYWITHFEET_NAMES
+                is_halpe26 = (
+                    kp_name in SYNTHPOSE_HALPE26_BODYWITHFEET_NAMES
+                    or kp_name in sapiens2_body_with_feet_names
+                )
             else:
                 # Fallback: use ID-based check (only works for original IDs)
                 # HALPE26 = COCO17 (0-16) + Foot keypoints (40-47)
@@ -2789,6 +2856,37 @@ def _draw_synthpose_skeleton(
 
     for person_id, (X, Y, scores) in enumerate(zip(all_X, all_Y, all_scores)):
         if np.isnan(X).all():
+            continue
+
+        custom_links = getattr(pose_model, "skeleton_links", None)
+        if custom_links:
+            for parent_id, child_id in custom_links:
+                if child_id is None or parent_id is None:
+                    continue
+                if child_id >= len(X) or parent_id >= len(X):
+                    continue
+                x1, y1 = X[parent_id], Y[parent_id]
+                x2, y2 = X[child_id], Y[child_id]
+                score1 = scores[parent_id]
+                score2 = scores[child_id]
+                if (
+                    np.isnan(x1)
+                    or np.isnan(y1)
+                    or np.isnan(x2)
+                    or np.isnan(y2)
+                    or np.isnan(score1)
+                    or np.isnan(score2)
+                    or score1 < float(threshold)
+                    or score2 < float(threshold)
+                ):
+                    continue
+                cv2.line(
+                    img,
+                    (int(x1), int(y1)),
+                    (int(x2), int(y2)),
+                    (200, 200, 200),
+                    thickness,
+                )
             continue
 
         # Use anytree parent-child relationships (works with reordered IDs)
@@ -5517,6 +5615,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         config_dict.get("pose").get("draw_skeleton_likelihood_threshold"),
         draw_keypoint_likelihood_threshold,
     )
+    draw_person_bounding_boxes = bool(
+        config_dict.get("pose").get("draw_person_bounding_boxes", True)
+    )
     average_likelihood_threshold = config_dict.get("pose").get(
         "average_likelihood_threshold"
     )
@@ -5871,8 +5972,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
     pending_frame = None
     pending_frame_index = None
-    config_dict.setdefault("pose", {}).pop("_manual_person_roi", None)
-    config_dict.setdefault("pose", {}).pop("_manual_ball_roi", None)
+    pose_runtime_cfg = config_dict.setdefault("pose", {})
+    if manual_roi:
+        pose_runtime_cfg.pop("_manual_person_roi", None)
+        pose_runtime_cfg.pop("_manual_ball_roi", None)
     if manual_roi and not load_trc_px:
         preview_frame_idx = int(frame_range[0])
         if video_file != "webcam":
@@ -5952,8 +6055,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         )
         realtime_display.set_session_state("Initializing")
 
-    # Check if SynthPose is requested
+    # Check if an optional PyTorch backend is requested before falling back to RTMLib.
     use_synthpose = pose_model_name.lower() in ["synthpose", "synthpose_base"]
+    use_sapiens2 = pose_model_name.lower() == "sapiens2"
 
     if use_synthpose:
         # SynthPose mode
@@ -5970,6 +6074,20 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         logging.info(
             f"Using SynthPose ({synthpose_mode}) - VitPose from HuggingFace Transformers with 52 keypoints"
         )
+    elif use_sapiens2:
+        # Sapiens2 mode. The backend can either preserve the native 308-keypoint
+        # tensor order or map the body/feet subset into HALPE_26 downstream.
+        pose_model = copy.deepcopy(HALPE_26)
+        ModelClass = None
+        sapiens2_schema = str(
+            config_dict.get("pose", {}).get("sapiens2_keypoint_schema", "halpe26")
+            or "halpe26"
+        )
+        logging.info(
+            "Using Sapiens2 - keypoint schema '%s' "
+            "(halpe26 mapping or native sapiens2_308)",
+            sapiens2_schema,
+        )
     else:
         # RTMLib mode (default)
         pose_model, ModelClass, mode = setup_model_class_mode(
@@ -5977,9 +6095,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         )
 
     # Select device and backend
-    if use_synthpose:
-        # SynthPose uses PyTorch directly, not ONNX - skip Pose2Sim backend setup
-        # Device will be auto-detected by the pose backend using torch.cuda.is_available()
+    if use_synthpose or use_sapiens2:
+        # Optional PyTorch backends do not use Pose2Sim's ONNX provider setup.
+        # Device will be resolved by the backend using torch.cuda.is_available().
         pass  # Keep original device value from config ('auto', 'cuda', 'cpu', etc.)
     else:
         # RTMLib uses ONNX backends
@@ -6032,6 +6150,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             backend_name = pose_tracker.backend_name
             display_runtime_backend = backend_name
             use_synthpose = backend_name == "synthpose"
+            pose_model = getattr(pose_tracker, "skeleton_tree", pose_model)
             logging.info(
                 f"{pose_tracker.backend_name} tracker initialized with {pose_tracker.num_keypoints} keypoints"
             )
@@ -6126,6 +6245,43 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     sam3_ball_mask_flag_enabled = bool(ball_overlay_enabled and uses_sam3_mask_source)
 
     raw_keypoint_names = keypoints_names.copy()
+    sapiens2_keypoint_schema = (
+        str(getattr(pose_tracker, "keypoint_schema", "") or "").strip().lower()
+        if use_sapiens2
+        else ""
+    )
+    preserve_sapiens2_original_schema = (
+        use_sapiens2 and sapiens2_keypoint_schema == "sapiens2_308"
+    )
+    derived_pose_keypoints = [] if preserve_sapiens2_original_schema else [
+        "Hip",
+        "Neck",
+        "Head",
+    ]
+    if preserve_sapiens2_original_schema:
+        logging.info(
+            "Sapiens2 original 308-keypoint schema selected; Sports2D-derived "
+            "Hip/Neck/Head markers are not appended to the exported pose."
+        )
+        frame_keypoint_likelihood_threshold = 0.0
+        frame_average_likelihood_threshold = 0.0
+        frame_keypoint_number_threshold = 0.0
+        logging.info(
+            "Sapiens2 original 308-keypoint schema keeps native dense points; "
+            "pose confidence rejection is disabled so sparse face/hand confidence "
+            "does not delete the body pose. Draw thresholds still control visualized "
+            "keypoints/skeleton links."
+        )
+        if calculate_angles:
+            logging.warning(
+                "Sapiens2 original 308-keypoint schema uses native snake_case names. "
+                "Sports2D angle definitions expect HALPE/OpenPose names, so most "
+                "angle outputs will be NaN unless you select sapiens2_keypoint_schema='halpe26'."
+            )
+    else:
+        frame_keypoint_likelihood_threshold = keypoint_likelihood_threshold
+        frame_average_likelihood_threshold = average_likelihood_threshold
+        frame_keypoint_number_threshold = keypoint_number_threshold
     L_R_direction_idx = None
     if flip_left_right:
         try:
@@ -6566,9 +6722,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         person_X_raw,
                         person_Y_raw,
                         person_scores_raw,
-                        keypoint_likelihood_threshold,
-                        average_likelihood_threshold,
-                        keypoint_number_threshold,
+                        frame_keypoint_likelihood_threshold,
+                        frame_average_likelihood_threshold,
+                        frame_keypoint_number_threshold,
                     )
                     person_render_X, person_render_Y, person_render_scores = (
                         person_X,
@@ -6604,7 +6760,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                     keypoints_names.copy(),
                     keypoints_ids.copy(),
                 )
-                for kpt in ["Hip", "Neck", "Head"]:
+                for kpt in derived_pose_keypoints:
                     if kpt not in new_keypoints_names:
                         person_X_flipped, person_Y, person_scores, new_keypoints_names = _upsert_derived_pose_keypoint(
                             kpt,
@@ -6715,14 +6871,15 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         alpha=sam3_realtime_mask_alpha,
                         ball_color=ball_color,
                     )
-                img = draw_bounding_box(
-                    img,
-                    valid_X,
-                    valid_Y,
-                    colors=colors,
-                    fontSize=fontSize,
-                    thickness=thickness,
-                )
+                if draw_person_bounding_boxes:
+                    img = draw_bounding_box(
+                        img,
+                        valid_X,
+                        valid_Y,
+                        colors=colors,
+                        fontSize=fontSize,
+                        thickness=thickness,
+                    )
                 # Draw keypoints and skeleton using unified draw_pose function
                 if use_synthpose:
                     # For realtime visualization, data is in original SynthPose order (indices 0-51)
@@ -6733,10 +6890,12 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
                     realtime_kpt_names = list(SYNTHPOSE_KEYPOINT_NAMES)
                     # Add derived markers if they were appended to the processed arrays.
-                    for kpt in ["Hip", "Neck", "Head"]:
+                    for kpt in derived_pose_keypoints:
                         if kpt in new_keypoints_names and kpt not in realtime_kpt_names:
                             realtime_kpt_names.append(kpt)
                     kpt_names_for_draw = realtime_kpt_names
+                elif use_sapiens2:
+                    kpt_names_for_draw = new_keypoints_names
                 else:
                     kpt_names_for_draw = None
                 img = draw_pose(
@@ -6892,6 +7051,8 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
         # End of the video is reached
         cap.release()
         logging.info(f"Video processing completed.")
+        if not load_trc_px and hasattr(pose_tracker, "log_inference_timing_summary"):
+            pose_tracker.log_inference_timing_summary()
         if save_vid or video_file == "webcam":
             out_vid.release()
             if video_file == "webcam":
@@ -7316,11 +7477,10 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
 
             # Do not process person if no section of min_chunk_size valid frames in a row
             if (first_run_start_min, last_run_end_max) == (0, 0):
-                (
-                    all_frames_X_processed[:, idx_person, :],
-                    all_frames_X_flipped_processed[:, idx_person, :],
-                    all_frames_Y_processed[:, idx_person, :],
-                ) = np.nan, np.nan, np.nan
+                all_frames_X_processed[:, idx_person, :] = np.nan
+                all_frames_Y_processed[:, idx_person, :] = np.nan
+                if calculate_angles or save_angles:
+                    all_frames_X_flipped_processed[:, idx_person, :] = np.nan
                 columns = np.array(
                     [[c] * 3 for c in all_frames_X_person.columns]
                 ).flatten()
@@ -7513,7 +7673,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             meter_keypoint_names = list(meter_trc_data[0].columns[1::3])
 
             # Compute height of the first person in pixels
-            height_px = CORRECTION_2D_TO_3D * compute_height(
+            height_px = CORRECTION_2D_TO_3D * _compute_height_compat(
                 meter_trc_data[0].iloc[:, 1:],
                 meter_keypoint_names,
                 fastest_frames_to_remove_percent=fastest_frames_to_remove_percent,
@@ -8239,14 +8399,15 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             else:
                 replay_fallback_frame = frame.copy()
             img = frame.copy()
-            img = draw_bounding_box(
-                img,
-                all_frames_X_processed[i],
-                all_frames_Y_processed[i],
-                colors=colors,
-                fontSize=fontSize,
-                thickness=thickness,
-            )
+            if draw_person_bounding_boxes:
+                img = draw_bounding_box(
+                    img,
+                    all_frames_X_processed[i],
+                    all_frames_Y_processed[i],
+                    colors=colors,
+                    fontSize=fontSize,
+                    thickness=thickness,
+                )
             # Draw keypoints and skeleton using unified draw_pose function
             img = draw_pose(
                 img,
@@ -8254,7 +8415,9 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 all_frames_Y_processed[i],
                 all_frames_scores_processed[i],
                 pose_model_with_new_ids,
-                keypoint_names=new_keypoints_names if use_synthpose else None,
+                keypoint_names=new_keypoints_names
+                if (use_synthpose or use_sapiens2)
+                else None,
                 backend_name=backend_name,
                 thickness=thickness,
                 keypoint_draw_threshold=draw_keypoint_likelihood_threshold,
@@ -8530,7 +8693,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 else:
                     # Provide missing data to Pose2Sim_config_dict
                     trc_data_m_keypoint_names = list(trc_data_m_i.columns[1::3])
-                    height_m_i = compute_height(
+                    height_m_i = _compute_height_compat(
                         trc_data_m_i.iloc[:, 1:],
                         trc_data_m_keypoint_names,
                         fastest_frames_to_remove_percent=fastest_frames_to_remove_percent,

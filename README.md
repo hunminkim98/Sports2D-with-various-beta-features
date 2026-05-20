@@ -495,6 +495,15 @@ sports2d --video_input demo.mp4 other_video.mp4 --time_range 1.2 2.7 0 3.5
            --detect_ball true
   ```
   This uses an Ultralytics COCO detector for people and optional sports-ball metadata while keeping the existing SynthPose VitPose path for the 52-keypoint pose output.
+- Use Sapiens2 as the pose-estimation backend
+  ``` cmd
+  cd /path/to/Sports2D-with-various-beta-features
+  pip install -e ".[sapiens2]"
+  pip install -e ./sapiens2
+  set SAPIENS_CHECKPOINT_ROOT=%USERPROFILE%/sapiens2_host
+  sports2d --config Sports2D/Demo/Config_demo.toml --pose_model sapiens2
+  ```
+  `pose_model='sapiens2'` loads the local Sapiens2 308-keypoint top-down pose model. By default `sapiens2_keypoint_schema='halpe26'` maps the body/feet subset to Sports2D's HALPE_26 schema for tracking, TRC export, angles, and OpenSim bridging; set `sapiens2_keypoint_schema='sapiens2_308'` to keep all native Sapiens2 keypoints for dense visualization/export. Sapiens2 itself requires Python 3.12+. Use `sapiens2_model_size='0.4b'|'0.8b'|'1b'|'5b'`; leave `sapiens2_config` and `sapiens2_checkpoint` empty to derive paths from `sapiens2_root` and `$SAPIENS_CHECKPOINT_ROOT`. With `sapiens2_auto_download=true` (default), the first run downloads the selected pose checkpoint from `facebook/sapiens2-pose-<size>` and the RTMDet detector checkpoint from `facebook/sapiens-pose-bbox-detector` into `$SAPIENS_CHECKPOINT_ROOT` (or `~/sapiens2_host`). The default `sapiens2_bbox_source='detector'` uses that RTMDet checkpoint; `manual_roi` and `full_frame` are available for single-person/local-smoke scenarios.
 - Review auto-estimated pose and ball tracks before exporting the final outputs
   ``` cmd
   sports2d --hybrid_mode true `
@@ -580,6 +589,7 @@ sports2d --help
 'keypoint_likelihood_threshold': ["", "detected keypoints are not retained if likelihood is below this threshold. 0.3 if not specified"],
 'draw_keypoint_likelihood_threshold': ["", "display-only threshold for keypoint markers after pose filtering. Higher values hide uncertain markers without changing saved pose/angle data. Falls back to keypoint_likelihood_threshold if not specified"],
 'draw_skeleton_likelihood_threshold': ["", "display-only threshold for skeleton lines after pose filtering. A line is drawn only when both endpoint keypoints meet this threshold. Falls back to draw_keypoint_likelihood_threshold if not specified"],
+'draw_person_bounding_boxes': ["", "true or false. Draw person bounding boxes and track IDs in realtime/saved overlays. true if not specified"],
 'average_likelihood_threshold': ["", "detected persons are not retained if average keypoint likelihood is below this threshold. 0.5 if not specified"],
 'keypoint_number_threshold': ["", "detected persons are not retained if number of detected keypoints is below this threshold. 0.3 if not specified, i.e., i.e., 30 percent"],
 'max_distance': ["", "If a person is detected further than max_distance from its position on the previous frame, it will be considered as a new one. in px or None, 100 by default."],
@@ -722,7 +732,7 @@ Sports2D:
 5. **Computes the selected joint and segment angles**, and flips them on the left/right side if the respective foot is pointing to the left/right. 
 
 5. **Draws the results on the image:**\
-  Draws bounding boxes around each person and writes their IDs\
+  Draws bounding boxes around each person and writes their IDs (set `draw_person_bounding_boxes=false` to hide them)\
   Draws the skeleton and the keypoints, with a green to red color scale to account for their confidence\
   Draws joint and segment angles on the body, and writes the values either near the joint/segment, or on the upper-left of the image with a progress bar
 

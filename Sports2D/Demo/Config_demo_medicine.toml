@@ -211,6 +211,7 @@ tracking_mode = 'sports2d' # 'sports2d' or 'deepsort'. 'deepsort' is slower, har
 keypoint_likelihood_threshold = 0.3 # Keypoints whose likelihood is lower will not be taken into account
 draw_keypoint_likelihood_threshold = 0.5 # Display-only threshold for keypoint markers after pose filtering
 draw_skeleton_likelihood_threshold = 0.6 # Display-only threshold for skeleton lines; raise this to hide uncertain long links
+draw_person_bounding_boxes = true # Draw person bounding boxes and track IDs on realtime/saved overlays
 person_detection_threshold = 0.3    # Object detector threshold (person/ball)
 average_likelihood_threshold = 0.3  # Person will be ignored if average likelihood of good keypoints is lower than this value
 keypoint_number_threshold = 0.3     # Person will be ignored if the number of good keypoints (above keypoint_likelihood_threshold) is less than this fraction

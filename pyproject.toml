@@ -45,6 +45,26 @@ synthpose = [
     "torchvision", 
     "transformers",
 ]
+sapiens2 = [
+    # Sapiens2 itself is installed from the local/nested checkout:
+    # `pip install -e ./sapiens2` (Sapiens2 requires Python >=3.12).
+    "torch>=2.7",
+    "torchvision",
+    "numpy",
+    "opencv-python",
+    "pillow",
+    "safetensors",
+    "tqdm",
+    "scipy",
+    "matplotlib",
+    "iopath",
+    "prettytable",
+    "termcolor",
+    "accelerate",
+    "rich",
+    "huggingface_hub",
+    "mmdet",
+]
 yolo26 = [
     "ultralytics",
 ]
