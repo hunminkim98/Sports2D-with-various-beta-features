@@ -1237,6 +1237,585 @@ def test_resolve_personIDs_for_medicine_ball_falls_back_when_presence_gate_remov
     )
 
 
+def _fill_motion_person(
+    all_frames_X_homog,
+    all_frames_Y_homog,
+    all_frames_scores_homog,
+    person_idx,
+    hip_x,
+    hip_y,
+    neck_offset=(0.0, -45.0),
+    left_foot_offset=(-10.0, 55.0),
+    right_foot_offset=(10.0, 55.0),
+    score=0.9,
+    visible_slice=None,
+):
+    """
+    Populate a synthetic six-keypoint track: Hip, Neck, L/R toe, L/R heel.
+    """
+
+    hip_x = np.asarray(hip_x, dtype=float)
+    hip_y = np.asarray(hip_y, dtype=float)
+    frame_count = len(hip_x)
+    visible = np.zeros((frame_count,), dtype=bool)
+    visible[visible_slice if visible_slice is not None else slice(None)] = True
+    offsets = [
+        (0.0, 0.0),
+        neck_offset,
+        left_foot_offset,
+        right_foot_offset,
+        left_foot_offset,
+        right_foot_offset,
+    ]
+    for keypoint_idx, (dx, dy) in enumerate(offsets):
+        all_frames_X_homog[visible, person_idx, keypoint_idx] = hip_x[visible] + dx
+        all_frames_Y_homog[visible, person_idx, keypoint_idx] = hip_y[visible] + dy
+        all_frames_scores_homog[visible, person_idx, keypoint_idx] = score
+
+
+def test_resolve_personIDs_for_motion_specific_applies_presence_confidence_size_gates():
+    """
+    Verify tiny background people are removed before broad-jump motion scoring.
+    """
+
+    from Sports2D.process import resolve_personIDs_for_motion_specific
+
+    frame_count = 10
+    keypoint_names = ["Hip", "Neck", "LBigToe", "RBigToe", "LHeel", "RHeel"]
+    all_frames_X_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+
+    hip_x = np.linspace(40.0, 180.0, frame_count)
+    hip_y = 100.0 - 18.0 * np.sin(np.linspace(0.0, np.pi, frame_count))
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        hip_x,
+        hip_y,
+        left_foot_offset=(-12.0, 55.0),
+        right_foot_offset=(12.0, 55.0),
+        score=0.9,
+    )
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.linspace(250.0, 360.0, frame_count),
+        np.full((frame_count,), 100.0),
+        neck_offset=(0.0, -12.0),
+        left_foot_offset=(-4.0, 12.0),
+        right_foot_offset=(4.0, 12.0),
+        score=0.99,
+    )
+
+    selected_persons, diagnostics = resolve_personIDs_for_motion_specific(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        keypoint_names,
+        nb_persons_to_detect=1,
+        target="auto",
+        presence_threshold=0.8,
+        confidence_threshold=0.3,
+        size_min_ratio=0.35,
+        motion_score_threshold=0.35,
+    )
+
+    assert selected_persons == [0]
+    assert diagnostics["eligible_person_ids"] == [0]
+    assert diagnostics["features_by_person"][0]["label"] == "broad_jump"
+    assert diagnostics["features_by_person"][1]["size_ratio"] < 0.35
+
+
+def test_resolve_personIDs_for_motion_specific_presence_is_gate_not_boost():
+    """
+    Verify higher presence does not outrank a stronger motion-specific candidate.
+    """
+
+    from Sports2D.process import resolve_personIDs_for_motion_specific
+
+    frame_count = 10
+    keypoint_names = ["Hip", "Neck", "LBigToe", "RBigToe", "LHeel", "RHeel"]
+    all_frames_X_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+
+    visible_first_eight = slice(0, 8)
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        np.linspace(30.0, 170.0, frame_count),
+        100.0 - 16.0 * np.sin(np.linspace(0.0, np.pi, frame_count)),
+        score=0.85,
+        visible_slice=visible_first_eight,
+    )
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.full((frame_count,), 260.0),
+        np.full((frame_count,), 100.0),
+        score=0.99,
+    )
+
+    selected_persons, diagnostics = resolve_personIDs_for_motion_specific(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        keypoint_names,
+        nb_persons_to_detect=1,
+        target="auto",
+        presence_threshold=0.8,
+        confidence_threshold=0.3,
+        size_min_ratio=0.35,
+        motion_score_threshold=0.35,
+    )
+
+    assert selected_persons == [0]
+    assert diagnostics["features_by_person"][0]["presence_ratio"] == pytest.approx(
+        0.8
+    )
+    assert diagnostics["features_by_person"][1]["presence_ratio"] == pytest.approx(
+        1.0
+    )
+
+
+def test_resolve_personIDs_for_motion_specific_broad_jump_requires_flight_motion():
+    """
+    Verify broad-jump selection needs airborne frames with simultaneous x motion.
+    """
+
+    from Sports2D.process import resolve_personIDs_for_motion_specific
+
+    frame_count = 10
+    keypoint_names = ["Hip", "Neck", "LBigToe", "RBigToe", "LHeel", "RHeel"]
+    all_frames_X_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        np.linspace(30.0, 190.0, frame_count),
+        np.full((frame_count,), 100.0),
+        score=0.95,
+    )
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.full((frame_count,), 260.0),
+        np.full((frame_count,), 100.0),
+        score=0.7,
+    )
+
+    selected_persons, diagnostics = resolve_personIDs_for_motion_specific(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        keypoint_names,
+        nb_persons_to_detect=1,
+        target="broad_jump",
+        presence_threshold=0.8,
+        confidence_threshold=0.3,
+        size_min_ratio=0.35,
+        motion_score_threshold=0.35,
+    )
+
+    assert selected_persons == [0]
+    assert diagnostics["used_fallback"] is True
+    assert diagnostics["fallback_reason"] == "no_motion_specific_candidate"
+    assert (
+        diagnostics["features_by_person"][0]["broad_jump_has_airborne_interval"]
+        is False
+    )
+    assert diagnostics["features_by_person"][0]["broad_jump_condition_met"] is False
+    assert diagnostics["features_by_person"][0]["broad_jump_score"] == 0.0
+
+
+def test_resolve_personIDs_for_motion_specific_broad_jump_tie_prefers_largest_bbox():
+    """
+    Verify multiple broad-jump matches are resolved by largest pose-bbox size.
+    """
+
+    from Sports2D.process import resolve_personIDs_for_motion_specific
+
+    frame_count = 12
+    keypoint_names = ["Hip", "Neck", "LBigToe", "RBigToe", "LHeel", "RHeel"]
+    all_frames_X_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+
+    flight_y = np.sin(np.linspace(0.0, np.pi, frame_count))
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        np.linspace(30.0, 210.0, frame_count),
+        100.0 - 16.0 * flight_y,
+        neck_offset=(0.0, -50.0),
+        left_foot_offset=(-20.0, 70.0),
+        right_foot_offset=(20.0, 70.0),
+        score=0.99,
+    )
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.linspace(260.0, 380.0, frame_count),
+        100.0 - 18.0 * flight_y,
+        neck_offset=(0.0, -70.0),
+        left_foot_offset=(-25.0, 90.0),
+        right_foot_offset=(25.0, 90.0),
+        score=0.75,
+    )
+
+    selected_persons, diagnostics = resolve_personIDs_for_motion_specific(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        keypoint_names,
+        nb_persons_to_detect=1,
+        target="broad_jump",
+        presence_threshold=0.8,
+        confidence_threshold=0.3,
+        size_min_ratio=0.35,
+        motion_score_threshold=0.35,
+    )
+
+    assert selected_persons == [1]
+    assert diagnostics["used_fallback"] is False
+    assert diagnostics["features_by_person"][0]["broad_jump_condition_met"] is True
+    assert diagnostics["features_by_person"][1]["broad_jump_condition_met"] is True
+    assert (
+        diagnostics["features_by_person"][1]["median_area"]
+        > diagnostics["features_by_person"][0]["median_area"]
+    )
+    assert (
+        diagnostics["features_by_person"][0]["mean_confidence"]
+        > diagnostics["features_by_person"][1]["mean_confidence"]
+    )
+
+
+def test_resolve_personIDs_for_motion_specific_detects_sprint_start():
+    """
+    Verify sprint-start scoring selects fast x motion with alternating heel y.
+    """
+
+    from Sports2D.process import resolve_personIDs_for_motion_specific
+
+    frame_count = 12
+    keypoint_names = ["Hip", "Neck", "LBigToe", "RBigToe", "LHeel", "RHeel"]
+    all_frames_X_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+
+    hip_x = np.array([20, 30, 42, 58, 78, 102, 130, 162, 198, 238, 282, 330], dtype=float)
+    heel_phase = np.sin(np.linspace(0.0, 2.0 * np.pi, frame_count))
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        hip_x,
+        np.full((frame_count,), 100.0),
+        neck_offset=(0.0, -45.0),
+        left_foot_offset=(-14.0, 55.0),
+        right_foot_offset=(14.0, 55.0),
+        score=0.9,
+    )
+    all_frames_Y_homog[:, 0, keypoint_names.index("LHeel")] = 155.0 + 14.0 * heel_phase
+    all_frames_Y_homog[:, 0, keypoint_names.index("RHeel")] = 155.0 - 14.0 * heel_phase
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.full((frame_count,), 260.0),
+        np.full((frame_count,), 100.0),
+        score=0.95,
+    )
+
+    selected_persons, diagnostics = resolve_personIDs_for_motion_specific(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        keypoint_names,
+        nb_persons_to_detect=1,
+        target="auto",
+        presence_threshold=0.8,
+        confidence_threshold=0.3,
+        size_min_ratio=0.35,
+        motion_score_threshold=0.35,
+    )
+
+    assert selected_persons == [0]
+    assert diagnostics["features_by_person"][0]["label"] == "sprint_start"
+    assert (
+        diagnostics["features_by_person"][0]["sprint_start_fast_horizontal_motion"]
+        is True
+    )
+    assert (
+        diagnostics["features_by_person"][0]["sprint_start_heel_vertical_oscillation"]
+        is True
+    )
+    assert diagnostics["features_by_person"][0]["sprint_start_heel_alternation"] is True
+    assert diagnostics["features_by_person"][0]["sprint_start_condition_met"] is True
+    assert (
+        diagnostics["features_by_person"][0]["sprint_start_score"]
+        > diagnostics["features_by_person"][0]["broad_jump_score"]
+    )
+
+
+def test_resolve_personIDs_for_motion_specific_sprint_start_uses_local_window_not_global_presence():
+    """
+    Verify sprint-start selection can pick a short-lived runner tracklet.
+    """
+
+    from Sports2D.process import resolve_personIDs_for_motion_specific
+
+    frame_count = 60
+    keypoint_names = ["Hip", "Neck", "LBigToe", "RBigToe", "LHeel", "RHeel"]
+    all_frames_X_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+
+    runner_slice = slice(36, 46)
+    hip_x = np.full((frame_count,), 100.0)
+    hip_x[runner_slice] = np.linspace(80.0, 440.0, runner_slice.stop - runner_slice.start)
+    heel_phase = np.sin(np.linspace(0.0, 2.0 * np.pi, runner_slice.stop - runner_slice.start))
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        hip_x,
+        np.full((frame_count,), 100.0),
+        score=0.9,
+        visible_slice=runner_slice,
+    )
+    all_frames_Y_homog[
+        runner_slice, 0, keypoint_names.index("LHeel")
+    ] = 155.0 + 14.0 * heel_phase
+    all_frames_Y_homog[
+        runner_slice, 0, keypoint_names.index("RHeel")
+    ] = 155.0 - 14.0 * heel_phase
+
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.full((frame_count,), 260.0),
+        np.full((frame_count,), 100.0),
+        score=0.99,
+    )
+
+    selected_persons, diagnostics = resolve_personIDs_for_motion_specific(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        keypoint_names,
+        nb_persons_to_detect=1,
+        target="sprint_start",
+        presence_threshold=0.8,
+        confidence_threshold=0.3,
+        size_min_ratio=0.35,
+        motion_score_threshold=0.35,
+        fps=30.0,
+    )
+
+    runner_features = diagnostics["features_by_person"][0]
+    assert selected_persons == [0]
+    assert diagnostics["used_fallback"] is False
+    assert runner_features["presence_ratio"] < 0.8
+    assert runner_features["sprint_start_window_valid_frame_count"] >= 3
+    assert runner_features["sprint_start_condition_met"] is True
+    assert diagnostics["features_by_person"][1]["sprint_start_condition_met"] is False
+
+
+def test_resolve_personIDs_for_motion_specific_sprint_start_rejects_static_heels():
+    """
+    Verify fast horizontal motion alone is not enough for sprint-start selection.
+    """
+
+    from Sports2D.process import resolve_personIDs_for_motion_specific
+
+    frame_count = 12
+    keypoint_names = ["Hip", "Neck", "LBigToe", "RBigToe", "LHeel", "RHeel"]
+    all_frames_X_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        np.array([20, 30, 42, 58, 78, 102, 130, 162, 198, 238, 282, 330], dtype=float),
+        np.full((frame_count,), 100.0),
+        score=0.95,
+    )
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.full((frame_count,), 260.0),
+        np.full((frame_count,), 100.0),
+        score=0.7,
+    )
+
+    selected_persons, diagnostics = resolve_personIDs_for_motion_specific(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        keypoint_names,
+        nb_persons_to_detect=1,
+        target="sprint_start",
+        presence_threshold=0.8,
+        confidence_threshold=0.3,
+        size_min_ratio=0.35,
+        motion_score_threshold=0.35,
+    )
+
+    assert selected_persons == [0]
+    assert diagnostics["used_fallback"] is True
+    assert diagnostics["fallback_reason"] == "no_motion_specific_candidate"
+    assert (
+        diagnostics["features_by_person"][0]["sprint_start_fast_horizontal_motion"]
+        is True
+    )
+    assert (
+        diagnostics["features_by_person"][0]["sprint_start_heel_vertical_oscillation"]
+        is False
+    )
+    assert diagnostics["features_by_person"][0]["sprint_start_condition_met"] is False
+
+
+def test_resolve_personIDs_for_motion_specific_sprint_start_rejects_in_phase_heels():
+    """
+    Verify heel y oscillation must alternate left/right for sprint-start selection.
+    """
+
+    from Sports2D.process import resolve_personIDs_for_motion_specific
+
+    frame_count = 12
+    keypoint_names = ["Hip", "Neck", "LBigToe", "RBigToe", "LHeel", "RHeel"]
+    all_frames_X_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+
+    hip_x = np.array([20, 30, 42, 58, 78, 102, 130, 162, 198, 238, 282, 330], dtype=float)
+    heel_phase = np.sin(np.linspace(0.0, 2.0 * np.pi, frame_count))
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        hip_x,
+        np.full((frame_count,), 100.0),
+        score=0.95,
+    )
+    all_frames_Y_homog[:, 0, keypoint_names.index("LHeel")] = 155.0 + 14.0 * heel_phase
+    all_frames_Y_homog[:, 0, keypoint_names.index("RHeel")] = 155.0 + 14.0 * heel_phase
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.full((frame_count,), 260.0),
+        np.full((frame_count,), 100.0),
+        score=0.7,
+    )
+
+    selected_persons, diagnostics = resolve_personIDs_for_motion_specific(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        keypoint_names,
+        nb_persons_to_detect=1,
+        target="sprint_start",
+        presence_threshold=0.8,
+        confidence_threshold=0.3,
+        size_min_ratio=0.35,
+        motion_score_threshold=0.35,
+    )
+
+    assert selected_persons == [0]
+    assert diagnostics["used_fallback"] is True
+    assert diagnostics["fallback_reason"] == "no_motion_specific_candidate"
+    assert (
+        diagnostics["features_by_person"][0]["sprint_start_heel_vertical_oscillation"]
+        is True
+    )
+    assert diagnostics["features_by_person"][0]["sprint_start_heel_alternation"] is False
+    assert diagnostics["features_by_person"][0]["sprint_start_condition_met"] is False
+
+
+def test_resolve_personIDs_for_motion_specific_falls_back_when_gates_remove_all_candidates():
+    """
+    Verify gate-filter failure falls back to the existing highest-likelihood selector.
+    """
+
+    from Sports2D.process import resolve_personIDs_for_motion_specific
+
+    frame_count = 10
+    keypoint_names = ["Hip", "Neck", "LBigToe", "RBigToe", "LHeel", "RHeel"]
+    all_frames_X_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, len(keypoint_names)), np.nan)
+
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        np.linspace(0.0, 120.0, frame_count),
+        np.full((frame_count,), 100.0),
+        score=0.2,
+    )
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.linspace(200.0, 320.0, frame_count),
+        np.full((frame_count,), 100.0),
+        score=0.9,
+        visible_slice=slice(0, 5),
+    )
+
+    selected_persons, diagnostics = resolve_personIDs_for_motion_specific(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        keypoint_names,
+        nb_persons_to_detect=1,
+        target="auto",
+        presence_threshold=0.8,
+        confidence_threshold=0.3,
+        size_min_ratio=0.35,
+        motion_score_threshold=0.35,
+    )
+
+    assert selected_persons == [1]
+    assert diagnostics["used_fallback"] is True
+    assert diagnostics["fallback_reason"] == "gate_filters_removed_all_candidates"
+
+
 def test_sam3_mask_available_handles_bool_flag_and_mask_list():
     """
     Verify SAM3 mask availability accepts the lightweight bool flag and explicit masks.
@@ -3499,13 +4078,17 @@ def test_default_config_exposes_ball_ordering_method():
 
 def test_config_help_mentions_medicine_ball_person_ordering():
     """
-    Verify the public person-ordering help text exposes the medicine-ball mode.
+    Verify the public person-ordering help text exposes domain-specific modes.
     """
 
     from Sports2D.Sports2D import DEFAULT_CONFIG, CONFIG_HELP
 
     assert DEFAULT_CONFIG["base"]["person_ordering_method"] == "on_click"
     assert "medicine_ball" in CONFIG_HELP["person_ordering_method"][1]
+    assert "motion_specific" in CONFIG_HELP["person_ordering_method"][1]
+    assert DEFAULT_CONFIG["motion"]["person_selection_target"] == "auto"
+    assert DEFAULT_CONFIG["motion"]["person_selection_presence_threshold"] == 0.8
+    assert "Gate filter" in CONFIG_HELP["person_selection_presence_threshold"][1]
 
 
 def test_config_help_mentions_ball_pose_exports():

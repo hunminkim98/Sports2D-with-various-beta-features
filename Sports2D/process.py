@@ -1603,6 +1603,22 @@ def _parse_ball_ordering_method(value, default="first_detected"):
     return method
 
 
+def _parse_motion_person_selection_target(value, default="auto"):
+    """
+    Parse the target motion class used by motion-specific person selection.
+    """
+    supported_targets = ["auto", "broad_jump", "sprint_start", "etc"]
+    target = str(default if value is None else value).strip().lower()
+    if target not in supported_targets:
+        logging.warning(
+            "Invalid motion.person_selection_target '%s'. Falling back to '%s'.",
+            value,
+            default,
+        )
+        target = default
+    return target
+
+
 def _parse_ball_detector_backend(value, synthpose_detector=None, default="same"):
     """
     Parse ball detector backend.
@@ -4313,6 +4329,912 @@ def get_personIDs_with_greatest_displacement(
     return selected_persons
 
 
+def _clip01(value):
+    """
+    Clip a scalar to [0, 1], treating missing values as 0.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(value):
+        return 0.0
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def _safe_nanmedian(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    return float(np.median(values))
+
+
+def _keypoint_series(all_frames_X_person, all_frames_Y_person, keypoint_names, names):
+    """
+    Return frame-wise mean XY for the requested keypoint names.
+    """
+    keypoint_names = list(keypoint_names or [])
+    indices = [keypoint_names.index(name) for name in names if name in keypoint_names]
+    if len(indices) == 0:
+        return None
+
+    xs = np.asarray(all_frames_X_person[:, indices], dtype=float)
+    ys = np.asarray(all_frames_Y_person[:, indices], dtype=float)
+    valid_x = np.sum(np.isfinite(xs), axis=1)
+    valid_y = np.sum(np.isfinite(ys), axis=1)
+    mean_x = np.divide(
+        np.nansum(xs, axis=1),
+        valid_x,
+        out=np.full((xs.shape[0],), np.nan, dtype=float),
+        where=valid_x > 0,
+    )
+    mean_y = np.divide(
+        np.nansum(ys, axis=1),
+        valid_y,
+        out=np.full((ys.shape[0],), np.nan, dtype=float),
+        where=valid_y > 0,
+    )
+    return np.column_stack([mean_x, mean_y])
+
+
+def _pose_center_series(all_frames_X_person, all_frames_Y_person):
+    """
+    Return frame-wise mean XY across all finite keypoints.
+    """
+    xs = np.asarray(all_frames_X_person, dtype=float)
+    ys = np.asarray(all_frames_Y_person, dtype=float)
+    valid_x = np.sum(np.isfinite(xs), axis=1)
+    valid_y = np.sum(np.isfinite(ys), axis=1)
+    mean_x = np.divide(
+        np.nansum(xs, axis=1),
+        valid_x,
+        out=np.full((xs.shape[0],), np.nan, dtype=float),
+        where=valid_x > 0,
+    )
+    mean_y = np.divide(
+        np.nansum(ys, axis=1),
+        valid_y,
+        out=np.full((ys.shape[0],), np.nan, dtype=float),
+        where=valid_y > 0,
+    )
+    return np.column_stack([mean_x, mean_y])
+
+
+def _first_last_valid_xy(series):
+    """
+    Return first and last finite XY rows from a frame-wise series.
+    """
+    if series is None:
+        return None, None
+    series = np.asarray(series, dtype=float)
+    if series.ndim != 2 or series.shape[1] < 2:
+        return None, None
+    valid_rows = np.where(np.all(np.isfinite(series[:, :2]), axis=1))[0]
+    if valid_rows.size == 0:
+        return None, None
+    return series[valid_rows[0], :2], series[valid_rows[-1], :2]
+
+
+def _longest_true_run(mask):
+    """
+    Return the inclusive (start, end, length) for the longest True run.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    best_start, best_end, best_len = None, None, 0
+    current_start = None
+    for idx, value in enumerate(mask):
+        if value and current_start is None:
+            current_start = idx
+        if (not value or idx == len(mask) - 1) and current_start is not None:
+            current_end = idx if value and idx == len(mask) - 1 else idx - 1
+            current_len = current_end - current_start + 1
+            if current_len > best_len:
+                best_start, best_end, best_len = (
+                    current_start,
+                    current_end,
+                    current_len,
+                )
+            current_start = None
+    return best_start, best_end, best_len
+
+
+def _broad_jump_airborne_motion_features(
+    hip,
+    left_foot,
+    right_foot,
+    body_height,
+):
+    """
+    Detect broad-jump-specific flight with horizontal motion.
+
+    From 2D pose only, flight is approximated as a contiguous interval where
+    both feet are lifted above the observed foot-ground baseline. During that
+    same interval, the hip center must move horizontally in either direction.
+    """
+    default = {
+        "broad_jump_has_airborne_interval": False,
+        "broad_jump_has_airborne_x_motion": False,
+        "broad_jump_condition_met": False,
+        "broad_jump_airborne_frame_count": 0,
+        "broad_jump_airborne_x_displacement": 0.0,
+        "broad_jump_airborne_x_displacement_norm": 0.0,
+        "broad_jump_foot_clearance": 0.0,
+        "broad_jump_foot_clearance_norm": 0.0,
+        "broad_jump_airborne_start_frame": None,
+        "broad_jump_airborne_end_frame": None,
+    }
+
+    if hip is None or left_foot is None or right_foot is None:
+        return default
+
+    hip = np.asarray(hip, dtype=float)
+    left_foot = np.asarray(left_foot, dtype=float)
+    right_foot = np.asarray(right_foot, dtype=float)
+    if (
+        hip.ndim != 2
+        or left_foot.ndim != 2
+        or right_foot.ndim != 2
+        or hip.shape[0] == 0
+    ):
+        return default
+
+    frame_count = min(hip.shape[0], left_foot.shape[0], right_foot.shape[0])
+    hip = hip[:frame_count, :2]
+    left_foot = left_foot[:frame_count, :2]
+    right_foot = right_foot[:frame_count, :2]
+
+    valid = (
+        np.all(np.isfinite(hip), axis=1)
+        & np.all(np.isfinite(left_foot), axis=1)
+        & np.all(np.isfinite(right_foot), axis=1)
+    )
+    if int(np.sum(valid)) < 3:
+        return default
+
+    # Image y grows downward. The lower foot of the two approximates support;
+    # high percentiles approximate stance/ground frames seen in the sequence.
+    support_y = np.maximum(left_foot[:, 1], right_foot[:, 1])
+    valid_support_y = support_y[valid]
+    if valid_support_y.size < 3:
+        return default
+
+    ground_y = float(np.nanpercentile(valid_support_y, 85))
+    min_clearance_px = max(0.07 * float(body_height), 4.0)
+    clearance = ground_y - support_y
+    airborne_mask = valid & (clearance >= min_clearance_px)
+    start_frame, end_frame, airborne_count = _longest_true_run(airborne_mask)
+    min_airborne_frames = max(2, min(5, int(np.ceil(0.05 * int(np.sum(valid))))))
+    has_airborne_interval = airborne_count >= min_airborne_frames
+
+    x_displacement = 0.0
+    x_displacement_norm = 0.0
+    has_airborne_x_motion = False
+    if has_airborne_interval and start_frame is not None and end_frame is not None:
+        start_hip = hip[start_frame]
+        end_hip = hip[end_frame]
+        if np.all(np.isfinite(start_hip)) and np.all(np.isfinite(end_hip)):
+            x_displacement = float(end_hip[0] - start_hip[0])
+            x_displacement_norm = abs(x_displacement) / max(float(body_height), 1e-6)
+            min_x_motion_px = max(0.20 * float(body_height), 5.0)
+            has_airborne_x_motion = abs(x_displacement) >= min_x_motion_px
+
+    max_clearance = (
+        float(np.nanmax(clearance[airborne_mask])) if np.any(airborne_mask) else 0.0
+    )
+    condition_met = bool(has_airborne_interval and has_airborne_x_motion)
+    return {
+        "broad_jump_has_airborne_interval": bool(has_airborne_interval),
+        "broad_jump_has_airborne_x_motion": bool(has_airborne_x_motion),
+        "broad_jump_condition_met": condition_met,
+        "broad_jump_airborne_frame_count": int(airborne_count),
+        "broad_jump_airborne_x_displacement": float(x_displacement),
+        "broad_jump_airborne_x_displacement_norm": float(x_displacement_norm),
+        "broad_jump_foot_clearance": float(max_clearance),
+        "broad_jump_foot_clearance_norm": float(
+            max_clearance / max(float(body_height), 1e-6)
+        ),
+        "broad_jump_airborne_start_frame": (
+            int(start_frame) if start_frame is not None and has_airborne_interval else None
+        ),
+        "broad_jump_airborne_end_frame": (
+            int(end_frame) if end_frame is not None and has_airborne_interval else None
+        ),
+    }
+
+
+def _sprint_start_motion_features(
+    hip,
+    left_heel,
+    right_heel,
+    body_height,
+    scores=None,
+    fps=30.0,
+):
+    """
+    Detect sprint-start-specific horizontal motion and heel alternation.
+
+    Sprint-start requires all three condition signals:
+    fast horizontal hip/body motion, vertical heel oscillation, and left/right
+    heel alternation. Stance posture features are kept out of this rule.
+    """
+    default = {
+        "sprint_start_fast_horizontal_motion": False,
+        "sprint_start_heel_vertical_oscillation": False,
+        "sprint_start_heel_alternation": False,
+        "sprint_start_condition_met": False,
+        "sprint_start_peak_frame": None,
+        "sprint_start_window_start_frame": None,
+        "sprint_start_window_end_frame": None,
+        "sprint_start_window_valid_frame_count": 0,
+        "sprint_start_window_presence_ratio": 0.0,
+        "sprint_start_window_mean_confidence": 0.0,
+        "sprint_start_peak_speed_norm": 0.0,
+        "sprint_start_horizontal_displacement_norm": 0.0,
+        "sprint_start_horizontal_speed_norm": 0.0,
+        "sprint_start_left_heel_y_range_norm": 0.0,
+        "sprint_start_right_heel_y_range_norm": 0.0,
+        "sprint_start_heel_antiphase_ratio": 0.0,
+        "sprint_start_heel_y_correlation": 0.0,
+    }
+    if hip is None or left_heel is None or right_heel is None:
+        return default
+
+    hip = np.asarray(hip, dtype=float)
+    left_heel = np.asarray(left_heel, dtype=float)
+    right_heel = np.asarray(right_heel, dtype=float)
+    if (
+        hip.ndim != 2
+        or left_heel.ndim != 2
+        or right_heel.ndim != 2
+        or hip.shape[0] == 0
+    ):
+        return default
+
+    frame_count = min(hip.shape[0], left_heel.shape[0], right_heel.shape[0])
+    hip = hip[:frame_count, :2]
+    left_heel = left_heel[:frame_count, :2]
+    right_heel = right_heel[:frame_count, :2]
+    fps = float(fps) if fps is not None else 30.0
+    if not np.isfinite(fps) or fps <= 0:
+        fps = 30.0
+
+    valid = (
+        np.all(np.isfinite(hip), axis=1)
+        & np.all(np.isfinite(left_heel), axis=1)
+        & np.all(np.isfinite(right_heel), axis=1)
+    )
+    if int(np.sum(valid)) < 4:
+        return default
+
+    body_height = max(float(body_height), 1e-6)
+
+    # Sprint starts are short, fast events. A whole-video median frame-to-frame
+    # speed is dominated by stationary/occluded frames and misses the runner.
+    # Instead, find each track's local peak horizontal hip speed, then evaluate
+    # the 1 second lookback window ending at that peak.
+    lag_frames = max(1, int(round(0.10 * fps)))
+    speeds = np.full((frame_count,), np.nan, dtype=float)
+    for frame_idx in range(lag_frames, frame_count):
+        start_idx = frame_idx - lag_frames
+        if not (valid[start_idx] and valid[frame_idx]):
+            continue
+        interval_valid = valid[start_idx : frame_idx + 1]
+        if float(np.mean(interval_valid)) < 0.5:
+            continue
+        dx = abs(float(hip[frame_idx, 0] - hip[start_idx, 0]))
+        elapsed_seconds = lag_frames / fps
+        speeds[frame_idx] = dx / max(elapsed_seconds, 1e-6) / body_height
+
+    if not np.any(np.isfinite(speeds)):
+        return default
+
+    peak_frame = int(np.nanargmax(speeds))
+    peak_speed_norm = float(speeds[peak_frame])
+    window_frames = max(3, int(round(1.0 * fps)))
+    window_start = max(0, peak_frame - window_frames + 1)
+    window_end = peak_frame
+    window_slice = slice(window_start, window_end + 1)
+    window_valid = valid[window_slice]
+    window_length = max(1, int(window_end - window_start + 1))
+    window_valid_count = int(np.sum(window_valid))
+    window_presence_ratio = float(window_valid_count / window_length)
+    if window_valid_count < 3:
+        return {
+            **default,
+            "sprint_start_peak_frame": int(peak_frame),
+            "sprint_start_window_start_frame": int(window_start),
+            "sprint_start_window_end_frame": int(window_end),
+            "sprint_start_window_valid_frame_count": int(window_valid_count),
+            "sprint_start_window_presence_ratio": float(window_presence_ratio),
+            "sprint_start_peak_speed_norm": float(peak_speed_norm),
+            "sprint_start_horizontal_speed_norm": float(peak_speed_norm),
+        }
+
+    window_indices = np.arange(window_start, window_end + 1)[window_valid]
+    hip_x = hip[window_indices, 0]
+    left_y = left_heel[window_indices, 1]
+    right_y = right_heel[window_indices, 1]
+
+    if scores is not None:
+        score_arr = np.asarray(scores, dtype=float)
+        if score_arr.ndim == 2 and score_arr.shape[0] >= frame_count:
+            window_scores = score_arr[window_slice]
+            finite_scores = window_scores[np.isfinite(window_scores)]
+            window_mean_confidence = (
+                float(np.mean(finite_scores)) if finite_scores.size > 0 else 0.0
+            )
+        else:
+            window_mean_confidence = 0.0
+    else:
+        window_mean_confidence = 0.0
+
+    first_hip_x = float(hip_x[0])
+    last_hip_x = float(hip_x[-1])
+    horizontal_displacement_norm = abs(last_hip_x - first_hip_x) / body_height
+    hip_dx = np.abs(np.diff(hip_x))
+    horizontal_speed_norm = (
+        float(np.nanmax(hip_dx)) * fps / body_height if hip_dx.size > 0 else 0.0
+    )
+    fast_horizontal_motion = (
+        peak_speed_norm >= 1.20 and horizontal_displacement_norm >= 0.35
+    )
+
+    left_range_norm = (
+        float(np.nanmax(left_y) - np.nanmin(left_y)) / body_height
+        if left_y.size > 0
+        else 0.0
+    )
+    right_range_norm = (
+        float(np.nanmax(right_y) - np.nanmin(right_y)) / body_height
+        if right_y.size > 0
+        else 0.0
+    )
+    heel_vertical_oscillation = left_range_norm >= 0.12 and right_range_norm >= 0.12
+
+    left_dy = np.diff(left_y)
+    right_dy = np.diff(right_y)
+    min_heel_step = max(0.03 * body_height, 2.0)
+    moving = (np.abs(left_dy) >= min_heel_step) & (
+        np.abs(right_dy) >= min_heel_step
+    )
+    if np.any(moving):
+        antiphase_ratio = float(
+            np.mean(np.sign(left_dy[moving]) != np.sign(right_dy[moving]))
+        )
+    else:
+        antiphase_ratio = 0.0
+
+    centered_left_y = left_y - float(np.mean(left_y))
+    centered_right_y = right_y - float(np.mean(right_y))
+    denom = float(np.linalg.norm(centered_left_y) * np.linalg.norm(centered_right_y))
+    heel_y_correlation = (
+        float(np.dot(centered_left_y, centered_right_y) / denom)
+        if denom > 1e-6
+        else 0.0
+    )
+    heel_alternation = antiphase_ratio >= 0.50 or heel_y_correlation <= -0.35
+    condition_met = bool(
+        fast_horizontal_motion
+        and heel_vertical_oscillation
+        and heel_alternation
+        and window_valid_count >= 3
+    )
+
+    return {
+        "sprint_start_fast_horizontal_motion": bool(fast_horizontal_motion),
+        "sprint_start_heel_vertical_oscillation": bool(heel_vertical_oscillation),
+        "sprint_start_heel_alternation": bool(heel_alternation),
+        "sprint_start_condition_met": condition_met,
+        "sprint_start_peak_frame": int(peak_frame),
+        "sprint_start_window_start_frame": int(window_start),
+        "sprint_start_window_end_frame": int(window_end),
+        "sprint_start_window_valid_frame_count": int(window_valid_count),
+        "sprint_start_window_presence_ratio": float(window_presence_ratio),
+        "sprint_start_window_mean_confidence": float(window_mean_confidence),
+        "sprint_start_peak_speed_norm": float(peak_speed_norm),
+        "sprint_start_horizontal_displacement_norm": float(
+            horizontal_displacement_norm
+        ),
+        "sprint_start_horizontal_speed_norm": float(horizontal_speed_norm),
+        "sprint_start_left_heel_y_range_norm": float(left_range_norm),
+        "sprint_start_right_heel_y_range_norm": float(right_range_norm),
+        "sprint_start_heel_antiphase_ratio": float(antiphase_ratio),
+        "sprint_start_heel_y_correlation": float(heel_y_correlation),
+    }
+
+
+def _motion_track_bbox_metrics(all_frames_X_person, all_frames_Y_person):
+    """
+    Compute median pose-bbox width, height, and area for one person track.
+    """
+    widths, heights, areas = [], [], []
+    for frame_X, frame_Y in zip(all_frames_X_person, all_frames_Y_person):
+        frame_X = np.asarray(frame_X, dtype=float)
+        frame_Y = np.asarray(frame_Y, dtype=float)
+        valid = np.isfinite(frame_X) & np.isfinite(frame_Y)
+        if not np.any(valid):
+            continue
+        width = float(np.nanmax(frame_X[valid]) - np.nanmin(frame_X[valid]))
+        height = float(np.nanmax(frame_Y[valid]) - np.nanmin(frame_Y[valid]))
+        if width <= 0 and height <= 0:
+            continue
+        widths.append(max(width, 0.0))
+        heights.append(max(height, 0.0))
+        areas.append(max(width, 0.0) * max(height, 0.0))
+    return {
+        "median_width": _safe_nanmedian(widths),
+        "median_height": _safe_nanmedian(heights),
+        "median_area": _safe_nanmedian(areas),
+    }
+
+
+def _motion_track_features(
+    all_frames_X_person,
+    all_frames_Y_person,
+    all_frames_scores_person,
+    keypoint_names,
+    fps=30.0,
+):
+    """
+    Compute rule-based motion-selection features for one tracked person slot.
+
+    The first-stage quality gates use presence, confidence, and pose-bbox size.
+    Motion scores are only used after those gates pass.
+    """
+    all_frames_X_person = np.asarray(all_frames_X_person, dtype=float)
+    all_frames_Y_person = np.asarray(all_frames_Y_person, dtype=float)
+    scores = np.asarray(all_frames_scores_person, dtype=float)
+    if all_frames_X_person.ndim != 2 or all_frames_Y_person.ndim != 2:
+        return {
+            "presence_ratio": 0.0,
+            "mean_confidence": float("nan"),
+            "median_area": float("nan"),
+            "median_height": float("nan"),
+            "broad_jump_score": 0.0,
+            "sprint_start_score": 0.0,
+            "label": "etc",
+        }
+
+    coord_presence = np.any(
+        np.isfinite(all_frames_X_person) & np.isfinite(all_frames_Y_person),
+        axis=1,
+    )
+    score_presence = (
+        np.any(np.isfinite(scores), axis=1)
+        if scores.ndim == 2 and scores.shape[0] == all_frames_X_person.shape[0]
+        else coord_presence
+    )
+    presence_ratio = (
+        float(np.mean(coord_presence & score_presence))
+        if all_frames_X_person.shape[0] > 0
+        else 0.0
+    )
+    finite_scores = scores[np.isfinite(scores)]
+    mean_confidence = (
+        float(np.mean(finite_scores)) if finite_scores.size > 0 else float("nan")
+    )
+
+    bbox_metrics = _motion_track_bbox_metrics(
+        all_frames_X_person, all_frames_Y_person
+    )
+    body_height = bbox_metrics["median_height"]
+    if not np.isfinite(body_height) or body_height <= 1e-6:
+        body_height = max(bbox_metrics.get("median_width", float("nan")), 1.0)
+    if not np.isfinite(body_height) or body_height <= 1e-6:
+        body_height = 1.0
+
+    hip = _keypoint_series(
+        all_frames_X_person,
+        all_frames_Y_person,
+        keypoint_names,
+        ["Hip", "MidHip", "CHip", "RHip", "LHip"],
+    )
+    if hip is None:
+        hip = _pose_center_series(all_frames_X_person, all_frames_Y_person)
+
+    trunk_top = _keypoint_series(
+        all_frames_X_person,
+        all_frames_Y_person,
+        keypoint_names,
+        ["Neck", "Head", "Nose", "RShoulder", "LShoulder"],
+    )
+    left_foot = _keypoint_series(
+        all_frames_X_person,
+        all_frames_Y_person,
+        keypoint_names,
+        ["LBigToe", "LHeel", "LAnkle", "LFoot"],
+    )
+    right_foot = _keypoint_series(
+        all_frames_X_person,
+        all_frames_Y_person,
+        keypoint_names,
+        ["RBigToe", "RHeel", "RAnkle", "RFoot"],
+    )
+    left_heel = _keypoint_series(
+        all_frames_X_person,
+        all_frames_Y_person,
+        keypoint_names,
+        ["LHeel"],
+    )
+    right_heel = _keypoint_series(
+        all_frames_X_person,
+        all_frames_Y_person,
+        keypoint_names,
+        ["RHeel"],
+    )
+
+    first_hip, last_hip = _first_last_valid_xy(hip)
+    valid_hip = hip[np.all(np.isfinite(hip[:, :2]), axis=1)]
+    if first_hip is None or last_hip is None or valid_hip.size == 0:
+        hip_net_horizontal = 0.0
+        hip_vertical_arc = 0.0
+        hip_speed_ratio = 0.0
+    else:
+        hip_net_horizontal = abs(float(last_hip[0] - first_hip[0])) / body_height
+        hip_vertical_arc = (
+            float(np.nanmax(valid_hip[:, 1]) - np.nanmin(valid_hip[:, 1]))
+            / body_height
+        )
+        hip_dx = np.abs(np.diff(valid_hip[:, 0]))
+        if hip_dx.size >= 4:
+            split = max(1, hip_dx.size // 3)
+            early_speed = float(np.median(hip_dx[:split]))
+            late_speed = float(np.median(hip_dx[-split:]))
+            hip_speed_ratio = late_speed / (early_speed + 1e-6)
+        else:
+            hip_speed_ratio = 0.0
+
+    first_left_foot, last_left_foot = _first_last_valid_xy(left_foot)
+    first_right_foot, last_right_foot = _first_last_valid_xy(right_foot)
+    if first_left_foot is not None and first_right_foot is not None:
+        initial_foot_sep = abs(float(first_left_foot[0] - first_right_foot[0]))
+        initial_foot_sep_norm = initial_foot_sep / body_height
+        initial_foot_y = float(np.nanmean([first_left_foot[1], first_right_foot[1]]))
+    else:
+        initial_foot_sep_norm = float("nan")
+        initial_foot_y = float("nan")
+
+    if (
+        first_left_foot is not None
+        and last_left_foot is not None
+        and first_right_foot is not None
+        and last_right_foot is not None
+    ):
+        left_dx = float(last_left_foot[0] - first_left_foot[0])
+        right_dx = float(last_right_foot[0] - first_right_foot[0])
+        same_direction = np.sign(left_dx) == np.sign(right_dx)
+        max_dx = max(abs(left_dx), abs(right_dx), 1e-6)
+        foot_sync = (min(abs(left_dx), abs(right_dx)) / max_dx) if same_direction else 0.0
+    else:
+        foot_sync = 0.0
+
+    first_trunk, _ = _first_last_valid_xy(trunk_top)
+    if first_hip is not None and first_trunk is not None:
+        trunk_lean = abs(float(first_trunk[0] - first_hip[0])) / (
+            abs(float(first_trunk[1] - first_hip[1])) + 1e-6
+        )
+    else:
+        trunk_lean = 0.0
+
+    if first_hip is not None and np.isfinite(initial_foot_y):
+        hip_to_feet_ratio = abs(float(initial_foot_y - first_hip[1])) / body_height
+    else:
+        hip_to_feet_ratio = float("nan")
+
+    broad_jump_flight = _broad_jump_airborne_motion_features(
+        hip, left_foot, right_foot, body_height
+    )
+    broad_jump_score = 1.0 if broad_jump_flight["broad_jump_condition_met"] else 0.0
+
+    sprint_start_motion = _sprint_start_motion_features(
+        hip,
+        left_heel,
+        right_heel,
+        body_height,
+        scores=scores,
+        fps=fps,
+    )
+    sprint_start_score = (
+        1.0 if sprint_start_motion["sprint_start_condition_met"] else 0.0
+    )
+
+    if broad_jump_score > 0.0:
+        label = "broad_jump"
+    elif sprint_start_score > 0.0:
+        label = "sprint_start"
+    else:
+        label = "etc"
+    return {
+        "presence_ratio": presence_ratio,
+        "mean_confidence": mean_confidence,
+        "median_area": bbox_metrics["median_area"],
+        "median_height": bbox_metrics["median_height"],
+        "hip_net_horizontal": hip_net_horizontal,
+        "hip_vertical_arc": hip_vertical_arc,
+        "initial_foot_sep": initial_foot_sep_norm,
+        "foot_sync": _clip01(foot_sync),
+        "trunk_lean": trunk_lean,
+        "hip_to_feet_ratio": hip_to_feet_ratio,
+        "hip_speed_ratio": hip_speed_ratio,
+        **broad_jump_flight,
+        **sprint_start_motion,
+        "broad_jump_score": float(broad_jump_score),
+        "sprint_start_score": float(sprint_start_score),
+        "label": label,
+    }
+
+
+def _motion_specific_target_score(features, target):
+    target = _parse_motion_person_selection_target(target)
+    broad_score = float(features.get("broad_jump_score", 0.0))
+    sprint_score = float(features.get("sprint_start_score", 0.0))
+    if target == "broad_jump":
+        return broad_score
+    if target == "sprint_start":
+        return sprint_score
+    if target == "etc":
+        return 1.0 - max(broad_score, sprint_score)
+    return max(broad_score, sprint_score)
+
+
+def resolve_personIDs_for_motion_specific(
+    all_frames_X_homog,
+    all_frames_Y_homog,
+    all_frames_scores_homog,
+    keypoint_names,
+    nb_persons_to_detect,
+    target="auto",
+    presence_threshold=0.8,
+    confidence_threshold=0.3,
+    size_min_ratio=0.35,
+    motion_score_threshold=0.35,
+    fps=30.0,
+):
+    """
+    Resolve motion-specific person ordering with first-stage gate filters.
+
+    Presence ratio, mean confidence, and pose-bbox size ratio are binary gates:
+    above-threshold tracks become candidates, but higher gate values do not
+    dominate the motion-specific ranking except as tie-breakers.
+    """
+    diagnostics = {
+        "used_fallback": False,
+        "fallback_reason": None,
+        "target": _parse_motion_person_selection_target(target),
+        "eligible_person_ids": [],
+        "ranked_person_ids": [],
+        "features_by_person": {},
+    }
+
+    all_frames_X_homog = np.asarray(all_frames_X_homog, dtype=float)
+    all_frames_Y_homog = np.asarray(all_frames_Y_homog, dtype=float)
+    all_frames_scores_homog = np.asarray(all_frames_scores_homog, dtype=float)
+    if (
+        all_frames_X_homog.ndim != 3
+        or all_frames_Y_homog.ndim != 3
+        or all_frames_scores_homog.ndim != 3
+        or all_frames_X_homog.shape[1] == 0
+    ):
+        diagnostics["used_fallback"] = True
+        diagnostics["fallback_reason"] = "no_person_tracks"
+        diagnostics["selected_persons"] = []
+        return [], diagnostics
+
+    person_count = all_frames_X_homog.shape[1]
+    features_by_person = {}
+    median_areas = []
+    for person_idx in range(person_count):
+        features = _motion_track_features(
+            all_frames_X_homog[:, person_idx, :],
+            all_frames_Y_homog[:, person_idx, :],
+            all_frames_scores_homog[:, person_idx, :],
+            keypoint_names,
+            fps=fps,
+        )
+        features_by_person[int(person_idx)] = features
+        area = float(features.get("median_area", float("nan")))
+        median_areas.append(area if np.isfinite(area) and area > 0 else 0.0)
+
+    max_median_area = max(median_areas) if len(median_areas) > 0 else 0.0
+    eligible_person_ids = []
+    for person_idx, features in features_by_person.items():
+        area = float(features.get("median_area", 0.0))
+        size_ratio = area / max_median_area if max_median_area > 0 else 0.0
+        features["size_ratio"] = float(size_ratio)
+        target_for_gate = diagnostics["target"]
+        sprint_gate = (
+            target_for_gate in {"sprint_start", "auto"}
+            and bool(features.get("sprint_start_condition_met", False))
+        )
+        if sprint_gate:
+            # Sprint-start runners are short-lived and often split into several
+            # tracker IDs. Do not require whole-video presence or whole-video
+            # bbox-size gates here; gate only the local peak-speed window.
+            window_confidence = float(
+                features.get("sprint_start_window_mean_confidence", 0.0)
+            )
+            if (
+                window_confidence >= float(confidence_threshold)
+                and int(features.get("sprint_start_window_valid_frame_count", 0)) >= 3
+            ):
+                eligible_person_ids.append(int(person_idx))
+            continue
+
+        if target_for_gate == "sprint_start":
+            continue
+
+        if (
+            float(features.get("presence_ratio", 0.0)) >= float(presence_threshold)
+            and float(features.get("mean_confidence", 0.0))
+            >= float(confidence_threshold)
+            and size_ratio >= float(size_min_ratio)
+        ):
+            eligible_person_ids.append(int(person_idx))
+
+    target = diagnostics["target"]
+    motion_margin = 0.05
+    ranked_person_ids = []
+    for person_idx in eligible_person_ids:
+        features = features_by_person[person_idx]
+        broad_score = float(features.get("broad_jump_score", 0.0))
+        sprint_score = float(features.get("sprint_start_score", 0.0))
+        if target == "auto":
+            if features.get("broad_jump_condition_met", False):
+                target_score = broad_score
+                features["label"] = "broad_jump"
+            else:
+                target_score = max(broad_score, sprint_score)
+            if (
+                target_score < float(motion_score_threshold)
+                or (
+                    not features.get("broad_jump_condition_met", False)
+                    and abs(broad_score - sprint_score) < motion_margin
+                )
+            ):
+                features["label"] = "etc"
+                continue
+        else:
+            target_score = _motion_specific_target_score(features, target)
+            if target != "etc" and target_score < float(motion_score_threshold):
+                continue
+            if target == "etc" and target_score < float(motion_score_threshold):
+                continue
+        features["target_score"] = float(target_score)
+        ranked_person_ids.append(int(person_idx))
+
+    def _motion_specific_rank_key(person_idx):
+        features = features_by_person[person_idx]
+        sprint_start_tiebreak = target == "sprint_start" or (
+            target == "auto" and features.get("label") == "sprint_start"
+        )
+        if sprint_start_tiebreak:
+            return (
+                -float(features.get("target_score", 0.0)),
+                -float(features.get("sprint_start_peak_speed_norm", 0.0)),
+                -float(
+                    features.get("sprint_start_horizontal_displacement_norm", 0.0)
+                ),
+                -float(features.get("sprint_start_window_mean_confidence", 0.0)),
+                -float(features.get("sprint_start_window_presence_ratio", 0.0)),
+                -float(features.get("size_ratio", 0.0)),
+                int(person_idx),
+            )
+        broad_jump_tiebreak = (
+            target == "broad_jump"
+            or (
+                target == "auto"
+                and features.get("label") == "broad_jump"
+                and features.get("broad_jump_condition_met", False)
+            )
+        )
+        if broad_jump_tiebreak:
+            return (
+                -float(features.get("target_score", 0.0)),
+                -float(features.get("size_ratio", 0.0)),
+                -float(features.get("median_area", 0.0)),
+                -float(features.get("mean_confidence", 0.0)),
+                -float(features.get("presence_ratio", 0.0)),
+                int(person_idx),
+            )
+        return (
+            -float(features.get("target_score", 0.0)),
+            -float(features.get("mean_confidence", 0.0)),
+            -float(features.get("size_ratio", 0.0)),
+            -float(features.get("presence_ratio", 0.0)),
+            int(person_idx),
+        )
+
+    ranked_person_ids = sorted(ranked_person_ids, key=_motion_specific_rank_key)
+
+    def _sprint_start_near_miss_rank_key(person_idx):
+        features = features_by_person[person_idx]
+        return (
+            -float(features.get("sprint_start_peak_speed_norm", 0.0)),
+            -float(features.get("sprint_start_horizontal_displacement_norm", 0.0)),
+            -float(features.get("sprint_start_window_mean_confidence", 0.0)),
+            -float(features.get("mean_confidence", 0.0)),
+            -float(features.get("size_ratio", 0.0)),
+            int(person_idx),
+        )
+
+    sprint_start_near_miss_ids = []
+    if target == "sprint_start":
+        for person_idx, features in features_by_person.items():
+            window_confidence = float(
+                features.get("sprint_start_window_mean_confidence", 0.0)
+            )
+            peak_speed = float(features.get("sprint_start_peak_speed_norm", 0.0))
+            displacement = float(
+                features.get("sprint_start_horizontal_displacement_norm", 0.0)
+            )
+            if (
+                window_confidence >= float(confidence_threshold)
+                and int(features.get("sprint_start_window_valid_frame_count", 0)) >= 3
+                and bool(
+                    features.get("sprint_start_heel_vertical_oscillation", False)
+                )
+                and bool(features.get("sprint_start_heel_alternation", False))
+                and (peak_speed >= 1.20 or displacement >= 0.35)
+            ):
+                sprint_start_near_miss_ids.append(int(person_idx))
+        sprint_start_near_miss_ids = sorted(
+            sprint_start_near_miss_ids, key=_sprint_start_near_miss_rank_key
+        )
+
+    diagnostics["eligible_person_ids"] = eligible_person_ids
+    diagnostics["ranked_person_ids"] = ranked_person_ids
+    diagnostics["sprint_start_near_miss_ids"] = sprint_start_near_miss_ids
+    diagnostics["features_by_person"] = features_by_person
+    if len(eligible_person_ids) == 0:
+        diagnostics["used_fallback"] = True
+        diagnostics["fallback_reason"] = (
+            "no_motion_specific_candidate"
+            if target == "sprint_start"
+            else "gate_filters_removed_all_candidates"
+        )
+        if target == "sprint_start" and len(sprint_start_near_miss_ids) > 0:
+            diagnostics["fallback_reason"] = "sprint_start_local_window_near_miss"
+            diagnostics["selected_persons"] = sprint_start_near_miss_ids[
+                : int(nb_persons_to_detect)
+            ]
+        else:
+            diagnostics["selected_persons"] = list(
+                map(
+                    int,
+                    get_personIDs_with_highest_scores(
+                        all_frames_scores_homog,
+                        nb_persons_to_detect,
+                    ),
+                )
+            )
+        return diagnostics["selected_persons"], diagnostics
+
+    if len(ranked_person_ids) == 0:
+        diagnostics["used_fallback"] = True
+        diagnostics["fallback_reason"] = "no_motion_specific_candidate"
+        if target == "sprint_start" and len(sprint_start_near_miss_ids) > 0:
+            diagnostics["fallback_reason"] = "sprint_start_local_window_near_miss"
+            diagnostics["selected_persons"] = sprint_start_near_miss_ids[
+                : int(nb_persons_to_detect)
+            ]
+        else:
+            diagnostics["selected_persons"] = list(
+                map(
+                    int,
+                    get_personIDs_with_highest_scores(
+                        all_frames_scores_homog,
+                        nb_persons_to_detect,
+                    ),
+                )
+            )
+        return diagnostics["selected_persons"], diagnostics
+
+    selected_persons = ranked_person_ids[: int(nb_persons_to_detect)]
+    diagnostics["selected_persons"] = selected_persons
+    return selected_persons, diagnostics
+
+
 def get_personIDs_for_medicine_ball(
     all_frames_X_homog,
     all_frames_Y_homog,
@@ -5584,6 +6506,21 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
     )
     motion_cfg = config_dict.get("motion", {}) or {}
     vertical_jump_requested = bool(motion_cfg.get("vertical_jump", False))
+    motion_person_selection_target = _parse_motion_person_selection_target(
+        motion_cfg.get("person_selection_target", "auto")
+    )
+    motion_person_presence_threshold = float(
+        np.clip(motion_cfg.get("person_selection_presence_threshold", 0.8), 0.0, 1.0)
+    )
+    motion_person_confidence_threshold = float(
+        np.clip(motion_cfg.get("person_selection_confidence_threshold", 0.3), 0.0, 1.0)
+    )
+    motion_person_size_min_ratio = float(
+        np.clip(motion_cfg.get("person_selection_size_min_ratio", 0.35), 0.0, 1.0)
+    )
+    motion_person_score_threshold = float(
+        np.clip(motion_cfg.get("person_selection_motion_score_threshold", 0.35), 0.0, 1.0)
+    )
 
     # Pixel to meters conversion
     to_meters = config_dict.get("px_to_meters_conversion").get("to_meters")
@@ -7032,12 +7969,48 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                         nb_persons_to_detect,
                         eligible_person_ids,
                     )
+        elif person_ordering_method == "motion_specific":
+            selected_persons, motion_person_stats = (
+                resolve_personIDs_for_motion_specific(
+                    all_frames_X_homog,
+                    all_frames_Y_homog,
+                    all_frames_scores_homog,
+                    new_keypoints_names,
+                    nb_persons_to_detect=nb_persons_to_detect,
+                    target=motion_person_selection_target,
+                    presence_threshold=motion_person_presence_threshold,
+                    confidence_threshold=motion_person_confidence_threshold,
+                    size_min_ratio=motion_person_size_min_ratio,
+                    motion_score_threshold=motion_person_score_threshold,
+                    fps=fps,
+                )
+            )
+            if motion_person_stats.get("used_fallback", False):
+                fallback_reason = motion_person_stats.get(
+                    "fallback_reason", "unknown reason"
+                )
+                logging.warning(
+                    "person_ordering_method='motion_specific' could not find "
+                    "a gate-filtered %s candidate. Falling back to "
+                    "'highest_likelihood' because %s.",
+                    motion_person_selection_target,
+                    fallback_reason,
+                )
+            elif len(selected_persons) < nb_persons_to_detect:
+                logging.warning(
+                    "person_ordering_method='motion_specific' kept %s person(s) "
+                    "after gate filters and motion scoring (requested %s). "
+                    "Eligible slots: %s.",
+                    len(selected_persons),
+                    nb_persons_to_detect,
+                    list(motion_person_stats.get("eligible_person_ids", [])),
+                )
         else:
             raise ValueError(
                 f"Invalid person_ordering_method: {person_ordering_method}. Must be "
                 "'on_click', 'highest_likelihood', 'largest_size', 'smallest_size', "
                 "'greatest_displacement', 'least_displacement', 'first_detected', "
-                "'last_detected', or 'medicine_ball'."
+                "'last_detected', 'medicine_ball', or 'motion_specific'."
             )
         logging.info(
             f"Reordered persons: IDs of persons {selected_persons} become {list(range(len(selected_persons)))}."

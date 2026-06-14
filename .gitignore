@@ -1,5 +1,7 @@
 **/__pycache__/
 **/build/
+.venv/
+.venv-codex/
 *.pyc
 logs.txt*
 **/*.log

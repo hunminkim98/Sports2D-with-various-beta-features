@@ -8,6 +8,13 @@
 
 ## 최근 동작 변경 메모
 
+- 2026-06-14: `base.person_ordering_method='motion_specific'` 설정이 추가되었습니다.
+  - broad_jump/일반 motion-specific 후보는 `presence_ratio`, 평균 confidence, pose-bbox 상대 크기로 gate filtering 합니다.
+  - gate 통과 여부는 후보군을 정하는 1차 필터이며, presence_ratio가 더 높다고 motion 점수를 추가로 올리지는 않습니다.
+  - 통과 후보만 broad_jump/sprint_start motion rule로 랭킹하고, `motion.person_selection_target='auto'`이면 둘 다 애매한 경우 `etc`로 둔 뒤 기존 likelihood fallback을 사용합니다.
+  - broad_jump는 양발이 지면 baseline보다 떠 있는 연속 구간과 같은 구간 내 hip x 이동이 있어야 하며, 여러 명이 이 조건을 만족하면 pose-bbox가 가장 큰 사람을 우선합니다.
+  - sprint_start는 전체 영상 기준 `presence_ratio >= 0.8` 또는 pose-bbox size gate를 요구하지 않고, 후보별 hip 기준 최대 수평 속도 frame을 찾은 뒤 직전 1초 window의 confidence/유효 frame을 gate로 사용합니다.
+  - sprint_start motion rule은 자세 보조 feature를 쓰지 않고 빠른 hip/body x 이동, heel Y 진자운동, 좌우 heel 교대성 세 조건을 모두 만족해야 합니다.
 - 2026-03-29: `base.person_ordering_method='medicine_ball'` 설정이 추가되었습니다.
   - `detect_ball=true`일 때 메디신볼 thrower를 자동 선택하기 위한 post-pass ordering mode입니다.
   - 첫 10프레임에서 selected ball에 가장 가까운 사람을 우선 후보로 보되, 전체 시퀀스에서 95% 이상 존재한 사람만 남깁니다.
