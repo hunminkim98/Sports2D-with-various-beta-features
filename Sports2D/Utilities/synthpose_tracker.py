@@ -23,6 +23,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import numpy as np
 import logging
+from contextlib import contextmanager
 from PIL import Image
 
 from Sports2D.Utilities.manual_roi import (
@@ -56,6 +57,42 @@ SUPPORTED_SYNTHPOSE_DETECTORS = (
     'rtdetrv4',
     'sam3',
 )
+
+
+def _resolve_rtmlib_yolox_device(pose_device: str, backend: str) -> str:
+    if pose_device == 'cuda':
+        return 'cuda'
+    if pose_device == 'mps' and backend == 'onnxruntime':
+        return 'mps'
+    return 'cpu'
+
+
+@contextmanager
+def _temporary_yolox_coreml_provider(backend: str, device: str):
+    if backend != 'onnxruntime' or device != 'mps':
+        yield
+        return
+
+    try:
+        from rtmlib.tools.base import RTMLIB_SETTINGS
+    except Exception as exc:
+        logging.debug('Could not configure SynthPose YOLOX CoreML provider: %s', exc)
+        yield
+        return
+
+    onnxruntime_settings = RTMLIB_SETTINGS.get('onnxruntime', {})
+    previous_provider = onnxruntime_settings.get('mps')
+    onnxruntime_settings['mps'] = (
+        'CoreMLExecutionProvider',
+        {
+            'ModelFormat': 'MLProgram',
+            'RequireStaticInputShapes': '1',
+        },
+    )
+    try:
+        yield
+    finally:
+        onnxruntime_settings['mps'] = previous_provider
 
 # Lazy imports to avoid loading heavy dependencies at module load time
 _MODELS_LOADED = False
@@ -1066,18 +1103,19 @@ class SynthPosePoseTracker:
         
         # Determine backend and device for rtmlib
         rtmlib_backend = self.backend if self.backend != 'auto' else 'onnxruntime'
-        rtmlib_device = 'cuda' if self.device == 'cuda' else 'cpu'
-        
+        rtmlib_device = _resolve_rtmlib_yolox_device(self.device, rtmlib_backend)
+
         # rtmlib YOLOX API: onnx_model, model_input_size, nms_thr, score_thr, backend, device
-        self.detector = YOLOX(
-            onnx_model=model_url,
-            model_input_size=input_size,
-            mode=detector_mode,
-            nms_thr=nms_thr,
-            score_thr=score_thr,
-            backend=rtmlib_backend,
-            device=rtmlib_device
-        )
+        with _temporary_yolox_coreml_provider(rtmlib_backend, rtmlib_device):
+            self.detector = YOLOX(
+                onnx_model=model_url,
+                model_input_size=input_size,
+                mode=detector_mode,
+                nms_thr=nms_thr,
+                score_thr=score_thr,
+                backend=rtmlib_backend,
+                device=rtmlib_device
+            )
 
         logging.info(
             'rtmlib YOLOX detector loaded (mode=%s, weights=%s/%s, '

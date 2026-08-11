@@ -46,6 +46,52 @@ TRACKER_INIT_RETRY_DELAY = 3  # seconds
 PERSON_CLASS_ID = 0
 SPORTS_BALL_CLASS_ID = 32
 
+def _configure_rtmlib_coreml_provider(backend: str, device: str) -> None:
+    """Keep RTMLib YOLOX usable on macOS without slowing RTMPose."""
+
+    if backend != "onnxruntime" or device != "mps":
+        return
+
+    try:
+        from rtmlib import YOLOX
+        from rtmlib.tools.base import RTMLIB_SETTINGS
+    except Exception as exc:
+        logging.debug("Could not configure RTMLib CoreML provider: %s", exc)
+        return
+
+    onnxruntime_settings = RTMLIB_SETTINGS.get("onnxruntime", {})
+    if "mps" not in onnxruntime_settings:
+        return
+    if getattr(YOLOX.__init__, "_sports2d_coreml_patch", False):
+        onnxruntime_settings["mps"] = "CoreMLExecutionProvider"
+        return
+
+    original_init = YOLOX.__init__
+    static_provider = (
+        "CoreMLExecutionProvider",
+        {
+            "ModelFormat": "MLProgram",
+            "RequireStaticInputShapes": "1",
+        },
+    )
+
+    def patched_init(self, *args, **kwargs):
+        call_backend = kwargs.get("backend", args[5] if len(args) > 5 else "onnxruntime")
+        call_device = kwargs.get("device", args[6] if len(args) > 6 else "cpu")
+        if call_backend == "onnxruntime" and call_device == "mps":
+            previous_provider = onnxruntime_settings.get("mps")
+            onnxruntime_settings["mps"] = static_provider
+            try:
+                return original_init(self, *args, **kwargs)
+            finally:
+                onnxruntime_settings["mps"] = previous_provider
+        return original_init(self, *args, **kwargs)
+
+    # ponytail: rtmlib gives YOLOX and RTMPose one shared device knob; patch YOLOX only.
+    patched_init._sports2d_coreml_patch = True
+    YOLOX.__init__ = patched_init
+    onnxruntime_settings["mps"] = "CoreMLExecutionProvider"
+
 
 ## AUTHORSHIP INFORMATION
 __author__ = "Sports2D Contributors"
@@ -690,6 +736,7 @@ class RTMLibBackend(PoseBackend):
         backend = pose_config.get("backend", "auto")
         device = pose_config.get("device", "auto")
         self._backend, self._device = setup_backend_device(backend, device)
+        _configure_rtmlib_coreml_provider(self._backend, self._device)
 
         det_frequency = pose_config.get("det_frequency", 4)
         detect_ball = bool(pose_config.get("detect_ball", False))

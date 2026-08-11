@@ -64,6 +64,7 @@ import logging
 import json
 import ast
 import copy
+import inspect
 import shutil
 import os
 import re
@@ -161,6 +162,36 @@ warnings.filterwarnings(
     "ignore",
     message=".*Input.*has a dynamic shape.*but the runtime shape.*has zero elements.*",
 )
+
+
+def _compute_height_compatible(
+    coords,
+    keypoint_names=None,
+    *,
+    fastest_frames_to_remove_percent=0.1,
+    close_to_zero_speed=50,
+    large_hip_knee_angles=45,
+    trimmed_extrema_percent=0.5,
+):
+    """Call Pose2Sim.compute_height across supported Pose2Sim versions."""
+
+    signature = inspect.signature(compute_height)
+    kwargs = {}
+    if "fastest_frames_to_remove_percent" in signature.parameters:
+        kwargs["fastest_frames_to_remove_percent"] = fastest_frames_to_remove_percent
+    if "close_to_zero_speed" in signature.parameters:
+        kwargs["close_to_zero_speed"] = close_to_zero_speed
+    if "large_hip_knee_angles" in signature.parameters:
+        kwargs["large_hip_knee_angles"] = large_hip_knee_angles
+    if "trimmed_extrema_percent" in signature.parameters:
+        kwargs["trimmed_extrema_percent"] = trimmed_extrema_percent
+
+    if keypoint_names is not None and len(signature.parameters) >= 2:
+        second_parameter = list(signature.parameters.values())[1]
+        if second_parameter.name not in kwargs:
+            return compute_height(coords, keypoint_names, **kwargs)
+
+    return compute_height(coords, **kwargs)
 
 
 # Not safe, but to be used until OpenMMLab/RTMlib's SSL certificates are updated
@@ -4329,6 +4360,261 @@ def get_personIDs_with_greatest_displacement(
     return selected_persons
 
 
+def _contiguous_true_runs(mask):
+    """
+    Return inclusive-exclusive index runs for consecutive True values.
+    """
+    true_indices = np.flatnonzero(np.asarray(mask, dtype=bool))
+    if true_indices.size == 0:
+        return []
+
+    split_points = np.flatnonzero(np.diff(true_indices) > 1) + 1
+    return [
+        (int(run[0]), int(run[-1]) + 1)
+        for run in np.split(true_indices, split_points)
+        if run.size > 0
+    ]
+
+
+def _pose_visibility_centers_scales(
+    all_frames_X_homog,
+    all_frames_Y_homog,
+    all_frames_scores_homog=None,
+    *,
+    min_visible_keypoints=4,
+    min_keypoint_score=0.0,
+):
+    """
+    Compute frame/person visibility, median centers, and pose-bbox scales.
+    """
+    all_frames_X_homog = np.asarray(all_frames_X_homog, dtype=float)
+    all_frames_Y_homog = np.asarray(all_frames_Y_homog, dtype=float)
+
+    visible_keypoints = np.isfinite(all_frames_X_homog) & np.isfinite(
+        all_frames_Y_homog
+    )
+    if all_frames_scores_homog is not None:
+        all_frames_scores_homog = np.asarray(all_frames_scores_homog, dtype=float)
+        visible_scores = np.isfinite(all_frames_scores_homog)
+        if min_keypoint_score is not None:
+            visible_scores &= all_frames_scores_homog > min_keypoint_score
+        visible_keypoints &= visible_scores
+
+    active = np.sum(visible_keypoints, axis=2) >= int(min_visible_keypoints)
+    masked_X = np.where(visible_keypoints, all_frames_X_homog, np.nan)
+    masked_Y = np.where(visible_keypoints, all_frames_Y_homog, np.nan)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        center_X = np.nanmedian(masked_X, axis=2)
+        center_Y = np.nanmedian(masked_Y, axis=2)
+        width = np.nanmax(masked_X, axis=2) - np.nanmin(masked_X, axis=2)
+        height = np.nanmax(masked_Y, axis=2) - np.nanmin(masked_Y, axis=2)
+
+    centers = np.stack((center_X, center_Y), axis=-1)
+    scales = np.sqrt(width**2 + height**2)
+    scales[~np.isfinite(scales)] = np.nan
+
+    return active, centers, scales
+
+
+def stitch_single_subject_person_track_fragments(
+    selected_person_id,
+    all_frames_X_homog,
+    all_frames_Y_homog,
+    all_frames_scores_homog,
+    arrays_by_name=None,
+    *,
+    min_fragment_frames=5,
+    max_overlap_ratio=0.10,
+    min_visible_keypoints=4,
+    min_keypoint_score=0.0,
+    max_temporal_gap_frames=30,
+    max_spatial_jump_scale=3.0,
+    min_spatial_jump_px=180.0,
+):
+    """
+    Fill gaps in one selected person slot from compatible raw ID fragments.
+
+    Pose trackers can split one athlete into multiple person IDs when the
+    detection association changes mid-video. For single-subject exports, keep
+    the selected slot as the public person00 and copy only non-overlapping,
+    spatially continuous fragments from other raw slots into that selected slot.
+    The input arrays are modified in place and diagnostics are returned.
+    """
+    diagnostics = {
+        "selected_person_id": None,
+        "merged_source_ids": [],
+        "filled_frames": 0,
+        "fragments": [],
+        "skipped_source_ids": {},
+    }
+
+    if all_frames_X_homog is None or all_frames_Y_homog is None:
+        return diagnostics
+    if np.ndim(all_frames_X_homog) < 3 or np.ndim(all_frames_Y_homog) < 3:
+        return diagnostics
+
+    frame_count, person_count = np.asarray(all_frames_X_homog).shape[:2]
+    if frame_count == 0 or person_count <= 1:
+        return diagnostics
+
+    selected_person_id = int(selected_person_id)
+    diagnostics["selected_person_id"] = selected_person_id
+    if selected_person_id < 0 or selected_person_id >= person_count:
+        return diagnostics
+
+    active, centers, scales = _pose_visibility_centers_scales(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        min_visible_keypoints=min_visible_keypoints,
+        min_keypoint_score=min_keypoint_score,
+    )
+
+    merged_active = active[:, selected_person_id].copy()
+    stitched_centers = centers[:, selected_person_id, :].copy()
+    stitched_scales = scales[:, selected_person_id].copy()
+    if not np.any(merged_active):
+        return diagnostics
+
+    arrays_by_name = dict(arrays_by_name or {})
+    candidate_ids = [idx for idx in range(person_count) if idx != selected_person_id]
+
+    def _first_active_frame(person_id):
+        frames = np.flatnonzero(active[:, person_id])
+        if frames.size == 0:
+            return frame_count
+        return int(frames[0])
+
+    def _mean_candidate_score(person_id):
+        if all_frames_scores_homog is None:
+            return 0.0
+        candidate_scores = np.asarray(all_frames_scores_homog)[:, person_id, :]
+        candidate_scores = candidate_scores[np.isfinite(candidate_scores)]
+        if candidate_scores.size == 0:
+            return 0.0
+        return float(np.nanmean(candidate_scores))
+
+    candidate_ids.sort(
+        key=lambda idx: (_first_active_frame(idx), -_mean_candidate_score(idx))
+    )
+
+    for candidate_id in candidate_ids:
+        candidate_active = active[:, candidate_id]
+        candidate_frame_count = int(np.sum(candidate_active))
+        if candidate_frame_count < int(min_fragment_frames):
+            diagnostics["skipped_source_ids"][candidate_id] = "too_short"
+            continue
+
+        overlap_count = int(np.sum(candidate_active & merged_active))
+        overlap_ratio = overlap_count / max(candidate_frame_count, 1)
+        if overlap_ratio > float(max_overlap_ratio):
+            diagnostics["skipped_source_ids"][candidate_id] = "overlap"
+            continue
+
+        fill_mask = candidate_active & ~merged_active
+        if int(np.sum(fill_mask)) < int(min_fragment_frames):
+            diagnostics["skipped_source_ids"][candidate_id] = "no_gap_fill"
+            continue
+
+        accepted_mask = np.zeros(frame_count, dtype=bool)
+        for start_frame, end_frame in _contiguous_true_runs(fill_mask):
+            continuity_ok = False
+            boundary_checks = []
+
+            previous_frames = np.flatnonzero(merged_active[:start_frame])
+            if previous_frames.size > 0:
+                previous_frame = int(previous_frames[-1])
+                temporal_gap = start_frame - previous_frame
+                if temporal_gap <= int(max_temporal_gap_frames):
+                    boundary_checks.append(
+                        (
+                            stitched_centers[previous_frame],
+                            centers[start_frame, candidate_id],
+                            stitched_scales[previous_frame],
+                            scales[start_frame, candidate_id],
+                        )
+                    )
+
+            next_frames = np.flatnonzero(merged_active[end_frame:])
+            if next_frames.size > 0:
+                next_frame = int(next_frames[0] + end_frame)
+                temporal_gap = next_frame - (end_frame - 1)
+                if temporal_gap <= int(max_temporal_gap_frames):
+                    boundary_checks.append(
+                        (
+                            stitched_centers[next_frame],
+                            centers[end_frame - 1, candidate_id],
+                            stitched_scales[next_frame],
+                            scales[end_frame - 1, candidate_id],
+                        )
+                    )
+
+            for selected_center, candidate_center, selected_scale, candidate_scale in (
+                boundary_checks
+            ):
+                if not (
+                    np.all(np.isfinite(selected_center))
+                    and np.all(np.isfinite(candidate_center))
+                ):
+                    continue
+                boundary_scale = np.nanmedian([selected_scale, candidate_scale])
+                if not np.isfinite(boundary_scale) or boundary_scale <= 0:
+                    boundary_scale = 0.0
+                max_spatial_jump = max(
+                    float(min_spatial_jump_px),
+                    float(max_spatial_jump_scale) * float(boundary_scale),
+                )
+                center_distance = float(
+                    np.linalg.norm(
+                        np.asarray(selected_center) - np.asarray(candidate_center)
+                    )
+                )
+                if center_distance <= max_spatial_jump:
+                    continuity_ok = True
+                    break
+
+            if continuity_ok:
+                accepted_mask[start_frame:end_frame] = True
+
+        accepted_frame_count = int(np.sum(accepted_mask))
+        if accepted_frame_count < int(min_fragment_frames):
+            diagnostics["skipped_source_ids"][candidate_id] = "spatial_discontinuity"
+            continue
+
+        for array in arrays_by_name.values():
+            if not isinstance(array, np.ndarray):
+                continue
+            if array.ndim < 2 or array.shape[0] != frame_count:
+                continue
+            if array.shape[1] <= max(selected_person_id, candidate_id):
+                continue
+            array[accepted_mask, selected_person_id, ...] = array[
+                accepted_mask, candidate_id, ...
+            ]
+
+        merged_active[accepted_mask] = True
+        stitched_centers[accepted_mask] = centers[accepted_mask, candidate_id, :]
+        stitched_scales[accepted_mask] = scales[accepted_mask, candidate_id]
+
+        diagnostics["merged_source_ids"].append(candidate_id)
+        diagnostics["filled_frames"] += accepted_frame_count
+        diagnostics["fragments"].append(
+            {
+                "source_id": candidate_id,
+                "filled_frames": accepted_frame_count,
+                "overlap_ratio": float(overlap_ratio),
+                "runs": [
+                    [int(start), int(end - 1)]
+                    for start, end in _contiguous_true_runs(accepted_mask)
+                ],
+            }
+        )
+
+    return diagnostics
+
+
 def _clip01(value):
     """
     Clip a scalar to [0, 1], treating missing values as 0.
@@ -8012,6 +8298,42 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 "'greatest_displacement', 'least_displacement', 'first_detected', "
                 "'last_detected', 'medicine_ball', or 'motion_specific'."
             )
+
+        selected_persons = [
+            int(person_id) for person_id in np.atleast_1d(selected_persons).tolist()
+        ]
+        if (
+            nb_persons_to_detect == 1
+            and len(selected_persons) == 1
+            and nb_detected_persons > 1
+        ):
+            stitch_fps = float(fps) if np.isfinite(fps) and float(fps) > 0 else 30.0
+            stitch_diagnostics = stitch_single_subject_person_track_fragments(
+                selected_persons[0],
+                all_frames_X_homog,
+                all_frames_Y_homog,
+                all_frames_scores_homog,
+                {
+                    "X_raw": all_frames_X_raw_homog,
+                    "Y_raw": all_frames_Y_raw_homog,
+                    "scores_raw": all_frames_scores_raw_homog,
+                    "X": all_frames_X_homog,
+                    "Y": all_frames_Y_homog,
+                    "scores": all_frames_scores_homog,
+                    "X_flipped": all_frames_X_flipped_homog,
+                    "angles": all_frames_angles_homog,
+                },
+                min_fragment_frames=max(3, int(round(0.10 * stitch_fps))),
+                max_temporal_gap_frames=max(5, int(round(0.50 * stitch_fps))),
+            )
+            if stitch_diagnostics.get("merged_source_ids"):
+                logging.info(
+                    "Merged single-subject person track fragments into ID %s "
+                    "from IDs %s (filled %s frames).",
+                    selected_persons[0],
+                    stitch_diagnostics["merged_source_ids"],
+                    stitch_diagnostics["filled_frames"],
+                )
         logging.info(
             f"Reordered persons: IDs of persons {selected_persons} become {list(range(len(selected_persons)))}."
         )
@@ -8486,7 +8808,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
             meter_keypoint_names = list(meter_trc_data[0].columns[1::3])
 
             # Compute height of the first person in pixels
-            height_px = CORRECTION_2D_TO_3D * compute_height(
+            height_px = CORRECTION_2D_TO_3D * _compute_height_compatible(
                 meter_trc_data[0].iloc[:, 1:],
                 meter_keypoint_names,
                 fastest_frames_to_remove_percent=fastest_frames_to_remove_percent,
@@ -9503,7 +9825,7 @@ def process_fun(config_dict, video_file, time_range, frame_rate, result_dir):
                 else:
                     # Provide missing data to Pose2Sim_config_dict
                     trc_data_m_keypoint_names = list(trc_data_m_i.columns[1::3])
-                    height_m_i = compute_height(
+                    height_m_i = _compute_height_compatible(
                         trc_data_m_i.iloc[:, 1:],
                         trc_data_m_keypoint_names,
                         fastest_frames_to_remove_percent=fastest_frames_to_remove_percent,

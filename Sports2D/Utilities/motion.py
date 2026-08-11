@@ -26,6 +26,14 @@ MIN_FLIGHT_TIME_S = 0.08
 FOOT_CONTACT_HEIGHT_M = 0.03
 CONTACT_VELOCITY_THRESHOLD_MPS = 0.50
 COM_PROXY_METHOD = "pelvis_trunk_proxy_v1"
+MIN_LANDING_CONFIRMATION_TIME_S = 0.06
+
+
+def _trapezoid(y, x=None):
+    integrate = getattr(np, "trapezoid", None)
+    if integrate is None:
+        integrate = np.trapz
+    return integrate(y, x=x)
 
 
 def _marker_triplet(trc_data, marker_name):
@@ -298,6 +306,19 @@ def estimate_com_derivatives(
     return velocity_y, acceleration_y
 
 
+def _first_sustained_true(mask, min_frames=1, start_frame=0):
+    mask = np.asarray(mask, dtype=bool)
+    if len(mask) == 0:
+        return None
+    min_frames = max(1, int(min_frames))
+    start_frame = int(np.clip(start_frame, 0, len(mask)))
+    search_stop = len(mask) - min_frames + 1
+    for frame_idx in range(start_frame, max(start_frame, search_stop)):
+        if np.all(mask[frame_idx:frame_idx + min_frames]):
+            return int(frame_idx)
+    return None
+
+
 def detect_vertical_jump_events(
     trc_data_m,
     com_velocity_y,
@@ -307,11 +328,16 @@ def detect_vertical_jump_events(
     foot_contact_height_m=FOOT_CONTACT_HEIGHT_M,
     contact_velocity_threshold_mps=CONTACT_VELOCITY_THRESHOLD_MPS,
     min_flight_time_s=MIN_FLIGHT_TIME_S,
+    min_landing_confirmation_time_s=MIN_LANDING_CONFIRMATION_TIME_S,
 ):
     support_height = _support_height_series(trc_data_m)
     min_flight_frames = max(1, int(round(float(min_flight_time_s) * float(fps))))
+    min_landing_frames = max(
+        1, int(round(float(min_landing_confirmation_time_s) * float(fps)))
+    )
     takeoff_frame = None
     landing_frame = None
+    landing_search_start = None
 
     if support_height is not None:
         airborne_mask = support_height > float(foot_contact_height_m)
@@ -326,11 +352,14 @@ def detect_vertical_jump_events(
                 break
 
         if takeoff_frame is not None:
-            landing_search_start = min(len(contact_mask), takeoff_frame + min_flight_frames)
-            for frame_idx in range(landing_search_start, len(contact_mask)):
-                if contact_mask[frame_idx]:
-                    landing_frame = frame_idx
-                    break
+            landing_search_start = min(
+                len(contact_mask), takeoff_frame + min_flight_frames
+            )
+            landing_frame = _first_sustained_true(
+                contact_mask,
+                min_frames=min_landing_frames,
+                start_frame=landing_search_start,
+            )
 
     if takeoff_frame is None:
         positive_velocity_candidates = np.where(
@@ -344,9 +373,32 @@ def detect_vertical_jump_events(
             )[0]
             takeoff_frame = int(low_force_candidates[0]) if len(low_force_candidates) > 0 else None
     if landing_frame is None and takeoff_frame is not None:
-        landing_candidates = np.where(raw_vgrf_n[min(len(raw_vgrf_n), takeoff_frame + 1):] >= 0.5 * float(body_weight_n))[0]
-        if len(landing_candidates) > 0:
-            landing_frame = int(landing_candidates[0] + min(len(raw_vgrf_n), takeoff_frame + 1))
+        landing_search_start = min(len(raw_vgrf_n), takeoff_frame + 1)
+
+    if takeoff_frame is not None:
+        raw_landing_start = (
+            min(len(raw_vgrf_n), int(landing_search_start))
+            if landing_search_start is not None
+            else min(len(raw_vgrf_n), takeoff_frame + 1)
+        )
+        raw_landing_mask = np.asarray(raw_vgrf_n, dtype=float) >= 0.5 * float(
+            body_weight_n
+        )
+        velocity_y = np.asarray(com_velocity_y, dtype=float)
+        if len(velocity_y) == len(raw_landing_mask):
+            raw_landing_mask &= velocity_y <= 0.0
+        raw_landing_min_frames = min_landing_frames if support_height is not None else 1
+        raw_landing_frame = _first_sustained_true(
+            raw_landing_mask,
+            min_frames=raw_landing_min_frames,
+            start_frame=raw_landing_start,
+        )
+        if raw_landing_frame is not None:
+            landing_frame = (
+                raw_landing_frame
+                if landing_frame is None
+                else min(int(landing_frame), int(raw_landing_frame))
+            )
 
     if takeoff_frame is not None:
         takeoff_frame = int(np.clip(takeoff_frame, 0, len(raw_vgrf_n) - 1))
@@ -555,7 +607,7 @@ def analyze_vertical_jump_trial(
 
     net_impulse_ns = None
     if takeoff_frame is not None and takeoff_frame > lowest_com_frame:
-        net_impulse_ns = float(np.trapz(
+        net_impulse_ns = float(_trapezoid(
             vgrf_n[lowest_com_frame:takeoff_frame + 1] - body_weight_n,
             time_s[lowest_com_frame:takeoff_frame + 1],
         ))
@@ -807,8 +859,8 @@ def _calculate_joint_contribution_from_selected_columns(
         hip_contraction = hip_moments_sum
         knee_contraction = knee_moments_sum
 
-    hip_integral = float(np.trapz(hip_contraction, x=phase_times))
-    knee_integral = float(np.trapz(knee_contraction, x=phase_times))
+    hip_integral = float(_trapezoid(hip_contraction, x=phase_times))
+    knee_integral = float(_trapezoid(knee_contraction, x=phase_times))
     total_integral = hip_integral + knee_integral
 
     if total_integral > 0:

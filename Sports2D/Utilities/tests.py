@@ -121,6 +121,72 @@ def test_wrap_angle_series_to_principal_output_range():
     assert np.all(valid <= 180.0)
 
 
+def test_compute_height_compatible_supports_pose2sim_01047(monkeypatch):
+    import Sports2D.process as process_module
+
+    calls = []
+
+    def compute_height_01047(
+        coords, large_hip_knee_angles=90, trimmed_extrema_percent=50
+    ):
+        calls.append((coords, large_hip_knee_angles, trimmed_extrema_percent))
+        return 1.75
+
+    monkeypatch.setattr(process_module, "compute_height", compute_height_01047)
+
+    result = process_module._compute_height_compatible(
+        "coords",
+        ["Hip"],
+        fastest_frames_to_remove_percent=0.1,
+        close_to_zero_speed=50,
+        large_hip_knee_angles=45,
+        trimmed_extrema_percent=0.5,
+    )
+
+    assert result == 1.75
+    assert calls == [("coords", 45, 0.5)]
+
+
+def test_compute_height_compatible_supports_named_keypoints(monkeypatch):
+    import Sports2D.process as process_module
+
+    calls = []
+
+    def compute_height_with_keypoints(
+        coords,
+        keypoint_names,
+        fastest_frames_to_remove_percent=0.1,
+        close_to_zero_speed=50,
+        large_hip_knee_angles=90,
+        trimmed_extrema_percent=50,
+    ):
+        calls.append(
+            (
+                coords,
+                keypoint_names,
+                fastest_frames_to_remove_percent,
+                close_to_zero_speed,
+                large_hip_knee_angles,
+                trimmed_extrema_percent,
+            )
+        )
+        return 1.8
+
+    monkeypatch.setattr(process_module, "compute_height", compute_height_with_keypoints)
+
+    result = process_module._compute_height_compatible(
+        "coords",
+        ["Hip"],
+        fastest_frames_to_remove_percent=0.2,
+        close_to_zero_speed=40,
+        large_hip_knee_angles=45,
+        trimmed_extrema_percent=0.5,
+    )
+
+    assert result == 1.8
+    assert calls == [("coords", ["Hip"], 0.2, 40, 45, 0.5)]
+
+
 def test_extract_ball_centers_parses_xyxy_boxes():
     """
     Verify ball center extraction from detector xyxy boxes.
@@ -1271,6 +1337,128 @@ def _fill_motion_person(
         all_frames_X_homog[visible, person_idx, keypoint_idx] = hip_x[visible] + dx
         all_frames_Y_homog[visible, person_idx, keypoint_idx] = hip_y[visible] + dy
         all_frames_scores_homog[visible, person_idx, keypoint_idx] = score
+
+
+def test_stitch_single_subject_person_track_fragments_fills_continuous_gap():
+    """
+    Verify one athlete split from ID 0 to ID 2 is exported as one selected slot.
+    """
+
+    from Sports2D.process import stitch_single_subject_person_track_fragments
+
+    frame_count = 8
+    keypoint_count = 6
+    all_frames_X_homog = np.full((frame_count, 3, keypoint_count), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 3, keypoint_count), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 3, keypoint_count), np.nan)
+    auxiliary = np.full((frame_count, 3, keypoint_count), np.nan)
+
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        np.linspace(100.0, 130.0, frame_count),
+        np.full(frame_count, 100.0),
+        visible_slice=slice(0, 4),
+    )
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.full(frame_count, 420.0),
+        np.full(frame_count, 100.0),
+    )
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        2,
+        np.linspace(140.0, 170.0, frame_count),
+        np.full(frame_count, 100.0),
+        visible_slice=slice(4, 8),
+    )
+    auxiliary[:, 2, :] = 2.0
+
+    diagnostics = stitch_single_subject_person_track_fragments(
+        0,
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        {
+            "X": all_frames_X_homog,
+            "Y": all_frames_Y_homog,
+            "scores": all_frames_scores_homog,
+            "auxiliary": auxiliary,
+        },
+        min_fragment_frames=2,
+        max_temporal_gap_frames=2,
+        min_spatial_jump_px=80.0,
+    )
+
+    assert diagnostics["merged_source_ids"] == [2]
+    assert diagnostics["filled_frames"] == 4
+    assert np.allclose(
+        all_frames_X_homog[4:8, 0, :], all_frames_X_homog[4:8, 2, :]
+    )
+    assert np.allclose(
+        all_frames_scores_homog[4:8, 0, :], all_frames_scores_homog[4:8, 2, :]
+    )
+    assert np.all(auxiliary[4:8, 0, :] == 2.0)
+    assert diagnostics["skipped_source_ids"][1] == "overlap"
+
+
+def test_stitch_single_subject_person_track_fragments_rejects_far_gap():
+    """
+    Verify a different person entering far away is not merged into person00.
+    """
+
+    from Sports2D.process import stitch_single_subject_person_track_fragments
+
+    frame_count = 8
+    keypoint_count = 6
+    all_frames_X_homog = np.full((frame_count, 2, keypoint_count), np.nan)
+    all_frames_Y_homog = np.full((frame_count, 2, keypoint_count), np.nan)
+    all_frames_scores_homog = np.full((frame_count, 2, keypoint_count), np.nan)
+
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        0,
+        np.linspace(100.0, 130.0, frame_count),
+        np.full(frame_count, 100.0),
+        visible_slice=slice(0, 4),
+    )
+    _fill_motion_person(
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        1,
+        np.full(frame_count, 800.0),
+        np.full(frame_count, 100.0),
+        visible_slice=slice(4, 8),
+    )
+
+    diagnostics = stitch_single_subject_person_track_fragments(
+        0,
+        all_frames_X_homog,
+        all_frames_Y_homog,
+        all_frames_scores_homog,
+        {
+            "X": all_frames_X_homog,
+            "Y": all_frames_Y_homog,
+            "scores": all_frames_scores_homog,
+        },
+        min_fragment_frames=2,
+        max_temporal_gap_frames=2,
+        min_spatial_jump_px=80.0,
+    )
+
+    assert diagnostics["merged_source_ids"] == []
+    assert diagnostics["skipped_source_ids"][1] == "spatial_discontinuity"
+    assert np.isnan(all_frames_X_homog[4:, 0, :]).all()
 
 
 def test_resolve_personIDs_for_motion_specific_applies_presence_confidence_size_gates():
@@ -3444,6 +3632,37 @@ def test_detect_vertical_jump_events_fallback_waits_for_propulsive_phase():
     assert landing_frame == 4
 
 
+def test_detect_vertical_jump_events_uses_raw_landing_when_support_height_lags():
+    """
+    Verify delayed foot-height contact does not erase an earlier landing impulse.
+    """
+
+    from Sports2D.Utilities.motion import detect_vertical_jump_events
+
+    trc_data = pd.DataFrame(
+        np.column_stack(
+            [
+                np.arange(8, dtype=float) / 30.0,
+                np.zeros(8, dtype=float),
+                np.array([0.0, 0.0, 0.08, 0.12, 0.09, 0.07, 0.02, 0.01]),
+                np.zeros(8, dtype=float),
+            ]
+        ),
+        columns=["time", "LBigToe", "LBigToe", "LBigToe"],
+    )
+
+    takeoff_frame, landing_frame = detect_vertical_jump_events(
+        trc_data,
+        com_velocity_y=np.array([0.0, 0.2, 0.7, 0.3, -0.6, -0.3, 0.0, 0.0]),
+        raw_vgrf_n=np.array([700.0, 700.0, 20.0, 40.0, 600.0, 650.0, 700.0, 700.0]),
+        body_weight_n=700.0,
+        fps=30.0,
+    )
+
+    assert takeoff_frame == 2
+    assert landing_frame == 4
+
+
 def test_synthpose_tracker_merge_secondary_ball_detections_updates_ball_contract():
     """
     Verify hybrid SAM3 ball detections merge into the existing tracker metadata schema.
@@ -3606,6 +3825,48 @@ def test_synthpose_tracker_yolo26_adapter_builds_detection_metadata():
     assert metadata["ball_scores"].tolist() == pytest.approx([0.72])
     assert metadata["class_names"].tolist() == ["person", "sports ball", "person"]
 
+
+
+def test_synthpose_yolox_uses_mps_only_for_onnxruntime():
+    """Verify SynthPose YOLOX can use CoreML/MPS without affecting other backends."""
+
+    from Sports2D.Utilities.synthpose_tracker import _resolve_rtmlib_yolox_device
+
+    assert _resolve_rtmlib_yolox_device('mps', 'onnxruntime') == 'mps'
+    assert _resolve_rtmlib_yolox_device('mps', 'openvino') == 'cpu'
+    assert _resolve_rtmlib_yolox_device('cuda', 'onnxruntime') == 'cuda'
+    assert _resolve_rtmlib_yolox_device('cpu', 'onnxruntime') == 'cpu'
+
+
+def test_temporary_yolox_coreml_provider_restores_rtmlib_settings(monkeypatch):
+    """Verify SynthPose YOLOX gets static CoreML shapes only during construction."""
+
+    import sys
+    import types
+
+    from Sports2D.Utilities.synthpose_tracker import _temporary_yolox_coreml_provider
+
+    settings = {'onnxruntime': {'mps': 'CoreMLExecutionProvider'}}
+    rtmlib_module = types.ModuleType('rtmlib')
+    tools_module = types.ModuleType('rtmlib.tools')
+    base_module = types.ModuleType('rtmlib.tools.base')
+    base_module.RTMLIB_SETTINGS = settings
+    tools_module.base = base_module
+    rtmlib_module.tools = tools_module
+
+    monkeypatch.setitem(sys.modules, 'rtmlib', rtmlib_module)
+    monkeypatch.setitem(sys.modules, 'rtmlib.tools', tools_module)
+    monkeypatch.setitem(sys.modules, 'rtmlib.tools.base', base_module)
+
+    with _temporary_yolox_coreml_provider('onnxruntime', 'mps'):
+        provider_name, provider_options = settings['onnxruntime']['mps']
+        assert provider_name == 'CoreMLExecutionProvider'
+        assert provider_options == {
+            'ModelFormat': 'MLProgram',
+            'RequireStaticInputShapes': '1',
+        }
+
+    assert settings['onnxruntime']['mps'] == 'CoreMLExecutionProvider'
 
 def test_synthpose_tracker_yolox_human_mode_keeps_scoreless_person_boxes():
     """
@@ -6017,6 +6278,46 @@ def test_apply_ball_override_to_tracks_updates_selected_track_metadata():
     assert updated_tracks[0]["missing"] == 0
     assert updated_tracks[0]["box"].tolist() == pytest.approx([40.0, 50.0, 60.0, 70.0])
 
+
+
+def test_configure_rtmlib_coreml_provider_patches_yolox_only(monkeypatch):
+    """Verify YOLOX gets static CoreML shapes without forcing RTMPose to CPU."""
+
+    import sys
+    import types
+
+    from Sports2D.Utilities import pose_backend
+
+    settings = {"onnxruntime": {"mps": "CoreMLExecutionProvider"}}
+    captured = {}
+
+    class FakeYOLOX:
+        def __init__(self, *args, **kwargs):
+            captured["during_yolox_init"] = settings["onnxruntime"]["mps"]
+
+    rtmlib_module = types.ModuleType("rtmlib")
+    rtmlib_module.YOLOX = FakeYOLOX
+    tools_module = types.ModuleType("rtmlib.tools")
+    base_module = types.ModuleType("rtmlib.tools.base")
+    base_module.RTMLIB_SETTINGS = settings
+    tools_module.base = base_module
+    rtmlib_module.tools = tools_module
+
+    monkeypatch.setitem(sys.modules, "rtmlib", rtmlib_module)
+    monkeypatch.setitem(sys.modules, "rtmlib.tools", tools_module)
+    monkeypatch.setitem(sys.modules, "rtmlib.tools.base", base_module)
+
+    pose_backend._configure_rtmlib_coreml_provider("onnxruntime", "mps")
+
+    FakeYOLOX(backend="onnxruntime", device="mps")
+
+    provider_name, provider_options = captured["during_yolox_init"]
+    assert provider_name == "CoreMLExecutionProvider"
+    assert provider_options == {
+        "ModelFormat": "MLProgram",
+        "RequireStaticInputShapes": "1",
+    }
+    assert settings["onnxruntime"]["mps"] == "CoreMLExecutionProvider"
 
 def test_create_pose_backend_surfaces_raw_sam3_guidance(monkeypatch):
     """
